@@ -1,0 +1,20 @@
+# Gradle & Android
+.gradle/
+build/
+*/build/
+local.properties
+local-m2/
+.cloudstream-build/
+*.apk
+*.aab
+*.ap_
+*.dex
+captures/
+.idea/
+*.iml
+.cxx/
+
+# Node / Web preview
+node_modules/
+dist/
+.DS_Store
