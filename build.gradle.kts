@@ -1,3 +1,4 @@
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
 
 plugins {
@@ -10,14 +11,10 @@ plugins {
     alias(libs.plugins.ksp) apply false
 }
 
-// The CloudStream library (built from the pinned commit into local-m2/) and its
-// transitive deps (kotlin-stdlib 2.4.x, kotlin-reflect 2.4.0, kotlinx-serialization 1.11,
-// NiceHttp, quickjs) are compiled with Kotlin metadata 2.3/2.4, but this project uses
-// Kotlin 2.1.10 (metadata 2.1). Without this flag :plugin-host:kspDebugKotlin fails with
-// "Module was compiled with an incompatible version of Kotlin".
-// KspTaskJvm extends KotlinCompile, so this covers KSP tasks too.
+// Replaces the per-module `kotlinOptions { jvmTarget = "11" }` blocks
+// (the kotlinOptions DSL is an error since Kotlin 2.2).
 subprojects {
     tasks.withType<KotlinCompile>().configureEach {
-        compilerOptions.freeCompilerArgs.add("-Xskip-metadata-version-check")
+        compilerOptions.jvmTarget.set(JvmTarget.JVM_11)
     }
 }
