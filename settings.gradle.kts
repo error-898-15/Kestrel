@@ -19,6 +19,8 @@ buildscript {
     repositories {
         google()
         mavenCentral()
+        // R8 9.1.29 is not on Google Maven; official R8 release repository
+        maven { url = uri("https://storage.googleapis.com/r8-releases/raw") }
     }
     dependencies {
         classpath("com.android.tools:r8:9.1.29")
