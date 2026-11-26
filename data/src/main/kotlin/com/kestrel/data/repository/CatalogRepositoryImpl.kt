@@ -105,6 +105,9 @@ class CatalogRepositoryImpl @Inject constructor(
 
     override suspend fun loadDetails(providerId: String, url: String): Result<MediaDetails> =
         withContext(ioDispatcher) {
+            if (runtimeLoader.getProvider(providerId) == null) {
+                syncEnabledPlugins()
+            }
             val provider = runtimeLoader.getProvider(providerId)
                 ?: return@withContext Result.failure(IllegalStateException("Provider unavailable"))
             provider.load(url)
@@ -112,6 +115,9 @@ class CatalogRepositoryImpl @Inject constructor(
 
     override suspend fun resolveLinks(providerId: String, dataUrl: String): Result<ResolvedLinks> =
         withContext(ioDispatcher) {
+            if (runtimeLoader.getProvider(providerId) == null) {
+                syncEnabledPlugins()
+            }
             val provider = runtimeLoader.getProvider(providerId)
                 ?: return@withContext Result.failure(IllegalStateException("Provider unavailable"))
             provider.getLinks(dataUrl)

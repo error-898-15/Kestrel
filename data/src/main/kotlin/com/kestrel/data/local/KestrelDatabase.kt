@@ -49,11 +49,12 @@ interface PluginDao {
 }
 
 @Database(
-    entities = [RepoEntity::class, PluginEntity::class],
-    version = 1,
+    entities = [RepoEntity::class, PluginEntity::class, LibraryEntity::class],
+    version = 2,
     exportSchema = false
 )
 abstract class KestrelDatabase : RoomDatabase() {
     abstract fun repoDao(): RepoDao
     abstract fun pluginDao(): PluginDao
+    abstract fun libraryDao(): LibraryDao
 }

@@ -4,12 +4,15 @@ package com.kestrel.data.di
 import android.content.Context
 import androidx.room.Room
 import com.kestrel.data.local.KestrelDatabase
+import com.kestrel.data.local.LibraryDao
 import com.kestrel.data.local.PluginDao
 import com.kestrel.data.local.RepoDao
 import com.kestrel.data.repository.CatalogRepositoryImpl
 import com.kestrel.data.repository.ExtensionRepositoryImpl
+import com.kestrel.data.repository.LibraryRepositoryImpl
 import com.kestrel.domain.repository.CatalogRepository
 import com.kestrel.domain.repository.ExtensionRepository
+import com.kestrel.domain.repository.LibraryRepository
 import dagger.Binds
 import dagger.Module
 import dagger.Provides
@@ -28,6 +31,10 @@ abstract class DataBindModule {
     @Binds
     @Singleton
     abstract fun bindCatalogRepository(impl: CatalogRepositoryImpl): CatalogRepository
+
+    @Binds
+    @Singleton
+    abstract fun bindLibraryRepository(impl: LibraryRepositoryImpl): LibraryRepository
 }
 
 @Module
@@ -46,4 +53,7 @@ object DataProvideModule {
 
     @Provides
     fun providePluginDao(db: KestrelDatabase): PluginDao = db.pluginDao()
+
+    @Provides
+    fun provideLibraryDao(db: KestrelDatabase): LibraryDao = db.libraryDao()
 }

@@ -2,7 +2,7 @@
 package com.kestrel.pluginhost.di
 
 import com.kestrel.domain.repository.PluginRuntimeLoader
-import com.kestrel.pluginhost.cloudstream.Cs3PluginLoader
+import com.kestrel.pluginhost.CompositePluginRuntimeLoader
 import dagger.Binds
 import dagger.Module
 import dagger.hilt.InstallIn
@@ -14,5 +14,5 @@ import javax.inject.Singleton
 abstract class PluginHostModule {
     @Binds
     @Singleton
-    abstract fun bindPluginRuntimeLoader(impl: Cs3PluginLoader): PluginRuntimeLoader
+    abstract fun bindPluginRuntimeLoader(impl: CompositePluginRuntimeLoader): PluginRuntimeLoader
 }

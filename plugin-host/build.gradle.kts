@@ -38,6 +38,7 @@ dependencies {
     implementation(libs.jsoup)
     implementation(libs.nicehttp)
     implementation(libs.rhino)
+    implementation(libs.quickjs.kt)
     implementation(libs.androidx.appcompat)
 
     implementation(libs.okhttp)
