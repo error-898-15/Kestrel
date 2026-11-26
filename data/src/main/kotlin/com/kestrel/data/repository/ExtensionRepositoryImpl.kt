@@ -13,6 +13,7 @@ import com.kestrel.domain.model.PluginInstallState
 import com.kestrel.domain.model.PluginMetadata
 import com.kestrel.domain.model.RepoConfig
 import com.kestrel.domain.repository.ExtensionRepository
+import com.kestrel.domain.repository.PluginRuntimeLoader
 import com.kestrel.pluginhost.AdapterRegistry
 import com.kestrel.pluginhost.PluginSandbox
 import kotlinx.coroutines.CoroutineDispatcher
@@ -31,6 +32,7 @@ class ExtensionRepositoryImpl @Inject constructor(
     private val jsonParser: RepoJsonParser,
     private val installer: PluginInstaller,
     private val adapterRegistry: AdapterRegistry,
+    private val runtimeLoader: PluginRuntimeLoader,
     private val json: Json,
     @IoDispatcher private val ioDispatcher: CoroutineDispatcher
 ) : ExtensionRepository {
@@ -80,7 +82,7 @@ class ExtensionRepositoryImpl @Inject constructor(
 
     override suspend fun removeRepository(repoId: String) = withContext(ioDispatcher) {
         val repoPlugins = pluginDao.getByRepo(repoId)
-        repoPlugins.forEach { adapterRegistry.unregisterByPlugin(it.id) }
+        repoPlugins.forEach { runtimeLoader.unloadPlugin(it.id) }
         installer.deleteRepoDirectory(repoId)
         pluginDao.deleteByRepo(repoId)
         repoDao.deleteById(repoId)
@@ -107,8 +109,17 @@ class ExtensionRepositoryImpl @Inject constructor(
                     isEnabled = true,
                     lastError = null
                 )
-                pluginDao.upsert(updated.toEntity(json))
-                updated
+                val loadResult = runtimeLoader.loadPlugin(updated)
+                val finalPlugin = if (loadResult.isFailure) {
+                    updated.copy(
+                        isEnabled = false,
+                        lastError = loadResult.exceptionOrNull()?.message ?: "Runtime load failed"
+                    )
+                } else {
+                    updated
+                }
+                pluginDao.upsert(finalPlugin.toEntity(json))
+                finalPlugin
             }.onFailure { err ->
                 pluginDao.upsert(
                     existing.copy(
@@ -124,7 +135,7 @@ class ExtensionRepositoryImpl @Inject constructor(
 
     override suspend fun uninstallPlugin(pluginId: String) = withContext(ioDispatcher) {
         val existing = pluginDao.getById(pluginId)?.toDomain(json) ?: return@withContext
-        adapterRegistry.unregisterByPlugin(pluginId)
+        runtimeLoader.unloadPlugin(pluginId)
         installer.deletePluginFile(existing.localFilePath)
         pluginDao.upsert(
             existing.copy(
@@ -146,8 +157,9 @@ class ExtensionRepositoryImpl @Inject constructor(
                         existing.installState == PluginInstallState.UPDATE_AVAILABLE) {
                         "Install plugin before enabling"
                     }
+                    runtimeLoader.loadPlugin(existing).getOrThrow()
                 } else {
-                    adapterRegistry.unregisterByPlugin(pluginId)
+                    runtimeLoader.unloadPlugin(pluginId)
                 }
                 pluginDao.setEnabled(pluginId, enabled)
             }

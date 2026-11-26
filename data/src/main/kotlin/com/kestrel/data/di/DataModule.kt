@@ -6,7 +6,9 @@ import androidx.room.Room
 import com.kestrel.data.local.KestrelDatabase
 import com.kestrel.data.local.PluginDao
 import com.kestrel.data.local.RepoDao
+import com.kestrel.data.repository.CatalogRepositoryImpl
 import com.kestrel.data.repository.ExtensionRepositoryImpl
+import com.kestrel.domain.repository.CatalogRepository
 import com.kestrel.domain.repository.ExtensionRepository
 import dagger.Binds
 import dagger.Module
@@ -22,6 +24,10 @@ abstract class DataBindModule {
     @Binds
     @Singleton
     abstract fun bindExtensionRepository(impl: ExtensionRepositoryImpl): ExtensionRepository
+
+    @Binds
+    @Singleton
+    abstract fun bindCatalogRepository(impl: CatalogRepositoryImpl): CatalogRepository
 }
 
 @Module

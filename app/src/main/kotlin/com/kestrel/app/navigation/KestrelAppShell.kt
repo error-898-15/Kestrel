@@ -95,12 +95,14 @@ fun KestrelAppShell() {
         ) {
             composable(KestrelRoute.Home.route) {
                 HomeScreen(
-                    onOpenExtensions = { navController.navigate(KestrelRoute.Extensions.route) }
+                    onOpenExtensions = { navController.navigate(KestrelRoute.Extensions.route) },
+                    onOpenMedia = { navController.navigate("details") }
                 )
             }
             composable(KestrelRoute.Search.route) {
                 SearchScreen(
-                    onOpenExtensions = { navController.navigate(KestrelRoute.Extensions.route) }
+                    onOpenExtensions = { navController.navigate(KestrelRoute.Extensions.route) },
+                    onOpenMedia = { navController.navigate("details") }
                 )
             }
             composable(KestrelRoute.Library.route) {
