@@ -18,6 +18,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.Jsoup
+import java.util.concurrent.atomic.AtomicReference
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -70,8 +71,7 @@ class NuvioJsEngine @Inject constructor(
         timeoutMs: Long
     ): JSONObject {
         val resultDeferred = CompletableDeferred<String>()
-        @Volatile
-        var capturedJson: String? = null
+        val capturedJson = AtomicReference<String?>(null)
 
         val raw = withTimeoutOrNull(timeoutMs) {
             quickJs(Dispatchers.Default) {
@@ -84,7 +84,7 @@ class NuvioJsEngine @Inject constructor(
                                 scraperId = scraperId,
                                 reqJson = reqJson,
                                 onResult = { data ->
-                                    capturedJson = data
+                                    capturedJson.set(data)
                                     if (!resultDeferred.isCompleted) resultDeferred.complete(data)
                                 }
                             )
@@ -115,9 +115,9 @@ class NuvioJsEngine @Inject constructor(
                 evaluate<Any?>(scriptCode, "$scraperId.js")
                 runCatching { evaluate<Any?>(callScript, "nuvio-invoke.js") }
 
-                capturedJson ?: if (resultDeferred.isCompleted) resultDeferred.await() else null
+                capturedJson.get() ?: if (resultDeferred.isCompleted) resultDeferred.await() else null
             }
-        } ?: capturedJson
+        } ?: capturedJson.get()
 
         if (raw.isNullOrBlank()) {
             return JSONObject().put("error", "Nuvio scraper timed out or returned no output")
