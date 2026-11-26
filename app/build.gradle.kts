@@ -80,6 +80,10 @@ dependencies {
 
     implementation(libs.hilt.android)
     ksp(libs.hilt.compiler)
+    // Hilt 2.58 bundles a kotlin-metadata-jvm that only reads Kotlin metadata <= 2.3.
+    // Kotlin 2.4 emits metadata 2.4.0, so hiltJavaCompileDebug failed. Put a newer
+    // metadata reader (same version as the Kotlin plugin) on the processor path.
+    ksp("org.jetbrains.kotlin:kotlin-metadata-jvm:${libs.versions.kotlin.get()}")
 
     testImplementation(libs.junit)
 }
