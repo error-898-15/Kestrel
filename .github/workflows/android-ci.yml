@@ -1,0 +1,58 @@
+name: Android CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      CLOUDSTREAM_COMMIT: a28e6468f54cfe420feebd205d3d21d08ed0cde8
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Cache CloudStream local-m2
+        id: cache-m2
+        uses: actions/cache@v4
+        with:
+          path: local-m2
+          key: cloudstream-lib-${{ env.CLOUDSTREAM_COMMIT }}
+
+      - name: Publish pinned CloudStream library
+        if: steps.cache-m2.outputs.cache-hit != 'true'
+        run: bash scripts/fetch-cloudstream-lib.sh
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.11.1
+
+      - name: Build Debug APK
+        run: gradle assembleDebug --no-daemon
+
+      - name: Upload Debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: kestrel-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+
+      - name: Run Unit Tests
+        run: gradle testDebugUnitTest --no-daemon
+
+      - name: Run Lint
+        run: gradle lintDebug --no-daemon
