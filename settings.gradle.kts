@@ -1,16 +1,3 @@
-// Kotlin 2.4 class metadata needs R8/D8 9.1.29 (AGP 8.13 bundles 8.13, which only
-// understands Kotlin <= 2.3). Without this, D8 logs a "Unexpected error during rewriting of
-// Kotlin metadata" stack trace for every CloudStream class and the build runs out of memory.
-buildscript {
-    repositories {
-        google()
-        mavenCentral()
-    }
-    dependencies {
-        classpath("com.android.tools:r8:9.1.29")
-    }
-}
-
 pluginManagement {
     repositories {
         google {
@@ -22,6 +9,19 @@ pluginManagement {
         }
         mavenCentral()
         gradlePluginPortal()
+    }
+}
+
+// Kotlin 2.4 class metadata needs R8/D8 9.1.29 (AGP 8.13 bundles 8.13, which only
+// understands Kotlin <= 2.3). Without this, D8 logs a "Unexpected error during rewriting of
+// Kotlin metadata" stack trace for every CloudStream class and the build runs out of memory.
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath("com.android.tools:r8:9.1.29")
     }
 }
 
