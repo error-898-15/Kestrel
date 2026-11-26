@@ -26,16 +26,23 @@ jobs:
       - name: Accept Android SDK licenses
         run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
 
-      - name: Cache CloudStream local-m2
+      - name: Restore CloudStream local-m2
         id: cache-m2
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: local-m2
           key: cloudstream-lib-${{ env.CLOUDSTREAM_COMMIT }}
 
       - name: Publish pinned CloudStream library
         if: steps.cache-m2.outputs.cache-hit != 'true'
-        run: bash scripts/fetch-cloudstream-lib.sh
+        run: bash scripts/fetch-cloudstream-lib.sh || (sleep 20 && bash scripts/fetch-cloudstream-lib.sh)
+
+      - name: Save CloudStream local-m2
+        if: steps.cache-m2.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: local-m2
+          key: cloudstream-lib-${{ env.CLOUDSTREAM_COMMIT }}
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
