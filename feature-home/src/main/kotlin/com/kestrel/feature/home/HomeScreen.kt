@@ -466,4 +466,6 @@ private fun MediaType.heroLabel(): String = when (this) {
     MediaType.LIVE -> "Live"
     MediaType.OVA -> "OVA"
     MediaType.CARTOON -> "Cartoon"
+    MediaType.DOCUMENTARY -> "Documentary"
+    MediaType.OTHER -> "Other"
 }
