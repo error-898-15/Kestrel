@@ -4,6 +4,7 @@ package com.kestrel.feature.extensions
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.kestrel.domain.model.PluginMetadata
+import com.kestrel.domain.model.ProviderSettingsUiTarget
 import com.kestrel.domain.model.RepoConfig
 import com.kestrel.domain.repository.ExtensionRepository
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -21,6 +22,7 @@ import javax.inject.Inject
 data class ExtensionsUiState(
     val repositories: List<RepoConfig> = emptyList(),
     val plugins: List<PluginMetadata> = emptyList(),
+    val configurablePluginIds: Set<String> = emptySet(),
     val availableLanguages: List<String> = emptyList(),
     val availableTvTypes: List<String> = emptyList(),
     val selectedLanguage: String? = null,
@@ -31,6 +33,10 @@ data class ExtensionsUiState(
     val refreshingRepoIds: Set<String> = emptySet(),
     val installingRepoIds: Set<String> = emptySet(),
     val busyPluginIds: Set<String> = emptySet(),
+    val loadingSettingsPluginIds: Set<String> = emptySet(),
+    val activeSettingsTarget: ProviderSettingsUiTarget? = null,
+    val isSavingSettings: Boolean = false,
+    val settingsError: String? = null,
     val bannerMessage: String? = null,
     val bannerIsError: Boolean = false
 )
@@ -52,6 +58,10 @@ class ExtensionsViewModel @Inject constructor(
         val refreshingRepoIds: Set<String> = emptySet(),
         val installingRepoIds: Set<String> = emptySet(),
         val busyPluginIds: Set<String> = emptySet(),
+        val loadingSettingsPluginIds: Set<String> = emptySet(),
+        val activeSettingsTarget: ProviderSettingsUiTarget? = null,
+        val isSavingSettings: Boolean = false,
+        val settingsError: String? = null,
         val bannerMessage: String? = null,
         val bannerIsError: Boolean = false
     )
@@ -104,11 +114,13 @@ class ExtensionsViewModel @Inject constructor(
 
     val uiState: StateFlow<ExtensionsUiState> = combine(
         filteredSlice,
+        repository.configurablePluginIds,
         actionState
-    ) { slice, actions ->
+    ) { slice, configurableIds, actions ->
         ExtensionsUiState(
             repositories = slice.repositories,
             plugins = slice.plugins,
+            configurablePluginIds = configurableIds,
             availableLanguages = slice.availableLanguages,
             availableTvTypes = slice.availableTvTypes,
             selectedLanguage = slice.queryState.selectedLanguage,
@@ -119,6 +131,10 @@ class ExtensionsViewModel @Inject constructor(
             refreshingRepoIds = actions.refreshingRepoIds,
             installingRepoIds = actions.installingRepoIds,
             busyPluginIds = actions.busyPluginIds,
+            loadingSettingsPluginIds = actions.loadingSettingsPluginIds,
+            activeSettingsTarget = actions.activeSettingsTarget,
+            isSavingSettings = actions.isSavingSettings,
+            settingsError = actions.settingsError,
             bannerMessage = actions.bannerMessage,
             bannerIsError = actions.bannerIsError
         )
@@ -252,13 +268,21 @@ class ExtensionsViewModel @Inject constructor(
                 repository.installPlugin(plugin.id)
             }
             result
-                .onSuccess {
+                .onSuccess { installed ->
                     actionState.update {
-                        it.copy(
-                            busyPluginIds = it.busyPluginIds - plugin.id,
-                            bannerMessage = "Installed ${plugin.displayName}",
-                            bannerIsError = false
-                        )
+                        if (!installed.lastError.isNullOrBlank()) {
+                            it.copy(
+                                busyPluginIds = it.busyPluginIds - plugin.id,
+                                bannerMessage = "${plugin.displayName}: ${installed.lastError}",
+                                bannerIsError = true
+                            )
+                        } else {
+                            it.copy(
+                                busyPluginIds = it.busyPluginIds - plugin.id,
+                                bannerMessage = "Installed ${plugin.displayName}",
+                                bannerIsError = false
+                            )
+                        }
                     }
                 }
                 .onFailure { err ->
@@ -287,6 +311,111 @@ class ExtensionsViewModel @Inject constructor(
                         it.copy(
                             bannerMessage = err.message ?: "Could not toggle plugin",
                             bannerIsError = true
+                        )
+                    }
+                }
+        }
+    }
+
+    fun openPluginSettings(plugin: PluginMetadata) {
+        viewModelScope.launch {
+            actionState.update {
+                it.copy(
+                    loadingSettingsPluginIds = it.loadingSettingsPluginIds + plugin.id,
+                    settingsError = null
+                )
+            }
+            repository.openOrLoadSettings(plugin.id)
+                .onSuccess { target ->
+                    actionState.update {
+                        when (target) {
+                            is ProviderSettingsUiTarget.NativeCloudStreamOpened -> it.copy(
+                                loadingSettingsPluginIds = it.loadingSettingsPluginIds - plugin.id
+                            )
+                            is ProviderSettingsUiTarget.NuvioConfig,
+                            is ProviderSettingsUiTarget.StremioConfig -> it.copy(
+                                loadingSettingsPluginIds = it.loadingSettingsPluginIds - plugin.id,
+                                activeSettingsTarget = target,
+                                settingsError = null
+                            )
+                        }
+                    }
+                }
+                .onFailure { err ->
+                    actionState.update {
+                        it.copy(
+                            loadingSettingsPluginIds = it.loadingSettingsPluginIds - plugin.id,
+                            bannerMessage = err.message ?: "Could not open settings for ${plugin.displayName}",
+                            bannerIsError = true
+                        )
+                    }
+                }
+        }
+    }
+
+    fun dismissSettingsDialog() {
+        actionState.update {
+            it.copy(
+                activeSettingsTarget = null,
+                isSavingSettings = false,
+                settingsError = null
+            )
+        }
+    }
+
+    fun saveNuvioSettings(
+        pluginId: String,
+        values: Map<String, String>,
+        customHeaders: Map<String, String>
+    ) {
+        viewModelScope.launch {
+            actionState.update { it.copy(isSavingSettings = true, settingsError = null) }
+            repository.saveNuvioSettings(pluginId, values, customHeaders)
+                .onSuccess {
+                    actionState.update {
+                        it.copy(
+                            isSavingSettings = false,
+                            activeSettingsTarget = null,
+                            bannerMessage = "Provider settings saved",
+                            bannerIsError = false
+                        )
+                    }
+                }
+                .onFailure { err ->
+                    actionState.update {
+                        it.copy(
+                            isSavingSettings = false,
+                            settingsError = err.message ?: "Failed to save settings"
+                        )
+                    }
+                }
+        }
+    }
+
+    fun saveStremioSettings(
+        pluginId: String,
+        manifestUrl: String,
+        configValues: Map<String, String>,
+        customHeaders: Map<String, String>
+    ) {
+        viewModelScope.launch {
+            actionState.update { it.copy(isSavingSettings = true, settingsError = null) }
+            repository.saveStremioSettings(pluginId, manifestUrl, configValues, customHeaders)
+                .onSuccess { updated ->
+                    actionState.update {
+                        it.copy(
+                            isSavingSettings = false,
+                            activeSettingsTarget = null,
+                            bannerMessage = "Saved settings for ${updated.displayName}",
+                            bannerIsError = false
+                        )
+                    }
+                }
+                .onFailure { err ->
+                    actionState.update {
+                        it.copy(
+                            isSavingSettings = false,
+                            settingsError = err.message ?: "Failed to apply Stremio settings"
                         )
                     }
                 }

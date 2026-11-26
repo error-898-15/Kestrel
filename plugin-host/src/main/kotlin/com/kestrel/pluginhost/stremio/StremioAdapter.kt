@@ -15,23 +15,24 @@ import com.kestrel.domain.model.StreamSource
 import com.kestrel.domain.model.SubtitleTrack
 import com.kestrel.domain.provider.SourceProvider
 import com.kestrel.pluginhost.PluginSandbox
+import com.kestrel.pluginhost.settings.ProviderSettingsStore
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import java.security.MessageDigest
 
 /**
- * Adapts a Stremio HTTP add-on (/manifest.json, /catalog, /meta, /stream)
- * into Kestrel's unified [SourceProvider].
+ * Adapts a Stremio HTTP addon manifest.json into Kestrel's [SourceProvider].
  */
 class StremioAdapter(
-    plugin: PluginMetadata,
+    private val plugin: PluginMetadata,
     private val manifest: StremioAddonManifest,
     private val client: StremioClient,
-    private val sandbox: PluginSandbox
+    private val sandbox: PluginSandbox,
+    private val settingsStore: ProviderSettingsStore? = null
 ) : SourceProvider {
 
-    private val baseUrl = client.baseUrlOf(plugin.downloadUrl)
+    private val baseUrl: String = client.baseUrlOf(plugin.downloadUrl)
 
     override val pluginId: String = plugin.id
     override val providerId: String = "${plugin.id}:${manifest.id.ifBlank { plugin.internalName }}"
@@ -44,14 +45,18 @@ class StremioAdapter(
 
     override val hasCatalog: Boolean = manifest.catalogs.isNotEmpty()
 
+    private fun customHeaders(): Map<String, String> =
+        settingsStore?.getHeaders(pluginId).orEmpty()
+
     override suspend fun getCatalog(page: Int): Result<List<CatalogRow>> =
         sandbox.execute(pluginId) {
             if (page > 1) return@execute emptyList()
+            val headers = customHeaders()
             coroutineScope {
                 manifest.catalogs.take(6).map { catalog ->
                     async {
                         val res = runCatching {
-                            client.fetchCatalog(baseUrl, catalog.type, catalog.id)
+                            client.fetchCatalog(baseUrl, catalog.type, catalog.id, customHeaders = headers)
                         }.getOrNull()
                         val items = res?.metas.orEmpty().map { meta ->
                             mapMetaPreview(meta)
@@ -72,11 +77,18 @@ class StremioAdapter(
     override suspend fun search(query: String, page: Int): Result<List<MediaSummary>> =
         sandbox.execute(pluginId) {
             if (page > 1) return@execute emptyList()
+            val headers = customHeaders()
             coroutineScope {
                 manifest.catalogs.take(4).map { catalog ->
                     async {
                         runCatching {
-                            client.fetchCatalog(baseUrl, catalog.type, catalog.id, searchQuery = query)
+                            client.fetchCatalog(
+                                baseUrl = baseUrl,
+                                type = catalog.type,
+                                catalogId = catalog.id,
+                                searchQuery = query,
+                                customHeaders = headers
+                            )
                         }.getOrNull()?.metas.orEmpty().map { mapMetaPreview(it) }
                     }
                 }.awaitAll().flatten().distinctBy { it.url }
@@ -86,7 +98,8 @@ class StremioAdapter(
     override suspend fun load(url: String): Result<MediaDetails> =
         sandbox.execute(pluginId) {
             val (type, id) = parseMetaToken(url)
-            val meta = client.fetchMeta(baseUrl, type, id).meta
+            val headers = customHeaders()
+            val meta = client.fetchMeta(baseUrl, type, id, headers).meta
                 ?: error("$name returned no meta for $id")
 
             val episodes = meta.videos.mapIndexed { idx, v ->
@@ -124,7 +137,7 @@ class StremioAdapter(
     override suspend fun getLinks(data: String): Result<ResolvedLinks> =
         sandbox.execute(pluginId, timeoutMs = 25_000L) {
             val (type, id) = parseMetaToken(data)
-            val response = client.fetchStreams(baseUrl, type, id)
+            val response = client.fetchStreams(baseUrl, type, id, customHeaders())
 
             val streams = mutableListOf<StreamSource>()
             val subtitles = mutableListOf<SubtitleTrack>()

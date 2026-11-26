@@ -3,10 +3,10 @@ package com.kestrel.app
 
 import android.graphics.Color
 import android.os.Bundle
-import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.appcompat.app.AppCompatActivity
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.rememberCoroutineScope
@@ -20,7 +20,7 @@ import kotlinx.coroutines.launch
 import javax.inject.Inject
 
 @AndroidEntryPoint
-class MainActivity : ComponentActivity() {
+class MainActivity : AppCompatActivity() {
 
     @Inject
     lateinit var appPreferences: AppPreferences
@@ -36,7 +36,9 @@ class MainActivity : ComponentActivity() {
             KestrelTheme {
                 val disclaimerAccepted by appPreferences.disclaimerAccepted.collectAsState(initial = true)
                 val scope = rememberCoroutineScope()
+
                 KestrelAppShell()
+
                 if (!disclaimerAccepted) {
                     FirstLaunchDisclaimerDialog(
                         onAccept = {

@@ -124,7 +124,7 @@ class RepoUrlResolver @Inject constructor(
     }
 
     private fun toJsDelivrMirror(url: String): String? {
-        val rawRegex = Regex("^https?://raw\\.githubusercontent\\.com/([^/]+)/([^/]+)/([^/]+)/(.*)$")
+        val rawRegex = Regex("^https?://raw\\.githubusercontent\\.com/([^/]+)/([^/]+)/(?:refs/heads/)?([^/]+)/(.*)$")
         val match = rawRegex.matchEntire(url) ?: return null
         val (owner, repo, branch, path) = match.destructured
         return "https://cdn.jsdelivr.net/gh/$owner/$repo@$branch/$path"
@@ -141,9 +141,11 @@ class RepoUrlResolver @Inject constructor(
             return listOf(
                 "https://raw.githubusercontent.com/$owner/$repo/main/manifest.json",
                 "https://raw.githubusercontent.com/$owner/$repo/main/repo.json",
+                "https://raw.githubusercontent.com/$owner/$repo/builds/repo.json",
                 "https://raw.githubusercontent.com/$owner/$repo/master/manifest.json",
                 "https://raw.githubusercontent.com/$owner/$repo/master/repo.json",
                 "https://raw.githubusercontent.com/$owner/$repo/main/plugins.json",
+                "https://raw.githubusercontent.com/$owner/$repo/builds/plugins.json",
                 "https://raw.githubusercontent.com/$owner/$repo/master/plugins.json"
             )
         }

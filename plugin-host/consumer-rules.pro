@@ -4,5 +4,14 @@
 -keep enum com.lagradost.cloudstream3.** { *; }
 -keep class com.lagradost.api.** { *; }
 -keep class com.lagradost.nicehttp.** { *; }
+-keep class com.google.android.material.** { *; }
+-keep class com.google.gson.** { *; }
+-keep class com.fasterxml.jackson.** { *; }
+-keep class org.jsoup.** { *; }
+-keep class com.fleeksoft.ksoup.** { *; }
+-keep class io.ktor.** { *; }
+-keep class androidx.appcompat.app.** { *; }
+-keep class androidx.fragment.app.** { *; }
 -keepattributes *Annotation*,Signature,InnerClasses,EnclosingMethod
 -dontwarn com.lagradost.cloudstream3.**
+-dontwarn com.google.android.material.**

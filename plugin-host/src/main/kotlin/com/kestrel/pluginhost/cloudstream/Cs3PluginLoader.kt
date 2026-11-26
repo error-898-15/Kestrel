@@ -7,6 +7,7 @@ import android.content.res.Resources
 import android.util.Log
 import com.kestrel.core.di.IoDispatcher
 import com.kestrel.domain.model.PluginMetadata
+import com.kestrel.domain.model.ProviderSettingsUiTarget
 import com.kestrel.domain.model.RepoType
 import com.kestrel.domain.provider.SourceProvider
 import com.kestrel.domain.repository.PluginRuntimeLoader
@@ -14,15 +15,25 @@ import com.kestrel.pluginhost.AdapterRegistry
 import com.kestrel.pluginhost.PluginSandbox
 import com.lagradost.cloudstream3.APIHolder
 import com.lagradost.cloudstream3.CloudStreamApp
+import com.lagradost.cloudstream3.CommonActivity
 import com.lagradost.cloudstream3.LoadResponse
+import com.lagradost.cloudstream3.MainActivity
 import com.lagradost.cloudstream3.plugins.BasePlugin
 import com.lagradost.cloudstream3.plugins.Plugin
+import com.lagradost.cloudstream3.plugins.PluginData
+import com.lagradost.cloudstream3.plugins.PluginManager
 import com.lagradost.cloudstream3.utils.extractorApis
 import dagger.hilt.android.qualifiers.ApplicationContext
 import dalvik.system.DexClassLoader
 import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -55,7 +66,8 @@ class Cs3PluginLoader @Inject constructor(
         val pluginId: String,
         val filePath: String,
         val instance: BasePlugin,
-        val providers: List<SourceProvider>
+        val providers: List<SourceProvider>,
+        val metadata: PluginMetadata
     )
 
     private data class ParsedCs3Manifest(
@@ -65,6 +77,9 @@ class Cs3PluginLoader @Inject constructor(
 
     private val mutex = Mutex()
     private val loadedByPluginId = ConcurrentHashMap<String, LoadedPluginRecord>()
+    private val _configurablePluginIds = MutableStateFlow<Set<String>>(emptySet())
+    private val _homeReloadRequests = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
+    override val homeReloadRequests: Flow<Unit> = _homeReloadRequests.asSharedFlow()
 
     init {
         CloudStreamApp.init(context)
@@ -72,10 +87,16 @@ class Cs3PluginLoader @Inject constructor(
         LoadResponse.kitsuIdPrefix = "kitsu"
         LoadResponse.aniListIdPrefix = "anilist"
         LoadResponse.simklIdPrefix = "simkl"
+        MainActivity.reloadHomeEvent += { _ ->
+            _homeReloadRequests.tryEmit(Unit)
+        }
     }
 
     override val activeProviders: Flow<List<SourceProvider>> =
         adapterRegistry.providers.map { it.values.toList() }
+
+    override val configurablePluginIds: Flow<Set<String>> =
+        _configurablePluginIds.asStateFlow()
 
     override suspend fun loadPlugin(plugin: PluginMetadata): Result<List<SourceProvider>> =
         withContext(ioDispatcher) {
@@ -137,8 +158,9 @@ class Cs3PluginLoader @Inject constructor(
                     }
 
                     val beforeApis = APIHolder.allProviders.toSet()
+                    val loadContext: Context = CommonActivity.activity ?: context
                     if (instance is Plugin) {
-                        instance.load(context)
+                        instance.load(loadContext)
                     } else {
                         instance.load()
                     }
@@ -161,14 +183,23 @@ class Cs3PluginLoader @Inject constructor(
                     }
 
                     adapters.forEach { adapterRegistry.register(it) }
+                    PluginManager.plugins[file.absolutePath] = instance
                     loadedByPluginId[plugin.id] = LoadedPluginRecord(
                         pluginId = plugin.id,
                         filePath = file.absolutePath,
                         instance = instance,
-                        providers = adapters
+                        providers = adapters,
+                        metadata = plugin
                     )
+                    syncOnlinePluginsList()
+
+                    val hasSettings = (instance as? Plugin)?.openSettings != null
+                    _configurablePluginIds.update { current ->
+                        if (hasSettings) current + plugin.id else current - plugin.id
+                    }
+
                     sandbox.markHealthy(plugin.id)
-                    Log.i(TAG, "Loaded ${plugin.displayName} (${adapters.size} MainAPI provider(s))")
+                    Log.i(TAG, "Loaded ${plugin.displayName} (${adapters.size} MainAPI provider(s), hasSettings=$hasSettings)")
                     adapters
                 }.onFailure { err ->
                     Log.e(TAG, "Failed to load ${plugin.displayName}", err)
@@ -189,13 +220,58 @@ class Cs3PluginLoader @Inject constructor(
     override fun getProvider(providerId: String): SourceProvider? =
         adapterRegistry.get(providerId)
 
+    override suspend fun openOrLoadSettings(plugin: PluginMetadata): Result<ProviderSettingsUiTarget> {
+        if (plugin.repoType != RepoType.CLOUDSTREAM) {
+            return Result.failure(IllegalArgumentException("Not a CloudStream plugin"))
+        }
+        val existing = loadedByPluginId[plugin.id]
+        if (existing == null) {
+            loadPlugin(plugin).onFailure { return Result.failure(it) }
+        }
+        val record = loadedByPluginId[plugin.id]
+            ?: return Result.failure(IllegalStateException("Enable ${plugin.displayName} to open settings"))
+        val csPlugin = record.instance as? Plugin
+        val openSettingsFn = csPlugin?.openSettings
+            ?: return Result.failure(IllegalStateException("${plugin.displayName} has no settings menu"))
+        val activity = CommonActivity.activity
+            ?: return Result.failure(IllegalStateException("No active screen available for settings"))
+
+        return withContext(Dispatchers.Main) {
+            runCatching {
+                openSettingsFn.invoke(activity)
+                ProviderSettingsUiTarget.NativeCloudStreamOpened(plugin.id)
+            }
+        }
+    }
+
+    override suspend fun saveProviderSettings(
+        plugin: PluginMetadata,
+        values: Map<String, String>,
+        customHeaders: Map<String, String>
+    ): Result<Unit> = Result.success(Unit)
+
     private fun unloadInternal(pluginId: String) {
         val record = loadedByPluginId.remove(pluginId)
+        _configurablePluginIds.update { it - pluginId }
         adapterRegistry.unregisterByPlugin(pluginId)
         if (record != null) {
+            PluginManager.plugins.remove(record.filePath)
             runCatching { record.instance.beforeUnload() }
             APIHolder.allProviders.removeAll { it.sourcePlugin == record.filePath }
             extractorApis.removeAll { it.sourcePlugin == record.filePath }
+            syncOnlinePluginsList()
+        }
+    }
+
+    private fun syncOnlinePluginsList() {
+        PluginManager.onlinePluginsList = loadedByPluginId.values.map { record ->
+            PluginData(
+                internalName = record.metadata.internalName,
+                url = record.metadata.downloadUrl,
+                isOnline = true,
+                filePath = record.filePath,
+                version = record.metadata.version
+            )
         }
     }
 

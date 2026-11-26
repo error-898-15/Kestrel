@@ -40,6 +40,8 @@ dependencies {
     implementation(libs.rhino)
     implementation(libs.quickjs.kt)
     implementation(libs.androidx.appcompat)
+    implementation(libs.material)
+    implementation(libs.gson)
     implementation(libs.okhttp)
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.kotlinx.serialization.json)

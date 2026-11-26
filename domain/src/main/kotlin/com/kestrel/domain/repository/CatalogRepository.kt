@@ -24,6 +24,7 @@ data class ProviderSearchResult(
 
 interface CatalogRepository {
     val activeProviders: Flow<List<SourceProvider>>
+    val homeReloadRequests: Flow<Unit>
 
     suspend fun syncEnabledPlugins(force: Boolean = false)
 

@@ -76,7 +76,7 @@ internal object CloudStreamMappers {
             providerId = providerId,
             providerName = providerName,
             title = item.name,
-            url = resolveUrl(item.url, baseUrl) ?: item.url,
+            url = resolveItemUrl(item.url, baseUrl) ?: item.url,
             type = mapTvType(item.type),
             posterUrl = resolveUrl(item.posterUrl, baseUrl),
             posterHeaders = item.posterHeaders.orEmpty(),
@@ -217,11 +217,25 @@ internal object CloudStreamMappers {
         headers = sub.headers.orEmpty()
     )
 
+    private fun resolveItemUrl(raw: String?, baseUrl: String): String? {
+        val trimmed = raw?.trim()?.takeIf { it.isNotBlank() } ?: return null
+        return when {
+            trimmed.startsWith("{") || trimmed.startsWith("[") -> trimmed
+            trimmed.startsWith("http://", ignoreCase = true) ||
+                trimmed.startsWith("https://", ignoreCase = true) -> trimmed
+            trimmed.startsWith("//") -> "https:$trimmed"
+            trimmed.startsWith("/") && baseUrl.isNotBlank() ->
+                "${baseUrl.trimEnd('/')}$trimmed"
+            else -> trimmed
+        }
+    }
+
     private fun resolveUrl(raw: String?, baseUrl: String): String? {
         val trimmed = raw?.trim()?.takeIf { it.isNotBlank() } ?: return null
         return when {
             trimmed.startsWith("http://", ignoreCase = true) ||
-                trimmed.startsWith("https://", ignoreCase = true) -> trimmed
+                trimmed.startsWith("https://", ignoreCase = true) ||
+                trimmed.startsWith("data:", ignoreCase = true) -> trimmed
             trimmed.startsWith("//") -> "https:$trimmed"
             trimmed.startsWith("/") && baseUrl.isNotBlank() ->
                 "${baseUrl.trimEnd('/')}$trimmed"

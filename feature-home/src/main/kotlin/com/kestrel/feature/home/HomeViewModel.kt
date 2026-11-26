@@ -75,6 +75,13 @@ class HomeViewModel @Inject constructor(
                     }
                 }
         }
+        viewModelScope.launch {
+            catalogRepository.homeReloadRequests.collect {
+                if (lastLoadedProviderIds.isNotEmpty()) {
+                    refreshCatalogs()
+                }
+            }
+        }
     }
 
     fun selectProvider(providerId: String?) {

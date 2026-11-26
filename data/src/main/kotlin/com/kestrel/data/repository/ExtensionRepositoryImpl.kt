@@ -11,11 +11,14 @@ import com.kestrel.data.remote.RepoJsonParser
 import com.kestrel.data.remote.RepoUrlResolver
 import com.kestrel.domain.model.PluginInstallState
 import com.kestrel.domain.model.PluginMetadata
+import com.kestrel.domain.model.ProviderSettingsUiTarget
 import com.kestrel.domain.model.RepoConfig
 import com.kestrel.domain.model.RepoType
 import com.kestrel.domain.repository.ExtensionRepository
 import com.kestrel.domain.repository.PluginRuntimeLoader
 import com.kestrel.pluginhost.PluginSandbox
+import com.kestrel.pluginhost.settings.ProviderSettingsStore
+import com.kestrel.pluginhost.stremio.StremioClient
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -38,6 +41,8 @@ class ExtensionRepositoryImpl @Inject constructor(
     private val jsonParser: RepoJsonParser,
     private val installer: PluginInstaller,
     private val runtimeLoader: PluginRuntimeLoader,
+    private val stremioClient: StremioClient,
+    private val settingsStore: ProviderSettingsStore,
     private val json: Json,
     @IoDispatcher private val ioDispatcher: CoroutineDispatcher
 ) : ExtensionRepository {
@@ -47,6 +52,9 @@ class ExtensionRepositoryImpl @Inject constructor(
 
     override val plugins: Flow<List<PluginMetadata>> =
         pluginDao.observeAll().map { rows -> rows.map { it.toDomain(json) } }
+
+    override val configurablePluginIds: Flow<Set<String>> =
+        runtimeLoader.configurablePluginIds
 
     override suspend fun addRepository(rawInput: String): Result<RepoConfig> =
         withContext(ioDispatcher) {
@@ -87,7 +95,10 @@ class ExtensionRepositoryImpl @Inject constructor(
 
     override suspend fun removeRepository(repoId: String) = withContext(ioDispatcher) {
         val repoPlugins = pluginDao.getByRepo(repoId)
-        repoPlugins.forEach { runtimeLoader.unloadPlugin(it.id) }
+        repoPlugins.forEach {
+            runtimeLoader.unloadPlugin(it.id)
+            settingsStore.clear(it.id)
+        }
         installer.deleteRepoDirectory(repoId)
         pluginDao.deleteByRepo(repoId)
         repoDao.deleteById(repoId)
@@ -111,8 +122,6 @@ class ExtensionRepositoryImpl @Inject constructor(
                 val updated = existing.copy(
                     localFilePath = installedFile.absolutePath,
                     installState = PluginInstallState.INSTALLED,
-                    // Nuvio scrapers can be enabled immediately once explicitly installed by user,
-                    // or toggled off individually anytime.
                     isEnabled = true,
                     lastError = null
                 )
@@ -157,7 +166,7 @@ class ExtensionRepositoryImpl @Inject constructor(
                     candidates.map { plugin ->
                         async {
                             semaphore.withPermit {
-                                installPlugin(plugin.id).isSuccess
+                                installPlugin(plugin.id).mapCatching { it.lastError == null }.getOrDefault(false)
                             }
                         }
                     }.awaitAll()
@@ -172,6 +181,7 @@ class ExtensionRepositoryImpl @Inject constructor(
     override suspend fun uninstallPlugin(pluginId: String) = withContext(ioDispatcher) {
         val existing = pluginDao.getById(pluginId)?.toDomain(json) ?: return@withContext
         runtimeLoader.unloadPlugin(pluginId)
+        settingsStore.clear(pluginId)
         installer.deletePluginFile(existing.localFilePath)
         pluginDao.upsert(
             existing.copy(
@@ -207,10 +217,11 @@ class ExtensionRepositoryImpl @Inject constructor(
                         "Install plugin before enabling"
                     }
                     runtimeLoader.loadPlugin(existing).getOrThrow()
+                    pluginDao.upsert(existing.copy(isEnabled = true, lastError = null).toEntity(json))
                 } else {
                     runtimeLoader.unloadPlugin(pluginId)
+                    pluginDao.setEnabled(pluginId, false)
                 }
-                pluginDao.setEnabled(pluginId, enabled)
             }
         }
 
@@ -235,6 +246,90 @@ class ExtensionRepositoryImpl @Inject constructor(
         }
         if (repaired.isNotEmpty()) {
             pluginDao.upsertAll(repaired)
+        }
+    }
+
+    override suspend fun openOrLoadSettings(pluginId: String): Result<ProviderSettingsUiTarget> =
+        withContext(ioDispatcher) {
+            val plugin = pluginDao.getById(pluginId)?.toDomain(json)
+                ?: return@withContext Result.failure(IllegalArgumentException("Plugin not found"))
+            runtimeLoader.openOrLoadSettings(plugin)
+        }
+
+    override suspend fun saveNuvioSettings(
+        pluginId: String,
+        values: Map<String, String>,
+        customHeaders: Map<String, String>
+    ): Result<Unit> = withContext(ioDispatcher) {
+        val plugin = pluginDao.getById(pluginId)?.toDomain(json)
+            ?: return@withContext Result.failure(IllegalArgumentException("Plugin not found"))
+        runtimeLoader.saveProviderSettings(plugin, values, customHeaders).onSuccess {
+            if (plugin.isEnabled) {
+                runtimeLoader.unloadPlugin(plugin.id)
+                runtimeLoader.loadPlugin(plugin)
+            }
+        }
+    }
+
+    override suspend fun saveStremioSettings(
+        pluginId: String,
+        manifestUrl: String,
+        configValues: Map<String, String>,
+        customHeaders: Map<String, String>
+    ): Result<PluginMetadata> = withContext(ioDispatcher) {
+        runCatching {
+            val existing = pluginDao.getById(pluginId)?.toDomain(json)
+                ?: error("Stremio addon not found")
+            require(existing.repoType == RepoType.STREMIO) { "Not a Stremio addon" }
+
+            runtimeLoader.saveProviderSettings(existing, configValues, customHeaders).getOrThrow()
+
+            val normalizedInput = stremioClient.normalizeManifestUrl(
+                manifestUrl.ifBlank { existing.downloadUrl }
+            )
+
+            // If user filled manifest.config fields without changing URL manually,
+            // attempt standard Stremio SDK config-encoded URL first and verify it resolves.
+            val candidateUrl = if (normalizedInput == existing.downloadUrl && configValues.any { it.value.isNotBlank() }) {
+                val encodedUrl = stremioClient.buildConfigEncodedManifestUrl(normalizedInput, configValues)
+                val probe = runCatching { stremioClient.fetchManifest(encodedUrl, customHeaders) }
+                if (probe.isSuccess) encodedUrl else normalizedInput
+            } else {
+                normalizedInput
+            }
+
+            val manifest = stremioClient.fetchManifest(candidateUrl, customHeaders)
+            val updatedPlugin = existing.copy(
+                downloadUrl = candidateUrl,
+                displayName = manifest.name.ifBlank { existing.displayName },
+                description = manifest.description.ifBlank { existing.description },
+                iconUrl = manifest.logo ?: existing.iconUrl,
+                tvTypes = manifest.types.ifEmpty { existing.tvTypes },
+                lastError = null
+            )
+
+            repoDao.getById(existing.repoId)?.toDomain(json)?.let { repo ->
+                repoDao.upsert(
+                    repo.copy(
+                        url = candidateUrl,
+                        resolvedUrl = candidateUrl,
+                        name = manifest.name.ifBlank { repo.name },
+                        description = manifest.description.ifBlank { repo.description },
+                        isHealthy = true,
+                        lastCheckedEpochMs = System.currentTimeMillis(),
+                        lastError = null
+                    ).toEntity(json)
+                )
+            }
+
+            pluginDao.upsert(updatedPlugin.toEntity(json))
+
+            if (updatedPlugin.isEnabled) {
+                runtimeLoader.unloadPlugin(updatedPlugin.id)
+                runtimeLoader.loadPlugin(updatedPlugin).getOrThrow()
+            }
+
+            updatedPlugin
         }
     }
 

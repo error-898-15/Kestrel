@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package com.kestrel.pluginhost.nuvio
 
+import com.kestrel.domain.model.ActorCredit
 import com.kestrel.domain.model.CatalogRow
+import com.kestrel.domain.model.Episode
 import com.kestrel.domain.model.MediaDetails
 import com.kestrel.domain.model.MediaSummary
 import com.kestrel.domain.model.MediaType
@@ -19,12 +21,13 @@ import java.security.MessageDigest
 
 /**
  * Adapts a user-enabled Nuvio JS scraper into Kestrel's [SourceProvider].
- * Scrapers expect data tokens in the form "tmdb:<id>:<movie|tv>[:season:episode]"
- * or plain TMDB IDs when invoked directly for stream resolution.
+ * Catalog, search, and metadata are powered by [CinemetaCatalogClient] so downloaded
+ * Nuvio scrapers immediately appear on Home and resolve TMDB tokens for playback.
  */
 class NuvioAdapter(
     private val plugin: PluginMetadata,
     private val engine: NuvioJsEngine,
+    private val catalogClient: CinemetaCatalogClient,
     private val sandbox: PluginSandbox
 ) : SourceProvider {
 
@@ -43,26 +46,88 @@ class NuvioAdapter(
         }
     }.toSet().ifEmpty { setOf(MediaType.MOVIE, MediaType.TV_SERIES) }
 
-    // Nuvio JS plugins are stream scrapers rather than standalone catalog providers.
-    override val hasCatalog: Boolean = false
+    override val hasCatalog: Boolean = true
 
     override suspend fun getCatalog(page: Int): Result<List<CatalogRow>> =
-        Result.success(emptyList())
+        sandbox.execute(pluginId) {
+            if (page > 1) return@execute emptyList()
+            catalogClient.fetchHomeCatalogs().map { section ->
+                CatalogRow(
+                    id = stableId("$providerId:${section.id}"),
+                    providerId = providerId,
+                    providerName = name,
+                    title = section.title,
+                    items = section.items.map { mapCatalogItem(it) },
+                    hasNextPage = false
+                )
+            }
+        }
 
     override suspend fun search(query: String, page: Int): Result<List<MediaSummary>> =
-        Result.success(emptyList())
+        sandbox.execute(pluginId) {
+            if (page > 1 || query.isBlank()) return@execute emptyList()
+            catalogClient.search(query).map { mapCatalogItem(it) }
+        }
 
     override suspend fun load(url: String): Result<MediaDetails> =
         sandbox.execute(pluginId) {
-            MediaDetails(
-                id = stableId("$providerId:$url"),
-                providerId = providerId,
-                providerName = name,
-                title = url,
-                url = url,
-                type = MediaType.MOVIE,
-                playDataUrl = url
-            )
+            if (url.startsWith("cinemeta:")) {
+                val parts = url.removePrefix("cinemeta:").split(":")
+                val type = parts.getOrNull(0).orEmpty().ifBlank { "movie" }
+                val id = parts.getOrNull(1).orEmpty().ifBlank { url }
+                val hintTmdb = parts.getOrNull(2)?.takeIf { it.isNotBlank() }
+
+                val meta = catalogClient.fetchMeta(type, id)
+                    ?: error("$name returned no details for $id")
+                val tmdbOrId = meta.moviedbId ?: hintTmdb ?: meta.id
+                val mediaKind = if (meta.type.equals("movie", ignoreCase = true)) "movie" else "tv"
+
+                val episodes = meta.videos
+                    .sortedWith(compareBy<CinemetaVideoItem>({ it.season ?: 0 }, { it.episode ?: 0 }))
+                    .mapIndexed { idx, v ->
+                        val s = v.season ?: 1
+                        val e = v.episode ?: (idx + 1)
+                        Episode(
+                            id = stableId("$providerId:${v.id}:$s:$e"),
+                            name = v.title ?: "Episode $e",
+                            season = s,
+                            episodeNumber = e,
+                            dataUrl = "tmdb:$tmdbOrId:$mediaKind:$s:$e",
+                            posterUrl = v.thumbnail,
+                            description = v.overview
+                        )
+                    }
+
+                MediaDetails(
+                    id = stableId("$providerId:${meta.id}"),
+                    providerId = providerId,
+                    providerName = name,
+                    title = meta.name,
+                    url = url,
+                    type = mapCinemetaType(meta.type),
+                    plot = meta.description,
+                    posterUrl = meta.poster,
+                    backdropUrl = meta.background ?: meta.poster,
+                    logoUrl = meta.logo,
+                    year = meta.releaseInfo?.take(4)?.toIntOrNull(),
+                    durationMinutes = meta.runtime?.filter(Char::isDigit)?.toIntOrNull(),
+                    rating = meta.imdbRating?.toDoubleOrNull(),
+                    tags = meta.genres,
+                    actors = meta.cast.map { ActorCredit(name = it) },
+                    episodes = episodes,
+                    playDataUrl = if (episodes.isEmpty()) "tmdb:$tmdbOrId:$mediaKind" else episodes.first().dataUrl
+                )
+            } else {
+                MediaDetails(
+                    id = stableId("$providerId:$url"),
+                    providerId = providerId,
+                    providerName = name,
+                    title = url,
+                    url = url,
+                    type = MediaType.MOVIE,
+                    playDataUrl = url
+                )
+            }
         }
 
     override suspend fun getLinks(data: String): Result<ResolvedLinks> =
@@ -72,6 +137,7 @@ class NuvioAdapter(
             val target = parseTarget(data)
 
             val output = engine.executeGetStreams(
+                pluginId = pluginId,
                 scraperId = plugin.internalName,
                 scriptCode = scriptCode,
                 tmdbId = target.tmdbId,
@@ -144,6 +210,37 @@ class NuvioAdapter(
                 subtitles = subtitles.distinctBy { it.url }
             )
         }
+
+    private fun mapCatalogItem(item: CinemetaCatalogItem): MediaSummary {
+        val token = buildString {
+            append("cinemeta:")
+            append(item.type)
+            append(":")
+            append(item.id)
+            if (!item.moviedbId.isNullOrBlank()) {
+                append(":")
+                append(item.moviedbId)
+            }
+        }
+        return MediaSummary(
+            id = stableId("$providerId:${item.type}:${item.id}"),
+            providerId = providerId,
+            providerName = name,
+            title = item.name,
+            url = token,
+            type = mapCinemetaType(item.type),
+            posterUrl = item.poster,
+            year = item.releaseInfo?.take(4)?.toIntOrNull(),
+            rating = item.imdbRating?.toDoubleOrNull()
+        )
+    }
+
+    private fun mapCinemetaType(type: String): MediaType = when (type.lowercase()) {
+        "movie" -> MediaType.MOVIE
+        "series", "tv" -> MediaType.TV_SERIES
+        "anime" -> MediaType.ANIME
+        else -> MediaType.OTHER
+    }
 
     private data class NuvioTarget(
         val tmdbId: String,

@@ -47,6 +47,7 @@ class CatalogRepositoryImpl @Inject constructor(
     private var syncedOnce = false
 
     override val activeProviders: Flow<List<SourceProvider>> = runtimeLoader.activeProviders
+    override val homeReloadRequests: Flow<Unit> = runtimeLoader.homeReloadRequests
 
     override suspend fun syncEnabledPlugins(force: Boolean) = withContext(ioDispatcher) {
         if (!force && syncedOnce) return@withContext
@@ -60,7 +61,6 @@ class CatalogRepositoryImpl @Inject constructor(
                         plugin.installState == PluginInstallState.UPDATE_AVAILABLE) &&
                     !installer.isInstalledOnDisk(plugin)
                 ) {
-                    // File was lost (e.g., cache/backup mismatch): reset cleanly to NOT_INSTALLED so Download button appears.
                     runtimeLoader.unloadPlugin(plugin.id)
                     pluginDao.upsert(
                         plugin.copy(
@@ -95,9 +95,27 @@ class CatalogRepositoryImpl @Inject constructor(
         page: Int
     ): Flow<ProviderCatalogResult> = channelFlow {
         syncEnabledPlugins(force = false)
-        val providers = runtimeLoader.activeProviders.first()
+        val matching = runtimeLoader.activeProviders.first()
             .filter { it.hasCatalog }
             .filter { providerFilterId == null || it.providerId == providerFilterId }
+
+        // Nuvio scrapers share Cinemeta home catalogs; in "All" mode fetch once to avoid duplicate rows,
+        // while selecting a specific Nuvio provider chip loads rows attributed to that provider.
+        val providers = if (providerFilterId == null) {
+            var seenNuvio = false
+            matching.filter { provider ->
+                if (provider.repoType == RepoType.NUVIO) {
+                    if (seenNuvio) false else {
+                        seenNuvio = true
+                        true
+                    }
+                } else {
+                    true
+                }
+            }
+        } else {
+            matching
+        }
 
         val semaphore = Semaphore(MAX_CONCURRENT_PROVIDERS)
         supervisorScope {

@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package com.kestrel.feature.extensions
 
+import android.annotation.SuppressLint
+import android.webkit.CookieManager
+import android.webkit.WebResourceRequest
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.tween
@@ -15,17 +20,23 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.outlined.Add
+import androidx.compose.material.icons.outlined.ArrowDropDown
 import androidx.compose.material.icons.outlined.CheckCircle
+import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.Cloud
 import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.DeleteOutline
@@ -33,17 +44,24 @@ import androidx.compose.material.icons.outlined.Download
 import androidx.compose.material.icons.outlined.ErrorOutline
 import androidx.compose.material.icons.outlined.Extension
 import androidx.compose.material.icons.outlined.Folder
+import androidx.compose.material.icons.outlined.Language
 import androidx.compose.material.icons.outlined.Movie
 import androidx.compose.material.icons.outlined.PlayArrow
 import androidx.compose.material.icons.outlined.Refresh
+import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.SystemUpdateAlt
+import androidx.compose.material.icons.outlined.Visibility
+import androidx.compose.material.icons.outlined.VisibilityOff
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
@@ -52,6 +70,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -68,10 +88,16 @@ import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil3.compose.AsyncImage
@@ -90,6 +116,9 @@ import com.kestrel.core.designsystem.kestrelNavClearance
 import com.kestrel.core.designsystem.rememberKestrelImageRequest
 import com.kestrel.domain.model.PluginInstallState
 import com.kestrel.domain.model.PluginMetadata
+import com.kestrel.domain.model.ProviderSettingField
+import com.kestrel.domain.model.ProviderSettingType
+import com.kestrel.domain.model.ProviderSettingsUiTarget
 import com.kestrel.domain.model.RepoConfig
 import com.kestrel.domain.model.RepoType
 
@@ -109,9 +138,9 @@ private enum class RepoFilter(
     val icon: ImageVector
 ) {
     ALL("ALL", "All installed repos", "All repos you've added", null, Icons.Outlined.Folder),
-    CLOUDSTREAM("CLOUDSTREAM", "CloudStream repos", "repo.json \u00B7 CloudStream extensions", RepoType.CLOUDSTREAM, Icons.Outlined.Cloud),
-    NUVIO("NUVIO", "Nuvio repos", "manifest.json \u00B7 Nuvio providers", RepoType.NUVIO, Icons.Outlined.PlayArrow),
-    STREMIO("STREMIO", "Stremio repos", "manifest.json \u00B7 Stremio addons", RepoType.STREMIO, Icons.Outlined.Movie);
+    CLOUDSTREAM("CLOUDSTREAM", "CloudStream repos", "repo.json · CloudStream extensions", RepoType.CLOUDSTREAM, Icons.Outlined.Cloud),
+    NUVIO("NUVIO", "Nuvio repos", "manifest.json · Nuvio providers", RepoType.NUVIO, Icons.Outlined.PlayArrow),
+    STREMIO("STREMIO", "Stremio repos", "manifest.json · Stremio addons", RepoType.STREMIO, Icons.Outlined.Movie);
 
     companion object {
         fun fromKey(key: String): RepoFilter = entries.firstOrNull { it.key == key } ?: ALL
@@ -201,7 +230,7 @@ fun ExtensionsScreen(
                     val installed = state.plugins.filter { it.isInstalled() }
                     GlassScreenHeader(
                         title = "Installed extensions",
-                        subtitle = "Manage, toggle & uninstall",
+                        subtitle = "Manage, toggle, configure & uninstall",
                         onBack = { back() },
                         trailing = {
                             Text(
@@ -215,7 +244,7 @@ fun ExtensionsScreen(
                     GlassSearchField(
                         value = state.searchQuery,
                         onValueChange = viewModel::onSearchQueryChanged,
-                        placeholder = "Filter installed extensions\u2026",
+                        placeholder = "Filter installed extensions…",
                         modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp),
                         onClear = { viewModel.onSearchQueryChanged("") }
                     )
@@ -252,7 +281,7 @@ fun ExtensionsScreen(
                                 )
                                 ActionCircle(
                                     icon = Icons.Outlined.Refresh,
-                                    description = "Validate Repository",
+                                    description = "Refresh repository",
                                     busy = isRefreshing,
                                     onClick = { viewModel.validateAndRefreshRepo(repo.id) }
                                 )
@@ -262,14 +291,14 @@ fun ExtensionsScreen(
                         GlassSearchField(
                             value = state.searchQuery,
                             onValueChange = viewModel::onSearchQueryChanged,
-                            placeholder = "Search this repo\u2026",
+                            placeholder = "Search this repo…",
                             modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp),
                             onClear = { viewModel.onSearchQueryChanged("") }
                         )
                         if (repo.type != RepoType.STREMIO) {
                             KestrelPrimaryButton(
                                 text = when {
-                                    isInstallingAll -> "Installing\u2026"
+                                    isInstallingAll -> "Installing…"
                                     pending > 0 -> "Install all ($pending)"
                                     else -> "All plugins installed"
                                 },
@@ -391,6 +420,35 @@ fun ExtensionsScreen(
             onDismiss = { showAddDialog = false }
         )
     }
+
+    when (val target = state.activeSettingsTarget) {
+        is ProviderSettingsUiTarget.NuvioConfig -> {
+            NuvioSettingsDialog(
+                target = target,
+                isSaving = state.isSavingSettings,
+                errorMessage = state.settingsError,
+                onSave = { values, headers ->
+                    viewModel.saveNuvioSettings(target.pluginId, values, headers)
+                },
+                onDismiss = viewModel::dismissSettingsDialog
+            )
+        }
+
+        is ProviderSettingsUiTarget.StremioConfig -> {
+            StremioSettingsDialog(
+                target = target,
+                isSaving = state.isSavingSettings,
+                errorMessage = state.settingsError,
+                onSave = { manifestUrl, values, headers ->
+                    viewModel.saveStremioSettings(target.pluginId, manifestUrl, values, headers)
+                },
+                onDismiss = viewModel::dismissSettingsDialog
+            )
+        }
+
+        is ProviderSettingsUiTarget.NativeCloudStreamOpened,
+        null -> Unit
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -426,7 +484,7 @@ private fun HubPage(
                 MenuRowContent(
                     icon = Icons.Outlined.Extension,
                     title = "$installed extensions installed",
-                    subtitle = "${state.repositories.size} repos \u00B7 $enabled enabled"
+                    subtitle = "${state.repositories.size} repos · $enabled enabled"
                 )
             }
         }
@@ -453,7 +511,7 @@ private fun HubPage(
                         MenuRowContent(
                             icon = filter.icon,
                             title = filter.title,
-                            subtitle = filter.subtitle + " \u00B7 " + count
+                            subtitle = filter.subtitle + " · " + count
                         )
                     }
                     if (index != rows.lastIndex) {
@@ -596,9 +654,15 @@ private fun PluginList(
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
         items(plugins, key = { it.id }, contentType = { "plugin_row" }) { plugin ->
+            val canOpenSettings = plugin.id in state.configurablePluginIds ||
+                plugin.repoType == RepoType.STREMIO ||
+                (plugin.repoType == RepoType.NUVIO && plugin.isInstalled())
             PluginCard(
                 plugin = plugin,
                 isBusy = plugin.id in state.busyPluginIds,
+                showSettings = canOpenSettings,
+                isSettingsLoading = plugin.id in state.loadingSettingsPluginIds,
+                onOpenSettings = { viewModel.openPluginSettings(plugin) },
                 onInstallOrUpdate = { viewModel.installOrUpdatePlugin(plugin) },
                 onUninstall = { viewModel.uninstallPlugin(plugin.id) },
                 onToggleEnabled = { enabled -> viewModel.togglePluginEnabled(plugin.id, enabled) }
@@ -699,7 +763,7 @@ private fun RepositoryCard(
                     SourceBadge(label = repo.type.name)
                     Text(
                         text = if (pendingCount > 0 && repo.type != RepoType.STREMIO) {
-                            "$pluginCount plugins \u00B7 $pendingCount to install"
+                            "$pluginCount plugins · $pendingCount to install"
                         } else {
                             "$pluginCount plugins"
                         },
@@ -808,6 +872,9 @@ private fun GlassPillButton(
 private fun PluginCard(
     plugin: PluginMetadata,
     isBusy: Boolean,
+    showSettings: Boolean,
+    isSettingsLoading: Boolean,
+    onOpenSettings: () -> Unit,
     onInstallOrUpdate: () -> Unit,
     onUninstall: () -> Unit,
     onToggleEnabled: (Boolean) -> Unit
@@ -818,7 +885,7 @@ private fun PluginCard(
         plugin.authors.takeIf { it.isNotEmpty() }?.joinToString(", "),
         "v${plugin.version}",
         plugin.tvTypes.takeIf { it.isNotEmpty() }?.joinToString(", ")
-    ).joinToString(" \u00B7 ")
+    ).joinToString(" · ")
 
     KestrelCard(modifier = Modifier.fillMaxWidth()) {
         Row(
@@ -920,7 +987,7 @@ private fun PluginCard(
 
                 PluginInstallState.INSTALLING -> {
                     GlassPillButton(
-                        text = "Installing\u2026",
+                        text = "Installing…",
                         icon = null,
                         onClick = {},
                         busy = true
@@ -934,6 +1001,15 @@ private fun PluginCard(
                         onClick = onInstallOrUpdate,
                         busy = isBusy
                     )
+                    if (showSettings) {
+                        ActionCircle(
+                            icon = Icons.Outlined.Settings,
+                            description = "Provider settings",
+                            onClick = onOpenSettings,
+                            busy = isSettingsLoading,
+                            tint = LilacText
+                        )
+                    }
                     Spacer(modifier = Modifier.weight(1f))
                     Switch(
                         checked = plugin.isEnabled,
@@ -949,6 +1025,15 @@ private fun PluginCard(
                         onClick = onUninstall,
                         accent = colors.statusError
                     )
+                    if (showSettings) {
+                        ActionCircle(
+                            icon = Icons.Outlined.Settings,
+                            description = "Provider settings",
+                            onClick = onOpenSettings,
+                            busy = isSettingsLoading,
+                            tint = LilacText
+                        )
+                    }
                     Spacer(modifier = Modifier.weight(1f))
                     Switch(
                         checked = plugin.isEnabled,
@@ -970,7 +1055,7 @@ private fun PluginCard(
 }
 
 // ---------------------------------------------------------------------------------------------
-// Add repository dialog
+// Dialogs (Add Repo + Provider Settings + Stremio Web Configurator)
 // ---------------------------------------------------------------------------------------------
 
 @Composable
@@ -1009,15 +1094,7 @@ private fun AddRepoDialog(
                     placeholder = { Text("https://... or cloudstreamrepo://...") },
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(18.dp),
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = colors.accentAmber,
-                        unfocusedBorderColor = Color.White.copy(alpha = 0.25f),
-                        focusedContainerColor = Color.White.copy(alpha = 0.06f),
-                        unfocusedContainerColor = Color.White.copy(alpha = 0.06f),
-                        focusedTextColor = colors.textPrimary,
-                        unfocusedTextColor = colors.textPrimary,
-                        cursorColor = colors.accentAmber
-                    )
+                    colors = kestrelDialogFieldColors()
                 )
                 if (!errorMessage.isNullOrBlank()) {
                     Text(
@@ -1042,3 +1119,547 @@ private fun AddRepoDialog(
         }
     )
 }
+
+@Composable
+private fun NuvioSettingsDialog(
+    target: ProviderSettingsUiTarget.NuvioConfig,
+    isSaving: Boolean,
+    errorMessage: String?,
+    onSave: (Map<String, String>, Map<String, String>) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val colors = KestrelTheme.colors
+    val fieldValues = remember(target) {
+        mutableStateMapOf<String, String>().apply {
+            target.fields.forEach { field ->
+                if (field.type != ProviderSettingType.HEADER) {
+                    put(field.key, field.currentValue)
+                }
+            }
+        }
+    }
+    val headerRows = remember(target) {
+        mutableStateListOf<Pair<String, String>>().apply {
+            target.customHeaders.forEach { (k, v) -> add(k to v) }
+        }
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = Color(0xFF2A2150),
+        titleContentColor = colors.textPrimary,
+        textContentColor = colors.textSecondary,
+        shape = RoundedCornerShape(28.dp),
+        title = {
+            Text(
+                text = "${target.displayName} settings",
+                style = MaterialTheme.typography.titleLarge,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 420.dp)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                if (target.fields.isEmpty()) {
+                    Text(
+                        text = "This Nuvio provider does not define custom fields. You can configure HTTP headers (Cookie, User-Agent, Authorization) below.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = colors.textSecondary
+                    )
+                } else {
+                    SettingsFieldsSection(
+                        fields = target.fields,
+                        values = fieldValues
+                    )
+                }
+
+                CustomHeadersSection(headers = headerRows)
+
+                if (!errorMessage.isNullOrBlank()) {
+                    Text(
+                        text = errorMessage,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = colors.statusError
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            KestrelPrimaryButton(
+                text = if (isSaving) "Saving…" else "Save",
+                enabled = !isSaving,
+                onClick = {
+                    val headerMap = headerRows
+                        .mapNotNull { (k, v) ->
+                            val key = k.trim()
+                            val value = v.trim()
+                            if (key.isNotEmpty() && value.isNotEmpty()) key to value else null
+                        }
+                        .toMap()
+                    onSave(fieldValues.toMap(), headerMap)
+                }
+            )
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text(text = "Cancel", color = colors.textSecondary)
+            }
+        }
+    )
+}
+
+@Composable
+private fun StremioSettingsDialog(
+    target: ProviderSettingsUiTarget.StremioConfig,
+    isSaving: Boolean,
+    errorMessage: String?,
+    onSave: (String, Map<String, String>, Map<String, String>) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val colors = KestrelTheme.colors
+    var manifestUrl by remember(target) { mutableStateOf(target.manifestUrl) }
+    var showWebConfigure by remember(target) { mutableStateOf(false) }
+
+    val fieldValues = remember(target) {
+        mutableStateMapOf<String, String>().apply {
+            target.fields.forEach { field ->
+                if (field.type != ProviderSettingType.HEADER) {
+                    put(field.key, field.currentValue)
+                }
+            }
+        }
+    }
+    val headerRows = remember(target) {
+        mutableStateListOf<Pair<String, String>>().apply {
+            target.customHeaders.forEach { (k, v) -> add(k to v) }
+        }
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = Color(0xFF2A2150),
+        titleContentColor = colors.textPrimary,
+        textContentColor = colors.textSecondary,
+        shape = RoundedCornerShape(28.dp),
+        title = {
+            Text(
+                text = "${target.displayName} settings",
+                style = MaterialTheme.typography.titleLarge,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 460.dp)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                if (!target.configureWebUrl.isNullOrBlank()) {
+                    GlassPillButton(
+                        text = "Open Web Configurator",
+                        icon = Icons.Outlined.Language,
+                        onClick = { showWebConfigure = true },
+                        accent = colors.accentTeal,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+
+                Text(
+                    text = "Manifest URL",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = colors.textPrimary
+                )
+                OutlinedTextField(
+                    value = manifestUrl,
+                    onValueChange = { manifestUrl = it },
+                    singleLine = true,
+                    placeholder = { Text("https://.../manifest.json") },
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(16.dp),
+                    colors = kestrelDialogFieldColors()
+                )
+
+                if (target.fields.isNotEmpty()) {
+                    SettingsFieldsSection(
+                        fields = target.fields,
+                        values = fieldValues
+                    )
+                }
+
+                CustomHeadersSection(headers = headerRows)
+
+                if (!errorMessage.isNullOrBlank()) {
+                    Text(
+                        text = errorMessage,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = colors.statusError
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            KestrelPrimaryButton(
+                text = if (isSaving) "Saving…" else "Save",
+                enabled = !isSaving && manifestUrl.isNotBlank(),
+                onClick = {
+                    val headerMap = headerRows
+                        .mapNotNull { (k, v) ->
+                            val key = k.trim()
+                            val value = v.trim()
+                            if (key.isNotEmpty() && value.isNotEmpty()) key to value else null
+                        }
+                        .toMap()
+                    onSave(manifestUrl.trim(), fieldValues.toMap(), headerMap)
+                }
+            )
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text(text = "Cancel", color = colors.textSecondary)
+            }
+        }
+    )
+
+    val webUrl = target.configureWebUrl
+    if (showWebConfigure && !webUrl.isNullOrBlank()) {
+        StremioWebConfigureDialog(
+            title = "${target.displayName} Configure",
+            configureUrl = webUrl,
+            onManifestCaptured = { capturedUrl ->
+                manifestUrl = capturedUrl
+                showWebConfigure = false
+            },
+            onDismiss = { showWebConfigure = false }
+        )
+    }
+}
+
+@Composable
+private fun SettingsFieldsSection(
+    fields: List<ProviderSettingField>,
+    values: MutableMap<String, String>
+) {
+    val colors = KestrelTheme.colors
+    fields.forEach { field ->
+        when (field.type) {
+            ProviderSettingType.HEADER -> {
+                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text(
+                        text = field.label,
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.SemiBold,
+                        color = colors.accentAmber
+                    )
+                    if (field.description.isNotBlank()) {
+                        Text(
+                            text = field.description,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = colors.textMuted
+                        )
+                    }
+                }
+            }
+
+            ProviderSettingType.TOGGLE -> {
+                val checked = (values[field.key] ?: field.defaultValue).equals("true", ignoreCase = true)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
+                        Text(
+                            text = field.label,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = colors.textPrimary
+                        )
+                        if (field.description.isNotBlank()) {
+                            Text(
+                                text = field.description,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = colors.textMuted
+                            )
+                        }
+                    }
+                    Switch(
+                        checked = checked,
+                        onCheckedChange = { values[field.key] = if (it) "true" else "false" }
+                    )
+                }
+            }
+
+            ProviderSettingType.SELECT -> {
+                var expanded by remember(field.key) { mutableStateOf(false) }
+                val currentVal = values[field.key] ?: field.defaultValue
+                val currentLabel = field.options.firstOrNull { it.value == currentVal }?.label
+                    ?: currentVal.ifBlank { "Select…" }
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text(
+                        text = field.label,
+                        style = MaterialTheme.typography.labelLarge,
+                        color = colors.textPrimary
+                    )
+                    Box {
+                        OutlinedTextField(
+                            value = currentLabel,
+                            onValueChange = {},
+                            readOnly = true,
+                            trailingIcon = {
+                                Icon(
+                                    imageVector = Icons.Outlined.ArrowDropDown,
+                                    contentDescription = null,
+                                    tint = colors.textSecondary
+                                )
+                            },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { expanded = true },
+                            enabled = false,
+                            shape = RoundedCornerShape(16.dp),
+                            colors = OutlinedTextFieldDefaults.colors(
+                                disabledTextColor = colors.textPrimary,
+                                disabledBorderColor = Color.White.copy(alpha = 0.25f),
+                                disabledContainerColor = Color.White.copy(alpha = 0.06f)
+                            )
+                        )
+                        DropdownMenu(
+                            expanded = expanded,
+                            onDismissRequest = { expanded = false }
+                        ) {
+                            field.options.forEach { opt ->
+                                DropdownMenuItem(
+                                    text = { Text(opt.label) },
+                                    onClick = {
+                                        values[field.key] = opt.value
+                                        expanded = false
+                                    }
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            ProviderSettingType.PASSWORD -> {
+                var reveal by remember(field.key) { mutableStateOf(false) }
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text(
+                        text = field.label,
+                        style = MaterialTheme.typography.labelLarge,
+                        color = colors.textPrimary
+                    )
+                    OutlinedTextField(
+                        value = values[field.key].orEmpty(),
+                        onValueChange = { values[field.key] = it },
+                        singleLine = true,
+                        visualTransformation = if (reveal) VisualTransformation.None else PasswordVisualTransformation(),
+                        trailingIcon = {
+                            IconButton(onClick = { reveal = !reveal }) {
+                                Icon(
+                                    imageVector = if (reveal) Icons.Outlined.VisibilityOff else Icons.Outlined.Visibility,
+                                    contentDescription = null,
+                                    tint = colors.textSecondary
+                                )
+                            }
+                        },
+                        placeholder = if (field.description.isNotBlank()) {
+                            { Text(field.description, maxLines = 1, overflow = TextOverflow.Ellipsis) }
+                        } else null,
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(16.dp),
+                        colors = kestrelDialogFieldColors()
+                    )
+                }
+            }
+
+            ProviderSettingType.NUMBER,
+            ProviderSettingType.TEXT -> {
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text(
+                        text = field.label,
+                        style = MaterialTheme.typography.labelLarge,
+                        color = colors.textPrimary
+                    )
+                    OutlinedTextField(
+                        value = values[field.key].orEmpty(),
+                        onValueChange = { values[field.key] = it },
+                        singleLine = true,
+                        keyboardOptions = if (field.type == ProviderSettingType.NUMBER) {
+                            KeyboardOptions(keyboardType = KeyboardType.Number)
+                        } else {
+                            KeyboardOptions.Default
+                        },
+                        placeholder = if (field.description.isNotBlank()) {
+                            { Text(field.description, maxLines = 1, overflow = TextOverflow.Ellipsis) }
+                        } else null,
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(16.dp),
+                        colors = kestrelDialogFieldColors()
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CustomHeadersSection(
+    headers: MutableList<Pair<String, String>>
+) {
+    val colors = KestrelTheme.colors
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Text(
+                text = "Custom HTTP Headers",
+                style = MaterialTheme.typography.labelLarge,
+                color = colors.accentAmber
+            )
+            TextButton(onClick = { headers.add("" to "") }) {
+                Text(text = "+ Add header", color = colors.accentTeal)
+            }
+        }
+
+        headers.forEachIndexed { index, pair ->
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                OutlinedTextField(
+                    value = pair.first,
+                    onValueChange = { headers[index] = it to pair.second },
+                    singleLine = true,
+                    placeholder = { Text("Header") },
+                    modifier = Modifier.weight(0.42f),
+                    shape = RoundedCornerShape(14.dp),
+                    colors = kestrelDialogFieldColors()
+                )
+                OutlinedTextField(
+                    value = pair.second,
+                    onValueChange = { headers[index] = pair.first to it },
+                    singleLine = true,
+                    placeholder = { Text("Value") },
+                    modifier = Modifier.weight(0.58f),
+                    shape = RoundedCornerShape(14.dp),
+                    colors = kestrelDialogFieldColors()
+                )
+                IconButton(onClick = { headers.removeAt(index) }) {
+                    Icon(
+                        imageVector = Icons.Outlined.DeleteOutline,
+                        contentDescription = "Remove header",
+                        tint = colors.statusError
+                    )
+                }
+            }
+        }
+    }
+}
+
+@SuppressLint("SetJavaScriptEnabled")
+@Composable
+private fun StremioWebConfigureDialog(
+    title: String,
+    configureUrl: String,
+    onManifestCaptured: (String) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val colors = KestrelTheme.colors
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Surface(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(16.dp),
+            shape = RoundedCornerShape(24.dp),
+            color = Color(0xFF191430)
+        ) {
+            Column(modifier = Modifier.fillMaxSize()) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        text = title,
+                        style = MaterialTheme.typography.titleMedium,
+                        color = colors.textPrimary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f)
+                    )
+                    IconButton(onClick = onDismiss) {
+                        Icon(
+                            imageVector = Icons.Outlined.Close,
+                            contentDescription = "Close configurator",
+                            tint = colors.textSecondary
+                        )
+                    }
+                }
+
+                AndroidView(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f),
+                    factory = { ctx ->
+                        WebView(ctx).apply {
+                            settings.javaScriptEnabled = true
+                            settings.domStorageEnabled = true
+                            settings.useWideViewPort = true
+                            settings.loadWithOverviewMode = true
+                            CookieManager.getInstance().setAcceptCookie(true)
+                            CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+                            webViewClient = object : WebViewClient() {
+                                override fun shouldOverrideUrlLoading(
+                                    view: WebView?,
+                                    request: WebResourceRequest?
+                                ): Boolean {
+                                    val url = request?.url?.toString().orEmpty()
+                                    val lower = url.lowercase()
+                                    if (lower.startsWith("stremio://")) {
+                                        val converted = "https://" + url.substring("stremio://".length).trimStart('/')
+                                        onManifestCaptured(converted)
+                                        return true
+                                    }
+                                    if (lower.endsWith("/manifest.json") || "/manifest.json?" in lower) {
+                                        onManifestCaptured(url)
+                                        return true
+                                    }
+                                    return false
+                                }
+                            }
+                            loadUrl(configureUrl)
+                        }
+                    }
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun kestrelDialogFieldColors() = OutlinedTextFieldDefaults.colors(
+    focusedBorderColor = KestrelTheme.colors.accentAmber,
+    unfocusedBorderColor = Color.White.copy(alpha = 0.25f),
+    focusedContainerColor = Color.White.copy(alpha = 0.06f),
+    unfocusedContainerColor = Color.White.copy(alpha = 0.06f),
+    focusedTextColor = KestrelTheme.colors.textPrimary,
+    unfocusedTextColor = KestrelTheme.colors.textPrimary,
+    cursorColor = KestrelTheme.colors.accentAmber
+)

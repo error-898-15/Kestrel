@@ -12,6 +12,23 @@ data class StremioCatalogDescriptor(
 )
 
 @Serializable
+data class StremioManifestBehaviorHints(
+    val configurable: Boolean = false,
+    val configurationRequired: Boolean = false,
+    val adult: Boolean = false
+)
+
+@Serializable
+data class StremioConfigField(
+    val key: String = "",
+    val type: String = "text",
+    val title: String = "",
+    val default: JsonElement? = null,
+    val required: Boolean = false,
+    val options: List<JsonElement> = emptyList()
+)
+
+@Serializable
 data class StremioAddonManifest(
     val id: String = "",
     val name: String = "",
@@ -20,7 +37,9 @@ data class StremioAddonManifest(
     val logo: String? = null,
     val types: List<String> = emptyList(),
     val catalogs: List<StremioCatalogDescriptor> = emptyList(),
-    val resources: List<JsonElement> = emptyList()
+    val resources: List<JsonElement> = emptyList(),
+    val behaviorHints: StremioManifestBehaviorHints? = null,
+    val config: List<StremioConfigField> = emptyList()
 )
 
 @Serializable

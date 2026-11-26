@@ -120,7 +120,7 @@ class PluginInstaller @Inject constructor(
     }
 
     private fun toJsDelivrMirror(url: String): String? {
-        val rawRegex = Regex("^https?://raw\\.githubusercontent\\.com/([^/]+)/([^/]+)/([^/]+)/(.*)$")
+        val rawRegex = Regex("^https?://raw\\.githubusercontent\\.com/([^/]+)/([^/]+)/(?:refs/heads/)?([^/]+)/(.*)$")
         val match = rawRegex.matchEntire(url) ?: return null
         val (owner, repo, branch, path) = match.destructured
         return "https://cdn.jsdelivr.net/gh/$owner/$repo@$branch/$path"

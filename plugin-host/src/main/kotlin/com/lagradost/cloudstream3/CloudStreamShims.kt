@@ -16,6 +16,7 @@ import androidx.fragment.app.Fragment
 import com.kestrel.core.network.KestrelCookieJar
 import com.kestrel.core.network.KestrelDohDns
 import com.lagradost.cloudstream3.utils.DataStore
+import com.lagradost.cloudstream3.utils.Event
 import okhttp3.Cache
 import java.io.File
 import java.lang.ref.WeakReference
@@ -23,11 +24,10 @@ import java.util.concurrent.TimeUnit
 
 /**
  * Host-level compatibility shims matching CloudStream3's `:app` runtime API
- * (`CloudStreamApp.Companion`, `AcraApplication.Companion`, `CommonActivity`).
+ * (`CloudStreamApp.Companion`, `AcraApplication.Companion`, `CommonActivity`, `MainActivity`).
  * Compiled with Jetpack Compose enabled so `$stable` fields match `.cs3` expectations.
  */
 open class CloudStreamApp : Application() {
-
     override fun attachBaseContext(base: Context?) {
         super.attachBaseContext(base)
         context = base
@@ -53,7 +53,7 @@ open class CloudStreamApp : Application() {
         tailrec fun Context.getActivity(): Activity? = when (this) {
             is Activity -> this
             is ContextWrapper -> baseContext.getActivity()
-            else -> null
+            else -> CommonActivity.activity
         }
 
         fun init(context: Context) {
@@ -253,26 +253,65 @@ object CommonActivity {
         activity = instance
     }
 
-    fun showToast(message: String?, duration: Int = Toast.LENGTH_SHORT) {
+    fun showToast(message: String?, duration: Int? = Toast.LENGTH_SHORT) {
         val ctx = activity ?: CloudStreamApp.context ?: return
         if (message.isNullOrBlank()) return
+        val toastDuration = duration ?: Toast.LENGTH_SHORT
         Handler(Looper.getMainLooper()).post {
-            runCatching { Toast.makeText(ctx, message, duration).show() }
+            runCatching { Toast.makeText(ctx, message, toastDuration).show() }
         }
     }
 
-    fun showToast(@StringRes message: Int, duration: Int = Toast.LENGTH_SHORT) {
+    fun showToast(@StringRes message: Int, duration: Int? = Toast.LENGTH_SHORT) {
         val ctx = activity ?: CloudStreamApp.context ?: return
+        val toastDuration = duration ?: Toast.LENGTH_SHORT
         Handler(Looper.getMainLooper()).post {
-            runCatching { Toast.makeText(ctx, message, duration).show() }
+            runCatching { Toast.makeText(ctx, message, toastDuration).show() }
         }
     }
 
-    fun showToast(act: Activity?, message: String?, duration: Int = Toast.LENGTH_SHORT) {
+    fun showToast(act: Activity?, message: String?, duration: Int? = Toast.LENGTH_SHORT) {
         val ctx = act ?: activity ?: CloudStreamApp.context ?: return
         if (message.isNullOrBlank()) return
+        val toastDuration = duration ?: Toast.LENGTH_SHORT
         Handler(Looper.getMainLooper()).post {
-            runCatching { Toast.makeText(ctx, message, duration).show() }
+            runCatching { Toast.makeText(ctx, message, toastDuration).show() }
+        }
+    }
+}
+
+/**
+ * Compatibility shim for CloudStream's `:app` `MainActivity.Companion` events and fields.
+ */
+class MainActivity {
+    companion object {
+        const val TAG = "MAINACT"
+        const val ANIMATED_OUTLINE: Boolean = false
+        const val API_NAME_EXTRA_KEY = "API_NAME_EXTRA_KEY"
+
+        var activityResultLauncher: Any? = null
+        var lastError: String? = null
+        var nextSearchQuery: String? = null
+
+        val afterPluginsLoadedEvent = Event<Boolean>()
+        val mainPluginsLoadedEvent = Event<Boolean>()
+        val afterRepositoryLoadedEvent = Event<Boolean>()
+        val reloadHomeEvent = Event<Boolean>()
+        val reloadAccountEvent = Event<Boolean>()
+        val bookmarksUpdatedEvent = Event<Boolean>()
+
+        fun setLastError(context: Context) {
+            runCatching {
+                val errorFile = context.filesDir.resolve("last_error")
+                if (errorFile.exists() && errorFile.isFile) {
+                    lastError = errorFile.readText()
+                    errorFile.delete()
+                }
+            }
+        }
+
+        fun deleteFileOnExit(file: File) {
+            runCatching { file.deleteOnExit() }
         }
     }
 }
