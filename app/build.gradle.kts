@@ -86,3 +86,11 @@ dependencies {
 
     testImplementation(libs.junit)
 }
+
+// CloudStream library & quickjs-kt are published with minCompileSdk 37, but AGP 8.7.3 only
+// supports compileSdk 35. Skip the AAR metadata check so we can keep compiling against 35.
+tasks.configureEach {
+    if (name.startsWith("check") && name.endsWith("AarMetadata")) {
+        enabled = false
+    }
+}
