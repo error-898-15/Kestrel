@@ -43,7 +43,27 @@ jobs:
           gradle-version: 8.11.1
 
       - name: Build Debug APK
-        run: gradle assembleDebug --no-daemon
+        shell: bash
+        run: gradle assembleDebug --no-daemon --stacktrace 2>&1 | tee build.log
+
+      - name: Build error summary
+        if: failure()
+        shell: bash
+        run: |
+          {
+            echo "## Build errors"
+            echo '```'
+            grep -nE "^e: |What went wrong|Execution failed|Caused by|FAILURE:" build.log | head -60 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload build.log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
 
       - name: Upload Debug APK
         uses: actions/upload-artifact@v4
@@ -52,7 +72,19 @@ jobs:
           path: app/build/outputs/apk/debug/*.apk
 
       - name: Run Unit Tests
-        run: gradle testDebugUnitTest --no-daemon
+        shell: bash
+        run: gradle testDebugUnitTest --no-daemon 2>&1 | tee test.log
 
       - name: Run Lint
-        run: gradle lintDebug --no-daemon
+        shell: bash
+        run: gradle lintDebug --no-daemon 2>&1 | tee lint.log
+
+      - name: Upload test and lint logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-lint-logs
+          path: |
+            test.log
+            lint.log
+          if-no-files-found: ignore
