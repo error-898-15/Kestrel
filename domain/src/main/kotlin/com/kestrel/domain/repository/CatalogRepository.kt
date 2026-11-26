@@ -25,7 +25,13 @@ data class ProviderSearchResult(
 interface CatalogRepository {
     val activeProviders: Flow<List<SourceProvider>>
 
-    suspend fun syncEnabledPlugins()
+    suspend fun syncEnabledPlugins(force: Boolean = false)
+
+    fun fetchHomeCatalogsStream(
+        providerFilterId: String? = null,
+        page: Int = 1
+    ): Flow<ProviderCatalogResult>
+
     suspend fun fetchHomeCatalogs(
         providerFilterId: String? = null,
         page: Int = 1

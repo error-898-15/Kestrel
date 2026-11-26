@@ -73,7 +73,7 @@ class Cs3PluginLoader @Inject constructor(
             if (plugin.repoType != RepoType.CLOUDSTREAM) {
                 return@withContext Result.success(emptyList())
             }
-            if (plugin.apiVersion !in 1..PluginSandbox.SUPPORTED_CLOUDSTREAM_API_VERSION) {
+            if (plugin.apiVersion !in 0..PluginSandbox.SUPPORTED_CLOUDSTREAM_API_VERSION) {
                 val msg = "Skipped ${plugin.displayName}: unsupported apiVersion ${plugin.apiVersion}"
                 sandbox.markError(plugin.id, msg)
                 return@withContext Result.failure(IllegalStateException(msg))
@@ -86,7 +86,7 @@ class Cs3PluginLoader @Inject constructor(
 
             mutex.withLock {
                 loadedByPluginId[plugin.id]?.let { existing ->
-                    if (existing.filePath == path) {
+                    if (existing.filePath == path && File(path).exists()) {
                         return@withContext Result.success(existing.providers)
                     }
                     unloadInternal(plugin.id)
@@ -98,9 +98,15 @@ class Cs3PluginLoader @Inject constructor(
                     // Android 14+ refuses dynamic code loading from writable files.
                     runCatching { file.setReadOnly() }
 
-                    val dexOutDir = File(context.codeCacheDir, "cs3_dex/${plugin.id}").apply {
-                        mkdirs()
+                    val dexOutDir = File(context.codeCacheDir, "cs3_dex/${plugin.id}")
+                    val stampFile = File(dexOutDir, ".cs3_stamp")
+                    val currentStamp = "${file.length()}:${file.lastModified()}"
+                    if (dexOutDir.exists() && runCatching { stampFile.readText() }.getOrNull() != currentStamp) {
+                        dexOutDir.deleteRecursively()
                     }
+                    dexOutDir.mkdirs()
+                    runCatching { stampFile.writeText(currentStamp) }
+
                     val classLoader = DexClassLoader(
                         file.absolutePath,
                         dexOutDir.absolutePath,
@@ -122,17 +128,22 @@ class Cs3PluginLoader @Inject constructor(
                         attachPluginResources(file, instance)
                     }
 
-                    // Snapshot APIs registered during plugin load
+                    val beforeApis = APIHolder.allProviders.toSet()
+
                     if (instance is Plugin) {
                         instance.load(context)
                     } else {
                         instance.load()
                     }
 
-                    val matchingApis = APIHolder.allProviders.toList()
-                        .filter { it.sourcePlugin == file.absolutePath }
+                    val bySourcePlugin = APIHolder.allProviders.filter { it.sourcePlugin == file.absolutePath }
+                    val newlyAdded = APIHolder.allProviders.filter { it !in beforeApis }
+                    val matchingApis = (bySourcePlugin + newlyAdded).distinct()
 
                     val adapters = matchingApis.mapIndexed { idx, api ->
+                        if (api.sourcePlugin.isNullOrBlank()) {
+                            api.sourcePlugin = file.absolutePath
+                        }
                         val providerId = "${plugin.id}:${api.name.ifBlank { "provider_$idx" }}"
                         CloudStreamAdapter(
                             pluginId = plugin.id,

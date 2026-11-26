@@ -12,13 +12,19 @@ import com.kestrel.data.remote.RepoUrlResolver
 import com.kestrel.domain.model.PluginInstallState
 import com.kestrel.domain.model.PluginMetadata
 import com.kestrel.domain.model.RepoConfig
+import com.kestrel.domain.model.RepoType
 import com.kestrel.domain.repository.ExtensionRepository
 import com.kestrel.domain.repository.PluginRuntimeLoader
-import com.kestrel.pluginhost.AdapterRegistry
 import com.kestrel.pluginhost.PluginSandbox
 import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import javax.inject.Inject
@@ -31,7 +37,6 @@ class ExtensionRepositoryImpl @Inject constructor(
     private val urlResolver: RepoUrlResolver,
     private val jsonParser: RepoJsonParser,
     private val installer: PluginInstaller,
-    private val adapterRegistry: AdapterRegistry,
     private val runtimeLoader: PluginRuntimeLoader,
     private val json: Json,
     @IoDispatcher private val ioDispatcher: CoroutineDispatcher
@@ -106,6 +111,8 @@ class ExtensionRepositoryImpl @Inject constructor(
                 val updated = existing.copy(
                     localFilePath = installedFile.absolutePath,
                     installState = PluginInstallState.INSTALLED,
+                    // Nuvio scrapers can be enabled immediately once explicitly installed by user,
+                    // or toggled off individually anytime.
                     isEnabled = true,
                     lastError = null
                 )
@@ -123,10 +130,39 @@ class ExtensionRepositoryImpl @Inject constructor(
             }.onFailure { err ->
                 pluginDao.upsert(
                     existing.copy(
+                        localFilePath = null,
+                        isEnabled = false,
                         installState = PluginInstallState.ERROR,
                         lastError = err.message ?: "Installation failed"
                     ).toEntity(json)
                 )
+            }
+        }
+
+    override suspend fun installAllInRepo(repoId: String): Result<Int> =
+        withContext(ioDispatcher) {
+            runCatching {
+                val candidates = pluginDao.getByRepo(repoId)
+                    .map { it.toDomain(json) }
+                    .filter { plugin ->
+                        plugin.installState != PluginInstallState.UNSUPPORTED_API &&
+                            (!installer.isInstalledOnDisk(plugin) ||
+                                plugin.installState == PluginInstallState.UPDATE_AVAILABLE ||
+                                plugin.installState == PluginInstallState.NOT_INSTALLED ||
+                                plugin.installState == PluginInstallState.ERROR)
+                    }
+
+                val semaphore = Semaphore(3)
+                val results = coroutineScope {
+                    candidates.map { plugin ->
+                        async {
+                            semaphore.withPermit {
+                                installPlugin(plugin.id).isSuccess
+                            }
+                        }
+                    }.awaitAll()
+                }
+                results.count { it }
             }
         }
 
@@ -153,8 +189,21 @@ class ExtensionRepositoryImpl @Inject constructor(
                 val existing = pluginDao.getById(pluginId)?.toDomain(json)
                     ?: error("Plugin not found")
                 if (enabled) {
-                    require(existing.installState == PluginInstallState.INSTALLED ||
-                        existing.installState == PluginInstallState.UPDATE_AVAILABLE) {
+                    if (!installer.isInstalledOnDisk(existing)) {
+                        pluginDao.upsert(
+                            existing.copy(
+                                localFilePath = null,
+                                isEnabled = false,
+                                installState = PluginInstallState.NOT_INSTALLED,
+                                lastError = null
+                            ).toEntity(json)
+                        )
+                        error("Plugin file missing — tap Download to reinstall")
+                    }
+                    require(
+                        existing.installState == PluginInstallState.INSTALLED ||
+                            existing.installState == PluginInstallState.UPDATE_AVAILABLE
+                    ) {
                         "Install plugin before enabling"
                     }
                     runtimeLoader.loadPlugin(existing).getOrThrow()
@@ -165,20 +214,48 @@ class ExtensionRepositoryImpl @Inject constructor(
             }
         }
 
+    override suspend fun reconcileMissingFiles() = withContext(ioDispatcher) {
+        val all = pluginDao.observeAll().first().map { it.toDomain(json) }
+        val repaired = all.mapNotNull { plugin ->
+            if (plugin.repoType != RepoType.STREMIO &&
+                (plugin.installState == PluginInstallState.INSTALLED ||
+                    plugin.installState == PluginInstallState.UPDATE_AVAILABLE) &&
+                !installer.isInstalledOnDisk(plugin)
+            ) {
+                runtimeLoader.unloadPlugin(plugin.id)
+                plugin.copy(
+                    localFilePath = null,
+                    isEnabled = false,
+                    installState = PluginInstallState.NOT_INSTALLED,
+                    lastError = null
+                ).toEntity(json)
+            } else {
+                null
+            }
+        }
+        if (repaired.isNotEmpty()) {
+            pluginDao.upsertAll(repaired)
+        }
+    }
+
     private suspend fun syncParsedRepo(parsed: ParsedRepoPayload): RepoConfig {
         val repo = parsed.repo
         val existingPlugins = pluginDao.getByRepo(repo.id).map { it.toDomain(json) }.associateBy { it.id }
 
         val incomingPlugins = when (parsed) {
             is ParsedRepoPayload.CloudStream -> {
-                parsed.pluginListUrls.flatMap { listUrl ->
-                    val (_, listBody) = urlResolver.fetchText(listUrl)
-                    jsonParser.parseCloudStreamPluginsList(
-                        repoId = repo.id,
-                        listUrl = listUrl,
-                        rawJson = listBody,
-                        supportedApiVersion = PluginSandbox.SUPPORTED_CLOUDSTREAM_API_VERSION
-                    )
+                if (parsed.inlinePlugins.isNotEmpty()) {
+                    parsed.inlinePlugins
+                } else {
+                    parsed.pluginListUrls.flatMap { listUrl ->
+                        val (_, listBody) = urlResolver.fetchText(listUrl)
+                        jsonParser.parseCloudStreamPluginsList(
+                            repoId = repo.id,
+                            listUrl = listUrl,
+                            rawJson = listBody,
+                            supportedApiVersion = PluginSandbox.SUPPORTED_CLOUDSTREAM_API_VERSION
+                        )
+                    }
                 }
             }
             is ParsedRepoPayload.Nuvio -> parsed.plugins
@@ -189,20 +266,30 @@ class ExtensionRepositoryImpl @Inject constructor(
             val local = existingPlugins[remote.id]
             if (local == null) {
                 remote
+            } else if (remote.repoType == RepoType.STREMIO) {
+                remote.copy(
+                    isEnabled = local.isEnabled,
+                    installState = PluginInstallState.INSTALLED,
+                    lastError = null
+                )
             } else {
-                val hasInstalledFile = !local.localFilePath.isNullOrBlank() &&
-                    java.io.File(local.localFilePath!!).exists()
+                val hasInstalledFile = installer.isInstalledOnDisk(local)
                 val newState = when {
                     remote.installState == PluginInstallState.UNSUPPORTED_API -> PluginInstallState.UNSUPPORTED_API
                     hasInstalledFile && remote.version > local.version -> PluginInstallState.UPDATE_AVAILABLE
                     hasInstalledFile -> PluginInstallState.INSTALLED
-                    else -> local.installState
+                    local.installState == PluginInstallState.ERROR -> PluginInstallState.ERROR
+                    else -> PluginInstallState.NOT_INSTALLED
                 }
                 remote.copy(
-                    localFilePath = local.localFilePath,
-                    isEnabled = if (newState == PluginInstallState.UNSUPPORTED_API) false else local.isEnabled,
+                    localFilePath = if (hasInstalledFile) local.localFilePath else null,
+                    isEnabled = if (hasInstalledFile && newState != PluginInstallState.UNSUPPORTED_API) local.isEnabled else false,
                     installState = newState,
-                    lastError = remote.lastError ?: local.lastError
+                    lastError = when {
+                        remote.lastError != null -> remote.lastError
+                        hasInstalledFile -> local.lastError
+                        else -> null
+                    }
                 )
             }
         }

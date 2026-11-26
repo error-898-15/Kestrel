@@ -2,6 +2,7 @@
 package com.kestrel.data.repository
 
 import android.content.Context
+import com.kestrel.data.remote.RepoUrlResolver
 import com.kestrel.domain.model.PluginMetadata
 import com.kestrel.domain.model.RepoType
 import com.kestrel.pluginhost.PluginSandbox
@@ -27,6 +28,7 @@ private data class Cs3ArchiveManifest(
 class PluginInstaller @Inject constructor(
     @ApplicationContext private val context: Context,
     private val okHttpClient: OkHttpClient,
+    private val urlResolver: RepoUrlResolver,
     private val json: Json
 ) {
     private fun pluginDirectory(repoId: String): File =
@@ -42,37 +44,47 @@ class PluginInstaller @Inject constructor(
         return File(pluginDirectory(plugin.repoId), "$safeName.$ext")
     }
 
+    fun isInstalledOnDisk(plugin: PluginMetadata): Boolean {
+        if (plugin.repoType == RepoType.STREMIO) return true
+        val path = plugin.localFilePath ?: return false
+        val file = File(path)
+        return file.exists() && file.length() > 0L
+    }
+
     fun downloadAndVerify(plugin: PluginMetadata): File {
-        require(plugin.apiVersion in 1..PluginSandbox.SUPPORTED_CLOUDSTREAM_API_VERSION) {
-            "Unsupported plugin API version ${plugin.apiVersion}"
+        if (plugin.repoType == RepoType.CLOUDSTREAM) {
+            require(plugin.apiVersion in 0..PluginSandbox.SUPPORTED_CLOUDSTREAM_API_VERSION) {
+                "Unsupported plugin API version ${plugin.apiVersion}"
+            }
         }
 
         val destFile = targetFile(plugin)
         val tmpFile = File(destFile.parentFile, "${destFile.name}.tmp")
         if (tmpFile.exists()) tmpFile.delete()
 
-        val request = Request.Builder()
-            .url(plugin.downloadUrl)
-            .header("User-Agent", "Kestrel/0.1 (Android)")
-            .get()
-            .build()
+        val candidates = buildDownloadCandidates(plugin)
+        var lastError: Throwable? = null
+        var downloaded = false
 
-        okHttpClient.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) {
-                error("Download failed with HTTP ${response.code}")
+        for (candidateUrl in candidates) {
+            try {
+                downloadToFile(candidateUrl, tmpFile)
+                downloaded = true
+                break
+            } catch (t: Throwable) {
+                lastError = t
+                if (tmpFile.exists()) tmpFile.delete()
             }
-            val body = response.body ?: error("Empty download response")
-            tmpFile.outputStream().use { out ->
-                body.byteStream().copyTo(out)
-            }
+        }
+
+        if (!downloaded) {
+            throw lastError ?: IllegalStateException("Download failed for ${plugin.displayName}")
         }
 
         when (plugin.repoType) {
             RepoType.CLOUDSTREAM -> verifyCs3Archive(tmpFile)
-            RepoType.NUVIO -> {
-                require(tmpFile.length() > 0L) { "Downloaded Nuvio scraper is empty" }
-            }
-            RepoType.STREMIO -> Unit
+            RepoType.NUVIO -> verifyNuvioScript(tmpFile)
+            RepoType.STREMIO -> require(tmpFile.length() > 0L) { "Empty Stremio manifest" }
         }
 
         if (destFile.exists()) {
@@ -90,6 +102,53 @@ class PluginInstaller @Inject constructor(
         }
 
         return destFile
+    }
+
+    private fun buildDownloadCandidates(plugin: PluginMetadata): List<String> {
+        val primary = urlResolver.rewriteGitHostUrl(plugin.downloadUrl.trim()).replace(" ", "%20")
+        if (plugin.repoType != RepoType.NUVIO) return listOf(primary)
+
+        val candidates = mutableListOf(primary)
+        val base = primary.substringBeforeLast('/')
+        val fileName = primary.substringAfterLast('/')
+        if (!primary.contains("/providers/", ignoreCase = true) && fileName.isNotBlank()) {
+            candidates.add("$base/providers/$fileName")
+        }
+        return candidates.distinct()
+    }
+
+    private fun downloadToFile(url: String, outFile: File) {
+        val request = Request.Builder()
+            .url(url)
+            .header("User-Agent", RepoUrlResolver.BROWSER_USER_AGENT)
+            .header("Accept", "*/*")
+            .get()
+            .build()
+
+        okHttpClient.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) {
+                error("HTTP ${response.code} downloading $url")
+            }
+            val body = response.body ?: error("Empty download response from $url")
+            outFile.outputStream().use { out ->
+                body.byteStream().copyTo(out)
+            }
+        }
+    }
+
+    private fun verifyNuvioScript(file: File) {
+        require(file.exists() && file.length() > 0L) { "Downloaded Nuvio scraper is empty" }
+        val preview = file.bufferedReader().use { reader ->
+            val buf = CharArray(512)
+            val read = reader.read(buf)
+            if (read > 0) String(buf, 0, read).trimStart() else ""
+        }
+        require(
+            !preview.startsWith("<!DOCTYPE html", ignoreCase = true) &&
+                !preview.startsWith("<html", ignoreCase = true)
+        ) {
+            "Nuvio scraper URL returned an HTML error page instead of JavaScript"
+        }
     }
 
     fun verifyCs3Archive(file: File) {

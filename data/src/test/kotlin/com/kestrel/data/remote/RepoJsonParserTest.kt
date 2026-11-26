@@ -118,6 +118,66 @@ class RepoJsonParserTest {
     }
 
     @Test
+    fun `parses nuvio manifest with manifestVersion providers numeric version and contentLanguage array`() {
+        val nuvioJson = """
+            {
+              "id": "community-nuvio",
+              "name": "Community Nuvio",
+              "manifestVersion": 1,
+              "providers": [
+                {
+                  "id": "uhd-scraper",
+                  "name": "UHD Scraper",
+                  "file": "providers/uhd.js",
+                  "version": 3,
+                  "author": "Dev",
+                  "contentLanguage": ["hi", "en"],
+                  "supportedTypes": ["movie", "tv"]
+                }
+              ]
+            }
+        """.trimIndent()
+
+        val parsed = parser.parseRepositoryManifest(
+            rawInputUrl = "https://raw.githubusercontent.com/dev/nuvio/main/manifest.json",
+            resolvedUrl = "https://raw.githubusercontent.com/dev/nuvio/main/manifest.json",
+            rawJson = nuvioJson
+        ) as ParsedRepoPayload.Nuvio
+
+        assertEquals(RepoType.NUVIO, parsed.repo.type)
+        assertEquals(1, parsed.plugins.size)
+        val plugin = parsed.plugins.first()
+        assertEquals("hi", plugin.language)
+        assertEquals(3, plugin.version)
+        assertEquals("https://raw.githubusercontent.com/dev/nuvio/main/providers/uhd.js", plugin.downloadUrl)
+        assertFalse(plugin.isEnabled)
+    }
+
+    @Test
+    fun `parses direct cloudstream plugins json array URL`() {
+        val pluginsJson = """
+            [
+              {
+                "url": "./builds/Direct.cs3",
+                "name": "Direct Provider",
+                "internalName": "DirectProvider",
+                "version": 2,
+                "apiVersion": 1
+              }
+            ]
+        """.trimIndent()
+
+        val parsed = parser.parseRepositoryManifest(
+            rawInputUrl = "https://example.com/repo/plugins.json",
+            resolvedUrl = "https://example.com/repo/plugins.json",
+            rawJson = pluginsJson
+        ) as ParsedRepoPayload.CloudStream
+
+        assertEquals(1, parsed.inlinePlugins.size)
+        assertEquals("https://example.com/repo/builds/Direct.cs3", parsed.inlinePlugins.first().downloadUrl)
+    }
+
+    @Test
     fun `auto detects stremio manifest`() {
         val stremioJson = """
             {

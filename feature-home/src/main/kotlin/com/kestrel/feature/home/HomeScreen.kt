@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.ErrorOutline
 import androidx.compose.material.icons.outlined.Explore
@@ -24,6 +25,7 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
@@ -87,7 +89,7 @@ fun HomeScreen(
                     contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    item {
+                    item(key = "all_sources", contentType = "chip") {
                         FilterChip(
                             selected = state.selectedProviderId == null,
                             onClick = { viewModel.selectProvider(null) },
@@ -98,7 +100,7 @@ fun HomeScreen(
                             )
                         )
                     }
-                    items(state.providers, key = { it.providerId }) { provider ->
+                    items(state.providers, key = { it.providerId }, contentType = { "chip" }) { provider ->
                         FilterChip(
                             selected = state.selectedProviderId == provider.providerId,
                             onClick = { viewModel.selectProvider(provider.providerId) },
@@ -110,6 +112,14 @@ fun HomeScreen(
                         )
                     }
                 }
+            }
+
+            if (state.isLoading && state.rows.isNotEmpty()) {
+                LinearProgressIndicator(
+                    modifier = Modifier.fillMaxWidth(),
+                    color = colors.accentAmber,
+                    trackColor = colors.surfaceLow
+                )
             }
 
             when {
@@ -139,7 +149,7 @@ fun HomeScreen(
                         verticalArrangement = Arrangement.spacedBy(18.dp)
                     ) {
                         if (state.providerErrors.isNotEmpty()) {
-                            item {
+                            item(key = "provider_errors", contentType = "error_banner") {
                                 KestrelCard(
                                     modifier = Modifier
                                         .fillMaxWidth()
@@ -166,7 +176,7 @@ fun HomeScreen(
                         }
 
                         if (state.rows.isEmpty()) {
-                            item {
+                            item(key = "empty_rows", contentType = "empty") {
                                 Box(modifier = Modifier.height(260.dp)) {
                                     EmptyStateView(
                                         icon = Icons.Outlined.Explore,
@@ -176,7 +186,11 @@ fun HomeScreen(
                                 }
                             }
                         } else {
-                            items(state.rows, key = { it.id }) { row ->
+                            itemsIndexed(
+                                items = state.rows,
+                                key = { index, row -> "${row.id}_$index" },
+                                contentType = { _, _ -> "catalog_row" }
+                            ) { _, row ->
                                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                                     SectionHeader(
                                         title = row.title,
@@ -187,12 +201,17 @@ fun HomeScreen(
                                         contentPadding = PaddingValues(horizontal = 16.dp),
                                         horizontalArrangement = Arrangement.spacedBy(12.dp)
                                     ) {
-                                        items(row.items, key = { it.id }) { item ->
+                                        itemsIndexed(
+                                            items = row.items,
+                                            key = { idx, item -> "${item.id}_$idx" },
+                                            contentType = { _, _ -> "poster_card" }
+                                        ) { _, item ->
                                             MediaPosterCard(
                                                 title = item.title,
                                                 posterUrl = item.posterUrl,
                                                 sourceTag = item.qualityLabel ?: item.type.name,
                                                 subtitle = item.year?.toString(),
+                                                posterHeaders = item.posterHeaders,
                                                 onClick = { onOpenMedia(item) }
                                             )
                                         }
@@ -200,7 +219,7 @@ fun HomeScreen(
                                 }
                             }
                         }
-                        item { Spacer(modifier = Modifier.height(8.dp)) }
+                        item(key = "bottom_spacer", contentType = "spacer") { Spacer(modifier = Modifier.height(8.dp)) }
                     }
                 }
             }

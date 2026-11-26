@@ -137,8 +137,8 @@ class CloudStreamAdapterTest {
         )
 
         val result = adapter.getCatalog(1)
-        assertTrue(result.isSuccess)
-        assertTrue(result.getOrThrow().isEmpty())
+        assertTrue(result.isFailure)
+        assertFalse(sandbox.healthByPlugin.value["broken-plugin"]?.isHealthy ?: true)
 
         val failingLoad = CloudStreamAdapter(
             pluginId = "broken-plugin",

@@ -11,7 +11,10 @@ import android.widget.Toast
 import com.fasterxml.jackson.databind.DeserializationFeature
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.KotlinModule
+import okhttp3.Cache
+import java.io.File
 import java.lang.ref.WeakReference
+import java.util.concurrent.TimeUnit
 
 /**
  * Minimal host-level shims for CloudStream app helpers that compiled .cs3 plugins
@@ -21,6 +24,9 @@ object CloudStreamApp {
     @Volatile
     private var appContext: Context? = null
 
+    private const val BROWSER_UA =
+        "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
+
     private val mapper: ObjectMapper by lazy {
         ObjectMapper()
             .registerModule(KotlinModule.Builder().build())
@@ -28,7 +34,48 @@ object CloudStreamApp {
     }
 
     fun init(context: Context) {
-        appContext = context.applicationContext
+        val ctx = context.applicationContext
+        appContext = ctx
+        configureCloudStreamNetworking(ctx)
+    }
+
+    private fun configureCloudStreamNetworking(context: Context) {
+        runCatching {
+            val mainApiKt = Class.forName("com.lagradost.cloudstream3.MainAPIKt")
+            val getApp = mainApiKt.methods.firstOrNull { it.name == "getApp" && it.parameterCount == 0 }
+            val requestsObj = getApp?.invoke(null) ?: return
+            val reqClass = requestsObj.javaClass
+
+            runCatching {
+                val setHeaders = reqClass.methods.firstOrNull {
+                    it.name == "setDefaultHeaders" && it.parameterCount == 1
+                }
+                setHeaders?.invoke(requestsObj, mapOf("User-Agent" to BROWSER_UA))
+            }
+
+            runCatching {
+                val getBaseClient = reqClass.methods.firstOrNull {
+                    it.name == "getBaseClient" && it.parameterCount == 0
+                }
+                val setBaseClient = reqClass.methods.firstOrNull {
+                    it.name == "setBaseClient" && it.parameterCount == 1
+                }
+                val client = getBaseClient?.invoke(requestsObj) as? okhttp3.OkHttpClient
+                if (client != null && setBaseClient != null) {
+                    val cacheDir = File(context.cacheDir, "cs3_http_cache").apply { mkdirs() }
+                    val updated = client.newBuilder()
+                        .connectTimeout(20, TimeUnit.SECONDS)
+                        .readTimeout(25, TimeUnit.SECONDS)
+                        .followRedirects(true)
+                        .followSslRedirects(true)
+                        .cache(Cache(cacheDir, 25L * 1024L * 1024L))
+                        .build()
+                    setBaseClient.invoke(requestsObj, updated)
+                }
+            }
+        }.onFailure {
+            Log.w("KestrelCS3", "CloudStream NiceHttp tuning skipped: ${it.message}")
+        }
     }
 
     val context: Context?
@@ -77,6 +124,32 @@ object CloudStreamApp {
     fun removeKey(folder: String, path: String) {
         removeKey("$folder/$path")
     }
+}
+
+/**
+ * Legacy alias expected by older CloudStream .cs3 plugins that reference AcraApplication directly.
+ */
+object AcraApplication {
+    val context: Context?
+        get() = CloudStreamApp.context
+
+    fun <T : Any> getKey(path: String, valueType: Class<T>): T? =
+        CloudStreamApp.getKey(path, valueType)
+
+    fun <T> getKey(folder: String, path: String, valueType: Class<T>): T? =
+        CloudStreamApp.getKey(folder, path, valueType)
+
+    fun <T> setKey(path: String, value: T) =
+        CloudStreamApp.setKey(path, value)
+
+    fun <T> setKey(folder: String, path: String, value: T) =
+        CloudStreamApp.setKey(folder, path, value)
+
+    fun removeKey(path: String) =
+        CloudStreamApp.removeKey(path)
+
+    fun removeKey(folder: String, path: String) =
+        CloudStreamApp.removeKey(folder, path)
 }
 
 object CommonActivity {

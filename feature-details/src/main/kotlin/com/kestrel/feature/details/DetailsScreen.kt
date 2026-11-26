@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
@@ -285,12 +286,17 @@ fun DetailsScreen(
                                 contentPadding = PaddingValues(horizontal = 16.dp),
                                 horizontalArrangement = Arrangement.spacedBy(12.dp)
                             ) {
-                                items(details.recommendations, key = { it.id }) { rec ->
+                                itemsIndexed(
+                                    items = details.recommendations,
+                                    key = { idx, rec -> "${rec.id}_$idx" },
+                                    contentType = { _, _ -> "poster_card" }
+                                ) { _, rec ->
                                     MediaPosterCard(
                                         title = rec.title,
                                         posterUrl = rec.posterUrl,
                                         sourceTag = rec.providerName,
                                         subtitle = rec.year?.toString(),
+                                        posterHeaders = rec.posterHeaders,
                                         onClick = { onOpenMedia(rec) }
                                     )
                                 }

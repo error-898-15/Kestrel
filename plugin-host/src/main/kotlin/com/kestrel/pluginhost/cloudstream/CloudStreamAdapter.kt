@@ -12,10 +12,13 @@ import com.kestrel.domain.model.SubtitleTrack
 import com.kestrel.domain.provider.SourceProvider
 import com.kestrel.pluginhost.PluginSandbox
 import com.lagradost.cloudstream3.MainAPI
+import com.lagradost.cloudstream3.MainPageData
 import com.lagradost.cloudstream3.MainPageRequest
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import java.util.Collections
 
 /**
@@ -41,7 +44,7 @@ class CloudStreamAdapter(
         get() = api.supportedTypes.map { CloudStreamMappers.mapTvType(it) }.toSet()
 
     override val hasCatalog: Boolean
-        get() = api.hasMainPage && api.mainPage.any { it.name.isNotBlank() || it.data.isNotBlank() }
+        get() = api.hasMainPage
 
     override suspend fun getCatalog(page: Int): Result<List<CatalogRow>> =
         sandbox.execute(
@@ -49,29 +52,45 @@ class CloudStreamAdapter(
             timeoutMs = api.getMainPageTimeoutMs ?: PluginSandbox.DEFAULT_TIMEOUT_MS
         ) {
             if (!api.hasMainPage) return@execute emptyList()
-            val sections = api.mainPage.filter { it.name.isNotBlank() || it.data.isNotBlank() }
-            if (sections.isEmpty()) return@execute emptyList()
+            val sections = api.mainPage
+                .filter { it.name.isNotBlank() || it.data.isNotBlank() }
+                .ifEmpty { listOf(MainPageData("", "", false)) }
 
-            coroutineScope {
+            val sectionErrors = Collections.synchronizedList(mutableListOf<Throwable>())
+            val sectionSemaphore = Semaphore(3)
+
+            val rows = coroutineScope {
                 sections.map { section ->
                     async {
-                        val req = MainPageRequest(
-                            name = section.name,
-                            data = section.data,
-                            horizontalImages = section.horizontalImages
-                        )
-                        val response = runCatching { api.getMainPage(page, req) }.getOrNull()
-                        response?.items.orEmpty().map { list ->
-                            CloudStreamMappers.mapHomePageList(
-                                list = list,
-                                providerId = providerId,
-                                providerName = name,
-                                hasNext = response?.hasNext == true
+                        sectionSemaphore.withPermit {
+                            val req = MainPageRequest(
+                                name = section.name,
+                                data = section.data,
+                                horizontalImages = section.horizontalImages
                             )
+                            val response = try {
+                                api.getMainPage(page, req)
+                            } catch (t: Throwable) {
+                                sectionErrors.add(t)
+                                null
+                            }
+                            response?.items.orEmpty().map { list ->
+                                CloudStreamMappers.mapHomePageList(
+                                    list = list,
+                                    providerId = providerId,
+                                    providerName = name,
+                                    hasNext = response?.hasNext == true
+                                )
+                            }
                         }
                     }
                 }.awaitAll().flatten().filter { it.items.isNotEmpty() }
             }
+
+            if (rows.isEmpty() && sectionErrors.isNotEmpty()) {
+                throw sectionErrors.first()
+            }
+            rows
         }
 
     override suspend fun search(query: String, page: Int): Result<List<MediaSummary>> =

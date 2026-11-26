@@ -40,15 +40,18 @@ import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil3.compose.AsyncImage
+import coil3.request.ImageRequest
 import com.kestrel.core.designsystem.EmptyStateView
 import com.kestrel.core.designsystem.KestrelCard
 import com.kestrel.core.designsystem.KestrelPrimaryButton
@@ -140,23 +143,25 @@ fun ExtensionsScreen(
             }
 
             if (state.repositories.isNotEmpty()) {
-                item {
+                item(key = "repos_header", contentType = "header") {
                     SectionHeader(
                         title = "Repositories",
                         badge = "${state.repositories.size}"
                     )
                 }
-                items(state.repositories, key = { it.id }) { repo ->
+                items(state.repositories, key = { it.id }, contentType = { "repo_card" }) { repo ->
                     RepositoryCard(
                         repo = repo,
                         isRefreshing = repo.id in state.refreshingRepoIds,
+                        isInstallingAll = repo.id in state.installingRepoIds,
+                        onInstallAll = { viewModel.installAllInRepo(repo.id) },
                         onValidate = { viewModel.validateAndRefreshRepo(repo.id) },
                         onRemove = { viewModel.removeRepository(repo.id) }
                     )
                 }
             }
 
-            item {
+            item(key = "plugins_header", contentType = "header") {
                 SectionHeader(
                     title = "Plugins",
                     badge = "${state.plugins.size}"
@@ -164,7 +169,7 @@ fun ExtensionsScreen(
             }
 
             if (state.repositories.isNotEmpty()) {
-                item {
+                item(key = "plugins_filters", contentType = "filters") {
                     PluginFiltersSection(
                         searchQuery = state.searchQuery,
                         languages = state.availableLanguages,
@@ -179,7 +184,7 @@ fun ExtensionsScreen(
             }
 
             if (state.plugins.isEmpty()) {
-                item {
+                item(key = "plugins_empty", contentType = "empty") {
                     Box(modifier = Modifier.height(260.dp)) {
                         EmptyStateView(
                             icon = Icons.Outlined.Extension,
@@ -197,7 +202,7 @@ fun ExtensionsScreen(
                     }
                 }
             } else {
-                items(state.plugins, key = { it.id }) { plugin ->
+                items(state.plugins, key = { it.id }, contentType = { "plugin_row" }) { plugin ->
                     PluginRowCard(
                         plugin = plugin,
                         isBusy = plugin.id in state.busyPluginIds,
@@ -265,6 +270,8 @@ private fun AddRepositoryCard(
 private fun RepositoryCard(
     repo: RepoConfig,
     isRefreshing: Boolean,
+    isInstallingAll: Boolean,
+    onInstallAll: () -> Unit,
     onValidate: () -> Unit,
     onRemove: () -> Unit
 ) {
@@ -309,6 +316,23 @@ private fun RepositoryCard(
                 )
             }
             Row(verticalAlignment = Alignment.CenterVertically) {
+                if (repo.type.name != "STREMIO") {
+                    IconButton(onClick = onInstallAll, enabled = !isInstallingAll) {
+                        if (isInstallingAll) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(18.dp),
+                                strokeWidth = 2.dp,
+                                color = colors.accentAmber
+                            )
+                        } else {
+                            Icon(
+                                imageVector = Icons.Outlined.Download,
+                                contentDescription = "Install All Plugins",
+                                tint = colors.accentAmber
+                            )
+                        }
+                    }
+                }
                 IconButton(onClick = onValidate, enabled = !isRefreshing) {
                     if (isRefreshing) {
                         CircularProgressIndicator(
@@ -421,8 +445,15 @@ private fun PluginRowCard(
                 contentAlignment = Alignment.Center
             ) {
                 if (!plugin.iconUrl.isNullOrBlank()) {
+                    val ctx = LocalContext.current
+                    val iconReq = remember(plugin.iconUrl) {
+                        ImageRequest.Builder(ctx)
+                            .data(plugin.iconUrl)
+                            .size(96, 96)
+                            .build()
+                    }
                     AsyncImage(
-                        model = plugin.iconUrl,
+                        model = iconReq,
                         contentDescription = plugin.displayName,
                         contentScale = ContentScale.Crop,
                         modifier = Modifier.fillMaxSize()

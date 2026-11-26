@@ -5,11 +5,15 @@ import com.kestrel.domain.model.PluginInstallState
 import com.kestrel.domain.model.PluginMetadata
 import com.kestrel.domain.model.RepoConfig
 import com.kestrel.domain.model.RepoType
-import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import java.security.MessageDigest
 import javax.inject.Inject
@@ -41,28 +45,6 @@ data class CloudStreamPluginDto(
 )
 
 @Serializable
-data class NuvioManifestDto(
-    val name: String = "Nuvio Repository",
-    val description: String = "",
-    val version: String? = null,
-    val scrapers: List<NuvioScraperDto> = emptyList()
-)
-
-@Serializable
-data class NuvioScraperDto(
-    val id: String = "",
-    val name: String = "",
-    val filename: String = "",
-    val url: String = "",
-    val version: String = "1",
-    val description: String = "",
-    val supportedTypes: List<String> = emptyList(),
-    val logo: String? = null,
-    val language: String = "en",
-    val enabled: Boolean = false
-)
-
-@Serializable
 data class StremioManifestDto(
     val id: String = "",
     val name: String = "",
@@ -79,7 +61,8 @@ sealed interface ParsedRepoPayload {
 
     data class CloudStream(
         override val repo: RepoConfig,
-        val pluginListUrls: List<String>
+        val pluginListUrls: List<String>,
+        val inlinePlugins: List<PluginMetadata> = emptyList()
     ) : ParsedRepoPayload
 
     data class Nuvio(
@@ -98,10 +81,22 @@ class RepoJsonParser @Inject constructor(
     private val json: Json
 ) {
     fun detectType(rawJson: String, resolvedUrl: String = ""): RepoType {
-        val obj: JsonObject = json.parseToJsonElement(rawJson).jsonObject
+        val root = json.parseToJsonElement(rawJson)
+        if (root is JsonArray) {
+            val firstObj = root.firstOrNull() as? JsonObject
+            if (firstObj != null && ("filename" in firstObj || "file" in firstObj || "script" in firstObj || "supportedTypes" in firstObj) &&
+                "internalName" !in firstObj && "apiVersion" !in firstObj
+            ) {
+                return RepoType.NUVIO
+            }
+            return RepoType.CLOUDSTREAM
+        }
+
+        val obj: JsonObject = root.jsonObject
         return when {
+            // Check Nuvio keys BEFORE manifestVersion, because some Nuvio manifests include manifestVersion.
+            "scrapers" in obj || "providers" in obj -> RepoType.NUVIO
             "pluginLists" in obj || "manifestVersion" in obj -> RepoType.CLOUDSTREAM
-            "scrapers" in obj -> RepoType.NUVIO
             ("resources" in obj || "catalogs" in obj) && "id" in obj -> RepoType.STREMIO
             resolvedUrl.endsWith("/manifest.json", ignoreCase = true) && "id" in obj -> RepoType.STREMIO
             else -> throw IllegalArgumentException("Unrecognized repository manifest format")
@@ -116,11 +111,45 @@ class RepoJsonParser @Inject constructor(
     ): ParsedRepoPayload {
         val type = detectType(rawJson, resolvedUrl)
         val repoId = stableId("${type.name}:$resolvedUrl")
+        val root = json.parseToJsonElement(rawJson)
 
         return when (type) {
             RepoType.CLOUDSTREAM -> {
+                if (root is JsonArray) {
+                    // Direct plugins.json URL provided by the user.
+                    val repoName = resolvedUrl.substringAfter("://")
+                        .split('/')
+                        .getOrNull(2)
+                        ?.takeIf { it.isNotBlank() }
+                        ?: "CloudStream Plugins"
+                    val repo = RepoConfig(
+                        id = repoId,
+                        url = rawInputUrl,
+                        resolvedUrl = resolvedUrl,
+                        name = repoName,
+                        description = "Direct plugins.json repository",
+                        type = RepoType.CLOUDSTREAM,
+                        manifestVersion = 1,
+                        pluginListUrls = listOf(resolvedUrl),
+                        addedAtEpochMs = nowEpochMs,
+                        lastCheckedEpochMs = nowEpochMs,
+                        isHealthy = true
+                    )
+                    val inline = parseCloudStreamPluginsList(
+                        repoId = repoId,
+                        listUrl = resolvedUrl,
+                        rawJson = rawJson,
+                        supportedApiVersion = 1
+                    )
+                    return ParsedRepoPayload.CloudStream(
+                        repo = repo,
+                        pluginListUrls = emptyList(),
+                        inlinePlugins = inline
+                    )
+                }
+
                 val dto = json.decodeFromString(CloudStreamRepoDto.serializer(), rawJson)
-                val resolvedLists = dto.pluginLists.map { resolveRelativeUrl(resolvedUrl, it) }
+                val resolvedLists = dto.pluginLists.map { rewriteGitUrl(resolveRelativeUrl(resolvedUrl, it)) }
                 ParsedRepoPayload.CloudStream(
                     repo = RepoConfig(
                         id = repoId,
@@ -139,45 +168,13 @@ class RepoJsonParser @Inject constructor(
                 )
             }
 
-            RepoType.NUVIO -> {
-                val dto = json.decodeFromString(NuvioManifestDto.serializer(), rawJson)
-                val repo = RepoConfig(
-                    id = repoId,
-                    url = rawInputUrl,
-                    resolvedUrl = resolvedUrl,
-                    name = dto.name.ifBlank { "Nuvio Scrapers" },
-                    description = dto.description,
-                    type = RepoType.NUVIO,
-                    manifestVersion = 1,
-                    addedAtEpochMs = nowEpochMs,
-                    lastCheckedEpochMs = nowEpochMs,
-                    isHealthy = true
-                )
-                val plugins = dto.scrapers.mapIndexed { index, scraper ->
-                    val scriptPath = scraper.url.ifBlank { scraper.filename }
-                    val scriptUrl = resolveRelativeUrl(resolvedUrl, scriptPath)
-                    val internal = scraper.id.ifBlank { scraper.name.ifBlank { "scraper_$index" } }
-                    PluginMetadata(
-                        id = stableId("$repoId:$internal"),
-                        repoId = repoId,
-                        repoType = RepoType.NUVIO,
-                        internalName = internal,
-                        displayName = scraper.name.ifBlank { internal },
-                        downloadUrl = scriptUrl,
-                        version = scraper.version.filter { it.isDigit() }.toIntOrNull() ?: 1,
-                        apiVersion = 1,
-                        status = 1,
-                        language = scraper.language.ifBlank { "en" },
-                        description = scraper.description,
-                        iconUrl = scraper.logo?.let { expandIconSize(resolveRelativeUrl(resolvedUrl, it)) },
-                        tvTypes = scraper.supportedTypes,
-                        // Nuvio scrapers always start disabled until the user explicitly enables them.
-                        isEnabled = false,
-                        installState = PluginInstallState.NOT_INSTALLED
-                    )
-                }
-                ParsedRepoPayload.Nuvio(repo = repo, plugins = plugins)
-            }
+            RepoType.NUVIO -> parseNuvioPayload(
+                repoId = repoId,
+                rawInputUrl = rawInputUrl,
+                resolvedUrl = resolvedUrl,
+                root = root,
+                nowEpochMs = nowEpochMs
+            )
 
             RepoType.STREMIO -> {
                 val dto = json.decodeFromString(StremioManifestDto.serializer(), rawJson)
@@ -216,6 +213,95 @@ class RepoJsonParser @Inject constructor(
         }
     }
 
+    private fun parseNuvioPayload(
+        repoId: String,
+        rawInputUrl: String,
+        resolvedUrl: String,
+        root: JsonElement,
+        nowEpochMs: Long
+    ): ParsedRepoPayload.Nuvio {
+        val obj = root as? JsonObject
+        val repoName = obj?.stringField("name")?.ifBlank { null } ?: "Nuvio Scrapers"
+        val repoDesc = obj?.stringField("description").orEmpty()
+        val manifestBaseUrl = obj?.stringField("baseUrl")?.takeIf { it.isNotBlank() } ?: resolvedUrl
+
+        val scraperArray = when {
+            root is JsonArray -> root
+            obj != null && "scrapers" in obj && obj["scrapers"] is JsonArray -> obj["scrapers"]!!.jsonArray
+            obj != null && "providers" in obj && obj["providers"] is JsonArray -> obj["providers"]!!.jsonArray
+            else -> JsonArray(emptyList())
+        }
+
+        val repo = RepoConfig(
+            id = repoId,
+            url = rawInputUrl,
+            resolvedUrl = resolvedUrl,
+            name = repoName,
+            description = repoDesc,
+            type = RepoType.NUVIO,
+            manifestVersion = 1,
+            addedAtEpochMs = nowEpochMs,
+            lastCheckedEpochMs = nowEpochMs,
+            isHealthy = true
+        )
+
+        val plugins = scraperArray.mapIndexedNotNull { index, el ->
+            val item = el as? JsonObject ?: return@mapIndexedNotNull null
+            val scriptPath = listOf("url", "rawUrl", "scriptUrl", "filename", "file", "script", "path")
+                .firstNotNullOfOrNull { key -> item.stringField(key)?.takeIf { it.isNotBlank() } }
+                ?: return@mapIndexedNotNull null
+
+            val scriptUrl = rewriteGitUrl(resolveRelativeUrl(manifestBaseUrl, scriptPath))
+            val name = item.stringField("name")?.ifBlank { null }
+            val internal = item.stringField("id")?.ifBlank { null }
+                ?: name
+                ?: scriptPath.substringAfterLast('/').removeSuffix(".js").ifBlank { "scraper_$index" }
+
+            val langs = item.stringListField("contentLanguage") + item.stringListField("language")
+            val primaryLang = langs.firstOrNull { it.isNotBlank() }
+                ?: item.stringField("language")?.ifBlank { null }
+                ?: "en"
+
+            val authors = (item.stringListField("authors") + listOfNotNull(item.stringField("author")))
+                .filter { it.isNotBlank() }
+                .distinct()
+
+            val supportedTypes = (item.stringListField("supportedTypes") +
+                item.stringListField("tvTypes") +
+                item.stringListField("types")).distinct()
+
+            val logoPath = item.stringField("logo") ?: item.stringField("icon") ?: item.stringField("iconUrl")
+            val iconUrl = logoPath?.takeIf { it.isNotBlank() }?.let {
+                expandIconSize(rewriteGitUrl(resolveRelativeUrl(manifestBaseUrl, it)))
+            }
+
+            val versionStr = item.primitiveText("version") ?: "1"
+            val versionInt = parseSemverMajorMinor(versionStr)
+
+            PluginMetadata(
+                id = stableId("$repoId:$internal"),
+                repoId = repoId,
+                repoType = RepoType.NUVIO,
+                internalName = internal,
+                displayName = name ?: internal,
+                downloadUrl = scriptUrl,
+                version = versionInt,
+                apiVersion = 1,
+                status = 1,
+                language = primaryLang,
+                authors = authors,
+                description = item.stringField("description").orEmpty(),
+                iconUrl = iconUrl,
+                tvTypes = supportedTypes,
+                // Nuvio scrapers start disabled until explicitly installed/enabled by the user.
+                isEnabled = false,
+                installState = PluginInstallState.NOT_INSTALLED
+            )
+        }
+
+        return ParsedRepoPayload.Nuvio(repo = repo, plugins = plugins)
+    }
+
     fun parseCloudStreamPluginsList(
         repoId: String,
         listUrl: String,
@@ -228,8 +314,8 @@ class RepoJsonParser @Inject constructor(
             .map { dto ->
                 val internal = dto.internalName.ifBlank { dto.name }
                 val display = dto.name.ifBlank { internal }
-                val resolvedDownload = resolveRelativeUrl(listUrl, dto.url)
-                val supported = dto.apiVersion in 1..supportedApiVersion
+                val resolvedDownload = rewriteGitUrl(resolveRelativeUrl(listUrl, dto.url))
+                val supported = dto.apiVersion in 0..supportedApiVersion
                 PluginMetadata(
                     id = stableId("$repoId:$internal"),
                     repoId = repoId,
@@ -243,7 +329,7 @@ class RepoJsonParser @Inject constructor(
                     language = dto.language.ifBlank { "en" },
                     authors = dto.authors,
                     description = dto.description,
-                    iconUrl = dto.iconUrl?.let { expandIconSize(resolveRelativeUrl(listUrl, it)) },
+                    iconUrl = dto.iconUrl?.let { expandIconSize(rewriteGitUrl(resolveRelativeUrl(listUrl, it))) },
                     tvTypes = dto.tvTypes,
                     fileSizeBytes = dto.fileSize,
                     repositoryUrl = dto.repositoryUrl,
@@ -266,11 +352,38 @@ class RepoJsonParser @Inject constructor(
         if (trimmed.startsWith("http://", ignoreCase = true) ||
             trimmed.startsWith("https://", ignoreCase = true)
         ) {
-            return trimmed
+            return trimmed.replace(" ", "%20")
         }
         val base = baseUrl.substringBeforeLast('/', missingDelimiterValue = baseUrl)
         val cleanTarget = trimmed.removePrefix("./").removePrefix("/")
-        return "$base/$cleanTarget"
+        return "$base/$cleanTarget".replace(" ", "%20")
+    }
+
+    private fun rewriteGitUrl(url: String): String {
+        val ghBlob = Regex("^https?://github\\.com/([^/]+)/([^/]+)/blob/([^/]+)/(.*)$")
+        ghBlob.matchEntire(url)?.let { m ->
+            return "https://raw.githubusercontent.com/${m.groupValues[1]}/${m.groupValues[2]}/${m.groupValues[3]}/${m.groupValues[4]}"
+        }
+        val cbSrc = Regex("^https?://codeberg\\.org/([^/]+)/([^/]+)/src/(branch|commit|tag)/([^/]+)/(.*)$")
+        cbSrc.matchEntire(url)?.let { m ->
+            return "https://codeberg.org/${m.groupValues[1]}/${m.groupValues[2]}/raw/${m.groupValues[3]}/${m.groupValues[4]}/${m.groupValues[5]}"
+        }
+        return url
+    }
+
+    private fun JsonObject.stringField(key: String): String? =
+        (this[key] as? JsonPrimitive)?.takeIf { it.isString }?.contentOrNull
+
+    private fun JsonObject.primitiveText(key: String): String? =
+        (this[key] as? JsonPrimitive)?.contentOrNull
+
+    private fun JsonObject.stringListField(key: String): List<String> {
+        val el = this[key] ?: return emptyList()
+        return when (el) {
+            is JsonArray -> el.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }
+            is JsonPrimitive -> el.contentOrNull?.let { listOf(it) } ?: emptyList()
+            else -> emptyList()
+        }
     }
 
     private fun parseSemverMajorMinor(version: String): Int {

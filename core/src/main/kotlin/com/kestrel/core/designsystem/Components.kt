@@ -31,6 +31,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -38,10 +39,14 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import coil3.compose.AsyncImage
+import coil3.network.NetworkHeaders
+import coil3.network.httpHeaders
+import coil3.request.ImageRequest
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -175,10 +180,36 @@ fun MediaPosterCard(
     sourceTag: String,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
-    subtitle: String? = null
+    subtitle: String? = null,
+    posterHeaders: Map<String, String> = emptyMap()
 ) {
     val colors = KestrelTheme.colors
     val spacing = KestrelTheme.spacing
+    val context = LocalContext.current
+    val gradientBrush = remember {
+        Brush.verticalGradient(
+            colors = listOf(Color.Transparent, Color(0xAA090B10)),
+            startY = 180f
+        )
+    }
+    val imageRequest = remember(posterUrl, posterHeaders) {
+        if (posterUrl.isNullOrBlank()) {
+            null
+        } else {
+            ImageRequest.Builder(context)
+                .data(posterUrl)
+                .size(280, 420)
+                .apply {
+                    if (posterHeaders.isNotEmpty()) {
+                        val hb = NetworkHeaders.Builder()
+                        posterHeaders.forEach { (k, v) -> hb[k] = v }
+                        httpHeaders(hb.build())
+                    }
+                }
+                .build()
+        }
+    }
+
     Column(
         modifier = modifier
             .width(spacing.posterWidth)
@@ -193,9 +224,9 @@ fun MediaPosterCard(
                 .background(colors.surface)
                 .border(1.dp, colors.borderSubtle, RoundedCornerShape(spacing.posterCorner))
         ) {
-            if (!posterUrl.isNullOrBlank()) {
+            if (imageRequest != null) {
                 AsyncImage(
-                    model = posterUrl,
+                    model = imageRequest,
                     contentDescription = title,
                     contentScale = ContentScale.Crop,
                     modifier = Modifier.fillMaxSize()
@@ -204,12 +235,7 @@ fun MediaPosterCard(
             Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .background(
-                        Brush.verticalGradient(
-                            colors = listOf(Color.Transparent, Color(0xAA090B10)),
-                            startY = 180f
-                        )
-                    )
+                    .background(gradientBrush)
             )
             SourceBadge(
                 label = sourceTag,

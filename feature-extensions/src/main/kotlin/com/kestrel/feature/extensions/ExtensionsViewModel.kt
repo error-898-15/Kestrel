@@ -7,10 +7,12 @@ import com.kestrel.domain.model.PluginMetadata
 import com.kestrel.domain.model.RepoConfig
 import com.kestrel.domain.repository.ExtensionRepository
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -27,6 +29,7 @@ data class ExtensionsUiState(
     val repoInput: String = "",
     val isAddingRepo: Boolean = false,
     val refreshingRepoIds: Set<String> = emptySet(),
+    val installingRepoIds: Set<String> = emptySet(),
     val busyPluginIds: Set<String> = emptySet(),
     val bannerMessage: String? = null,
     val bannerIsError: Boolean = false
@@ -37,54 +40,87 @@ class ExtensionsViewModel @Inject constructor(
     private val repository: ExtensionRepository
 ) : ViewModel() {
 
-    private data class FilterState(
+    private data class QueryFilterState(
         val selectedLanguage: String? = null,
         val selectedTvType: String? = null,
-        val searchQuery: String = "",
+        val searchQuery: String = ""
+    )
+
+    private data class ActionState(
         val repoInput: String = "",
         val isAddingRepo: Boolean = false,
         val refreshingRepoIds: Set<String> = emptySet(),
+        val installingRepoIds: Set<String> = emptySet(),
         val busyPluginIds: Set<String> = emptySet(),
         val bannerMessage: String? = null,
         val bannerIsError: Boolean = false
     )
 
-    private val filterState = MutableStateFlow(FilterState())
+    private data class FilteredPluginSlice(
+        val repositories: List<RepoConfig> = emptyList(),
+        val plugins: List<PluginMetadata> = emptyList(),
+        val availableLanguages: List<String> = emptyList(),
+        val availableTvTypes: List<String> = emptyList(),
+        val queryState: QueryFilterState = QueryFilterState()
+    )
 
-    val uiState: StateFlow<ExtensionsUiState> = combine(
+    private val queryFilterState = MutableStateFlow(QueryFilterState())
+    private val actionState = MutableStateFlow(ActionState())
+
+    init {
+        viewModelScope.launch {
+            repository.reconcileMissingFiles()
+        }
+    }
+
+    private val filteredSlice = combine(
         repository.repositories,
         repository.plugins,
-        filterState
-    ) { repos, allPlugins, filter ->
+        queryFilterState
+    ) { repos, allPlugins, query ->
         val langs = allPlugins.map { it.language }.filter { it.isNotBlank() }.distinct().sorted()
         val types = allPlugins.flatMap { it.tvTypes }.filter { it.isNotBlank() }.distinct().sorted()
 
         val filtered = allPlugins.filter { plugin ->
-            val matchesLang = filter.selectedLanguage == null ||
-                plugin.language.equals(filter.selectedLanguage, ignoreCase = true)
-            val matchesType = filter.selectedTvType == null ||
-                plugin.tvTypes.any { it.equals(filter.selectedTvType, ignoreCase = true) }
-            val matchesQuery = filter.searchQuery.isBlank() ||
-                plugin.displayName.contains(filter.searchQuery, ignoreCase = true) ||
-                plugin.internalName.contains(filter.searchQuery, ignoreCase = true) ||
-                plugin.description.contains(filter.searchQuery, ignoreCase = true)
+            val matchesLang = query.selectedLanguage == null ||
+                plugin.language.equals(query.selectedLanguage, ignoreCase = true)
+            val matchesType = query.selectedTvType == null ||
+                plugin.tvTypes.any { it.equals(query.selectedTvType, ignoreCase = true) }
+            val matchesQuery = query.searchQuery.isBlank() ||
+                plugin.displayName.contains(query.searchQuery, ignoreCase = true) ||
+                plugin.internalName.contains(query.searchQuery, ignoreCase = true) ||
+                plugin.description.contains(query.searchQuery, ignoreCase = true)
             matchesLang && matchesType && matchesQuery
         }
 
-        ExtensionsUiState(
+        FilteredPluginSlice(
             repositories = repos,
             plugins = filtered,
             availableLanguages = langs,
             availableTvTypes = types,
-            selectedLanguage = filter.selectedLanguage,
-            selectedTvType = filter.selectedTvType,
-            searchQuery = filter.searchQuery,
-            repoInput = filter.repoInput,
-            isAddingRepo = filter.isAddingRepo,
-            refreshingRepoIds = filter.refreshingRepoIds,
-            busyPluginIds = filter.busyPluginIds,
-            bannerMessage = filter.bannerMessage,
-            bannerIsError = filter.bannerIsError
+            queryState = query
+        )
+    }.flowOn(Dispatchers.Default)
+
+    val uiState: StateFlow<ExtensionsUiState> = combine(
+        filteredSlice,
+        actionState
+    ) { slice, actions ->
+        ExtensionsUiState(
+            repositories = slice.repositories,
+            plugins = slice.plugins,
+            availableLanguages = slice.availableLanguages,
+            availableTvTypes = slice.availableTvTypes,
+            selectedLanguage = slice.queryState.selectedLanguage,
+            selectedTvType = slice.queryState.selectedTvType,
+            searchQuery = slice.queryState.searchQuery,
+            repoInput = actions.repoInput,
+            isAddingRepo = actions.isAddingRepo,
+            refreshingRepoIds = actions.refreshingRepoIds,
+            installingRepoIds = actions.installingRepoIds,
+            busyPluginIds = actions.busyPluginIds,
+            bannerMessage = actions.bannerMessage,
+            bannerIsError = actions.bannerIsError
         )
     }.stateIn(
         scope = viewModelScope,
@@ -93,37 +129,37 @@ class ExtensionsViewModel @Inject constructor(
     )
 
     fun onRepoInputChanged(value: String) {
-        filterState.update { it.copy(repoInput = value) }
+        actionState.update { it.copy(repoInput = value) }
     }
 
     fun onSearchQueryChanged(value: String) {
-        filterState.update { it.copy(searchQuery = value) }
+        queryFilterState.update { it.copy(searchQuery = value) }
     }
 
     fun selectLanguage(lang: String?) {
-        filterState.update {
+        queryFilterState.update {
             it.copy(selectedLanguage = if (it.selectedLanguage == lang) null else lang)
         }
     }
 
     fun selectTvType(tvType: String?) {
-        filterState.update {
+        queryFilterState.update {
             it.copy(selectedTvType = if (it.selectedTvType == tvType) null else tvType)
         }
     }
 
     fun dismissBanner() {
-        filterState.update { it.copy(bannerMessage = null) }
+        actionState.update { it.copy(bannerMessage = null) }
     }
 
     fun addRepository() {
-        val raw = filterState.value.repoInput.trim()
+        val raw = actionState.value.repoInput.trim()
         if (raw.isEmpty()) return
         viewModelScope.launch {
-            filterState.update { it.copy(isAddingRepo = true, bannerMessage = null) }
+            actionState.update { it.copy(isAddingRepo = true, bannerMessage = null) }
             repository.addRepository(raw)
                 .onSuccess { repo ->
-                    filterState.update {
+                    actionState.update {
                         it.copy(
                             isAddingRepo = false,
                             repoInput = "",
@@ -133,7 +169,7 @@ class ExtensionsViewModel @Inject constructor(
                     }
                 }
                 .onFailure { err ->
-                    filterState.update {
+                    actionState.update {
                         it.copy(
                             isAddingRepo = false,
                             bannerMessage = err.message ?: "Failed to add repository",
@@ -146,10 +182,10 @@ class ExtensionsViewModel @Inject constructor(
 
     fun validateAndRefreshRepo(repoId: String) {
         viewModelScope.launch {
-            filterState.update { it.copy(refreshingRepoIds = it.refreshingRepoIds + repoId) }
+            actionState.update { it.copy(refreshingRepoIds = it.refreshingRepoIds + repoId) }
             repository.refreshRepository(repoId)
                 .onSuccess { repo ->
-                    filterState.update {
+                    actionState.update {
                         it.copy(
                             refreshingRepoIds = it.refreshingRepoIds - repoId,
                             bannerMessage = "${repo.name} is valid and up to date",
@@ -158,7 +194,7 @@ class ExtensionsViewModel @Inject constructor(
                     }
                 }
                 .onFailure { err ->
-                    filterState.update {
+                    actionState.update {
                         it.copy(
                             refreshingRepoIds = it.refreshingRepoIds - repoId,
                             bannerMessage = err.message ?: "Repository validation failed",
@@ -169,10 +205,39 @@ class ExtensionsViewModel @Inject constructor(
         }
     }
 
+    fun installAllInRepo(repoId: String) {
+        viewModelScope.launch {
+            actionState.update { it.copy(installingRepoIds = it.installingRepoIds + repoId) }
+            repository.installAllInRepo(repoId)
+                .onSuccess { count ->
+                    actionState.update {
+                        it.copy(
+                            installingRepoIds = it.installingRepoIds - repoId,
+                            bannerMessage = if (count > 0) {
+                                "Installed/updated $count plugin(s)"
+                            } else {
+                                "No compatible pending plugins to install"
+                            },
+                            bannerIsError = false
+                        )
+                    }
+                }
+                .onFailure { err ->
+                    actionState.update {
+                        it.copy(
+                            installingRepoIds = it.installingRepoIds - repoId,
+                            bannerMessage = err.message ?: "Batch install failed",
+                            bannerIsError = true
+                        )
+                    }
+                }
+        }
+    }
+
     fun removeRepository(repoId: String) {
         viewModelScope.launch {
             repository.removeRepository(repoId)
-            filterState.update {
+            actionState.update {
                 it.copy(bannerMessage = "Repository removed", bannerIsError = false)
             }
         }
@@ -180,7 +245,7 @@ class ExtensionsViewModel @Inject constructor(
 
     fun installOrUpdatePlugin(plugin: PluginMetadata) {
         viewModelScope.launch {
-            filterState.update { it.copy(busyPluginIds = it.busyPluginIds + plugin.id) }
+            actionState.update { it.copy(busyPluginIds = it.busyPluginIds + plugin.id) }
             val result = if (plugin.installState.name == "UPDATE_AVAILABLE") {
                 repository.updatePlugin(plugin.id)
             } else {
@@ -188,7 +253,7 @@ class ExtensionsViewModel @Inject constructor(
             }
             result
                 .onSuccess {
-                    filterState.update {
+                    actionState.update {
                         it.copy(
                             busyPluginIds = it.busyPluginIds - plugin.id,
                             bannerMessage = "Installed ${plugin.displayName}",
@@ -197,7 +262,7 @@ class ExtensionsViewModel @Inject constructor(
                     }
                 }
                 .onFailure { err ->
-                    filterState.update {
+                    actionState.update {
                         it.copy(
                             busyPluginIds = it.busyPluginIds - plugin.id,
                             bannerMessage = "${plugin.displayName}: ${err.message}",
@@ -218,7 +283,7 @@ class ExtensionsViewModel @Inject constructor(
         viewModelScope.launch {
             repository.setPluginEnabled(pluginId, enabled)
                 .onFailure { err ->
-                    filterState.update {
+                    actionState.update {
                         it.copy(
                             bannerMessage = err.message ?: "Could not toggle plugin",
                             bannerIsError = true

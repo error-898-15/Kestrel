@@ -14,7 +14,9 @@ interface ExtensionRepository {
     suspend fun removeRepository(repoId: String)
 
     suspend fun installPlugin(pluginId: String): Result<PluginMetadata>
+    suspend fun installAllInRepo(repoId: String): Result<Int>
     suspend fun updatePlugin(pluginId: String): Result<PluginMetadata>
     suspend fun uninstallPlugin(pluginId: String)
     suspend fun setPluginEnabled(pluginId: String, enabled: Boolean): Result<Unit>
+    suspend fun reconcileMissingFiles()
 }

@@ -53,7 +53,8 @@ class StremioClient @Inject constructor(
     private fun get(url: String): String {
         val request = Request.Builder()
             .url(url)
-            .header("User-Agent", "Kestrel/0.1 (Android)")
+            .header("User-Agent", BROWSER_USER_AGENT)
+            .header("Accept", "application/json, text/plain, */*")
             .get()
             .build()
         okHttpClient.newCall(request).execute().use { response ->
@@ -64,4 +65,9 @@ class StremioClient @Inject constructor(
 
     private fun encode(value: String): String =
         URLEncoder.encode(value, "UTF-8").replace("+", "%20")
+
+    companion object {
+        private const val BROWSER_USER_AGENT =
+            "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
+    }
 }

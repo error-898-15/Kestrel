@@ -78,6 +78,7 @@ dependencies {
     implementation(libs.androidx.navigation.compose)
     implementation(libs.androidx.hilt.navigation.compose)
 
+    implementation(libs.okhttp)
     implementation(libs.hilt.android)
     ksp(libs.hilt.compiler)
     // Hilt 2.58 bundles a kotlin-metadata-jvm that only reads Kotlin metadata <= 2.3.

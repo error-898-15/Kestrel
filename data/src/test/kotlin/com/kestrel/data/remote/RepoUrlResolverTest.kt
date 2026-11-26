@@ -10,19 +10,26 @@ class RepoUrlResolverTest {
     private val resolver = RepoUrlResolver(OkHttpClient())
 
     @Test
-    fun `normalizes cloudstreamrepo scheme to https`() {
-        val result = resolver.normalizeInput("cloudstreamrepo://example.com/repo.json")
-        assertEquals("https://example.com/repo.json", result)
+    fun `normalizes cloudstreamrepo and nuvio schemes to https`() {
+        assertEquals(
+            "https://example.com/repo.json",
+            resolver.normalizeInput("cloudstreamrepo://example.com/repo.json")
+        )
+        assertEquals(
+            "https://example.com/manifest.json",
+            resolver.normalizeInput("nuvio://example.com/manifest.json")
+        )
     }
 
     @Test
-    fun `rewrites github blob url to raw githubusercontent`() {
-        val result = resolver.normalizeInput(
-            "https://github.com/user/my-plugins/blob/main/repo.json"
-        )
+    fun `rewrites github blob and tree urls to raw githubusercontent`() {
         assertEquals(
             "https://raw.githubusercontent.com/user/my-plugins/main/repo.json",
-            result
+            resolver.normalizeInput("https://github.com/user/my-plugins/blob/main/repo.json")
+        )
+        assertEquals(
+            "https://raw.githubusercontent.com/user/nuvio-providers/main",
+            resolver.normalizeInput("https://github.com/user/nuvio-providers/tree/main")
         )
     }
 

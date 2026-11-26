@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
@@ -183,12 +184,17 @@ fun SearchScreen(
                                             contentPadding = PaddingValues(horizontal = 16.dp),
                                             horizontalArrangement = Arrangement.spacedBy(12.dp)
                                         ) {
-                                            items(group.items, key = { it.id }) { item ->
+                                            itemsIndexed(
+                                                items = group.items,
+                                                key = { idx, item -> "${item.id}_$idx" },
+                                                contentType = { _, _ -> "poster_card" }
+                                            ) { _, item ->
                                                 MediaPosterCard(
                                                     title = item.title,
                                                     posterUrl = item.posterUrl,
                                                     sourceTag = item.providerName,
                                                     subtitle = item.year?.toString() ?: item.qualityLabel,
+                                                    posterHeaders = item.posterHeaders,
                                                     onClick = { onOpenMedia(item) }
                                                 )
                                             }
