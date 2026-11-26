@@ -181,7 +181,7 @@ private fun LibraryEntryCard(
     onRemove: () -> Unit
 ) {
     val colors = KestrelTheme.colors
-    val posterRequest = rememberKestrelImageRequest(entry.posterUrl, null, 240, 360)
+    val posterRequest = rememberKestrelImageRequest(entry.posterUrl, emptyMap(), 240, 360)
 
     KestrelCard(
         onClick = onClick,
