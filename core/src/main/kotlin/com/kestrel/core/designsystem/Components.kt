@@ -26,7 +26,6 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
@@ -40,13 +39,16 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import coil3.compose.AsyncImage
 import coil3.network.NetworkHeaders
 import coil3.network.httpHeaders
 import coil3.request.ImageRequest
+import java.util.Locale
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -98,14 +100,25 @@ fun KestrelCard(
     content: @Composable ColumnScope.() -> Unit
 ) {
     val colors = KestrelTheme.colors
-    val borderColor = if (highlighted) colors.accentAmber else colors.borderSubtle
-    Surface(
+    val shape = RoundedCornerShape(18.dp)
+    val tint = if (highlighted) {
+        colors.accentAmber.copy(alpha = 0.14f)
+    } else {
+        Color.White.copy(alpha = 0.06f)
+    }
+    val rimColor = if (highlighted) colors.accentAmber else Color.White
+    val rimAlpha = if (highlighted) 0.78f else 0.36f
+
+    Box(
         modifier = modifier
-            .clip(MaterialTheme.shapes.medium)
-            .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier),
-        color = colors.surface,
-        shape = MaterialTheme.shapes.medium,
-        border = BorderStroke(1.dp, borderColor)
+            .clip(shape)
+            .glassPanel(
+                cornerRadius = 18.dp,
+                tint = tint,
+                rimColor = rimColor,
+                rimAlpha = rimAlpha
+            )
+            .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
     ) {
         Column(
             modifier = Modifier.padding(contentPadding),
@@ -123,15 +136,70 @@ fun SourceBadge(
 ) {
     Box(
         modifier = modifier
-            .clip(RoundedCornerShape(4.dp))
+            .clip(RoundedCornerShape(6.dp))
             .background(container)
-            .border(1.dp, accent.copy(alpha = 0.35f), RoundedCornerShape(4.dp))
-            .padding(horizontal = 6.dp, vertical = 2.dp)
+            .border(1.dp, accent.copy(alpha = 0.42f), RoundedCornerShape(6.dp))
+            .padding(horizontal = 7.dp, vertical = 2.dp)
     ) {
         Text(
             text = label.uppercase(),
             style = MaterialTheme.typography.labelSmall,
             color = accent,
+            maxLines = 1
+        )
+    }
+}
+
+@Composable
+fun ImdbRatingBadge(
+    rating: Double,
+    modifier: Modifier = Modifier
+) {
+    Row(
+        modifier = modifier,
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        Box(
+            modifier = Modifier
+                .clip(RoundedCornerShape(4.dp))
+                .background(Color(0xFFF5C518))
+                .padding(horizontal = 5.dp, vertical = 1.dp)
+        ) {
+            Text(
+                text = "IMDb",
+                fontSize = 10.sp,
+                fontWeight = FontWeight.Black,
+                color = Color(0xFF0A0A0A),
+                maxLines = 1
+            )
+        }
+        Text(
+            text = String.format(Locale.US, "%.1f", rating),
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.Bold,
+            color = Color.White,
+            maxLines = 1
+        )
+    }
+}
+
+@Composable
+fun CertificationBadge(
+    label: String,
+    modifier: Modifier = Modifier
+) {
+    Box(
+        modifier = modifier
+            .clip(RoundedCornerShape(6.dp))
+            .background(Color.White.copy(alpha = 0.08f))
+            .border(1.dp, Color.White.copy(alpha = 0.28f), RoundedCornerShape(6.dp))
+            .padding(horizontal = 8.dp, vertical = 3.dp)
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelMedium,
+            color = Color.White.copy(alpha = 0.9f),
             maxLines = 1
         )
     }
@@ -222,7 +290,7 @@ fun MediaPosterCard(
                 .aspectRatio(2f / 3f)
                 .clip(RoundedCornerShape(spacing.posterCorner))
                 .background(colors.surface)
-                .border(1.dp, colors.borderSubtle, RoundedCornerShape(spacing.posterCorner))
+                .border(1.dp, Color.White.copy(alpha = 0.16f), RoundedCornerShape(spacing.posterCorner))
         ) {
             if (imageRequest != null) {
                 AsyncImage(
@@ -283,10 +351,12 @@ fun EmptyStateView(
     ) {
         Box(
             modifier = Modifier
-                .size(64.dp)
-                .clip(MaterialTheme.shapes.large)
-                .background(colors.surface)
-                .border(1.dp, colors.borderSubtle, MaterialTheme.shapes.large),
+                .size(68.dp)
+                .glassPanel(
+                    cornerRadius = 20.dp,
+                    tint = Color.White.copy(alpha = 0.08f),
+                    rimAlpha = 0.45f
+                ),
             contentAlignment = Alignment.Center
         ) {
             Icon(
@@ -329,7 +399,7 @@ fun KestrelPrimaryButton(
         onClick = onClick,
         enabled = enabled,
         modifier = modifier,
-        shape = MaterialTheme.shapes.small,
+        shape = RoundedCornerShape(14.dp),
         colors = ButtonDefaults.buttonColors(
             containerColor = colors.accentAmber,
             contentColor = Color(0xFF1A1102),
@@ -353,8 +423,8 @@ fun KestrelOutlinedButton(
         onClick = onClick,
         enabled = enabled,
         modifier = modifier,
-        shape = MaterialTheme.shapes.small,
-        border = BorderStroke(1.dp, colors.borderStrong),
+        shape = RoundedCornerShape(14.dp),
+        border = BorderStroke(1.dp, Color.White.copy(alpha = 0.25f)),
         colors = ButtonDefaults.outlinedButtonColors(contentColor = colors.textPrimary)
     ) {
         Text(text = text, style = MaterialTheme.typography.labelLarge)

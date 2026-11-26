@@ -14,6 +14,7 @@ import com.kestrel.app.navigation.KestrelAppShell
 import com.kestrel.app.ui.FirstLaunchDisclaimerDialog
 import com.kestrel.core.designsystem.KestrelTheme
 import com.kestrel.data.preferences.AppPreferences
+import com.lagradost.cloudstream3.CommonActivity
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.launch
 import javax.inject.Inject
@@ -26,18 +27,16 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        CommonActivity.setActivityInstance(this)
         enableEdgeToEdge(
             statusBarStyle = SystemBarStyle.dark(Color.TRANSPARENT),
             navigationBarStyle = SystemBarStyle.dark(Color.TRANSPARENT)
         )
-
         setContent {
             KestrelTheme {
                 val disclaimerAccepted by appPreferences.disclaimerAccepted.collectAsState(initial = true)
                 val scope = rememberCoroutineScope()
-
                 KestrelAppShell()
-
                 if (!disclaimerAccepted) {
                     FirstLaunchDisclaimerDialog(
                         onAccept = {
@@ -47,5 +46,17 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        CommonActivity.setActivityInstance(this)
+    }
+
+    override fun onDestroy() {
+        if (CommonActivity.activity === this) {
+            CommonActivity.setActivityInstance(null)
+        }
+        super.onDestroy()
     }
 }

@@ -7,11 +7,14 @@ import com.kestrel.domain.model.Episode
 import com.kestrel.domain.model.MediaDetails
 import com.kestrel.domain.model.MediaSummary
 import com.kestrel.domain.model.MediaType
+import com.kestrel.domain.model.SeasonInfo
 import com.kestrel.domain.model.StreamFormat
 import com.kestrel.domain.model.StreamSource
 import com.kestrel.domain.model.SubtitleTrack
+import com.kestrel.domain.model.TrailerInfo
 import com.lagradost.cloudstream3.AnimeLoadResponse
 import com.lagradost.cloudstream3.AnimeSearchResponse
+import com.lagradost.cloudstream3.EpisodeResponse
 import com.lagradost.cloudstream3.HomePageList
 import com.lagradost.cloudstream3.LiveStreamLoadResponse
 import com.lagradost.cloudstream3.LoadResponse
@@ -45,20 +48,22 @@ internal object CloudStreamMappers {
         list: HomePageList,
         providerId: String,
         providerName: String,
-        hasNext: Boolean
+        hasNext: Boolean,
+        baseUrl: String = ""
     ): CatalogRow = CatalogRow(
         id = stableId("$providerId:${list.name}"),
         providerId = providerId,
         providerName = providerName,
         title = list.name,
-        items = list.list.map { mapSearchResponse(it, providerId, providerName) },
+        items = list.list.map { mapSearchResponse(it, providerId, providerName, baseUrl) },
         hasNextPage = hasNext
     )
 
     fun mapSearchResponse(
         item: SearchResponse,
         providerId: String,
-        providerName: String
+        providerName: String,
+        baseUrl: String = ""
     ): MediaSummary {
         val year = when (item) {
             is MovieSearchResponse -> item.year
@@ -71,9 +76,9 @@ internal object CloudStreamMappers {
             providerId = providerId,
             providerName = providerName,
             title = item.name,
-            url = item.url,
+            url = resolveUrl(item.url, baseUrl) ?: item.url,
             type = mapTvType(item.type),
-            posterUrl = item.posterUrl,
+            posterUrl = resolveUrl(item.posterUrl, baseUrl),
             posterHeaders = item.posterHeaders.orEmpty(),
             year = year,
             rating = item.score?.toDouble(10)?.takeIf { it >= 0.1 },
@@ -84,26 +89,45 @@ internal object CloudStreamMappers {
     fun mapLoadResponse(
         response: LoadResponse,
         providerId: String,
-        providerName: String
+        providerName: String,
+        baseUrl: String = ""
     ): MediaDetails {
         val mappedEpisodes = when (response) {
-            is TvSeriesLoadResponse -> response.episodes.mapIndexed { idx, ep -> mapEpisode(ep, idx) }
+            is TvSeriesLoadResponse -> response.episodes.mapIndexed { idx, ep -> mapEpisode(ep, idx, baseUrl) }
             is AnimeLoadResponse -> response.episodes.entries
                 .flatMap { (dubStatus, list) ->
                     list.mapIndexed { idx, ep ->
-                        val base = mapEpisode(ep, idx)
+                        val base = mapEpisode(ep, idx, baseUrl)
                         base.copy(name = "[${dubStatus.name}] ${base.name}")
                     }
                 }
             else -> emptyList()
         }
-
         val playData = when (response) {
             is MovieLoadResponse -> response.dataUrl
             is LiveStreamLoadResponse -> response.dataUrl
             is TorrentLoadResponse -> response.magnet ?: response.torrent
             else -> mappedEpisodes.firstOrNull()?.dataUrl
         }
+        val epResponse = response as? EpisodeResponse
+        val seasons = epResponse?.seasonNames.orEmpty().map { s ->
+            SeasonInfo(
+                season = s.season,
+                name = s.name,
+                posterUrl = mappedEpisodes.firstOrNull { it.season == s.season }?.posterUrl
+                    ?: resolveUrl(response.posterUrl, baseUrl)
+            )
+        }
+        val trailers = response.trailers.mapIndexed { idx, t ->
+            TrailerInfo(
+                url = t.extractorUrl,
+                title = if (response.trailers.size > 1) "Trailer ${idx + 1}" else "Trailer",
+                thumbnailUrl = resolveUrl(response.backgroundPosterUrl ?: response.posterUrl, baseUrl)
+            )
+        }
+        val poster = resolveUrl(response.posterUrl, baseUrl)
+        val backdrop = resolveUrl(response.backgroundPosterUrl, baseUrl) ?: poster
+        val logo = resolveUrl(response.logoUrl, baseUrl)
 
         return MediaDetails(
             id = stableId("$providerId:${response.url}"),
@@ -113,23 +137,28 @@ internal object CloudStreamMappers {
             url = response.url,
             type = mapTvType(response.type),
             plot = response.plot,
-            posterUrl = response.posterUrl,
-            backdropUrl = response.backgroundPosterUrl ?: response.posterUrl,
+            posterUrl = poster,
+            backdropUrl = backdrop,
+            logoUrl = logo,
             posterHeaders = response.posterHeaders.orEmpty(),
             year = response.year,
             durationMinutes = response.duration,
             rating = response.score?.toDouble(10)?.takeIf { it >= 0.1 },
+            contentRating = response.contentRating?.takeIf { it.isNotBlank() },
+            showStatus = epResponse?.showStatus?.name?.lowercase()?.replaceFirstChar { it.uppercase() },
             tags = response.tags.orEmpty(),
             actors = response.actors.orEmpty().map { actorData ->
                 ActorCredit(
                     name = actorData.actor.name,
                     role = actorData.roleString ?: actorData.role?.name,
-                    imageUrl = actorData.actor.image
+                    imageUrl = resolveUrl(actorData.actor.image, baseUrl)
                 )
             },
+            trailers = trailers,
+            seasons = seasons,
             episodes = mappedEpisodes,
             recommendations = response.recommendations.orEmpty().map {
-                mapSearchResponse(it, providerId, providerName)
+                mapSearchResponse(it, providerId, providerName, baseUrl)
             },
             playDataUrl = playData
         )
@@ -137,7 +166,8 @@ internal object CloudStreamMappers {
 
     private fun mapEpisode(
         ep: com.lagradost.cloudstream3.Episode,
-        index: Int
+        index: Int,
+        baseUrl: String
     ): Episode = Episode(
         id = stableId("${ep.data}:${ep.season}:${ep.episode}:$index"),
         name = ep.name?.takeIf { it.isNotBlank() }
@@ -145,9 +175,11 @@ internal object CloudStreamMappers {
         season = ep.season,
         episodeNumber = ep.episode ?: (index + 1),
         dataUrl = ep.data,
-        posterUrl = ep.posterUrl,
+        posterUrl = resolveUrl(ep.posterUrl, baseUrl),
         description = ep.description,
-        runtimeMinutes = ep.runTime
+        runtimeMinutes = ep.runTime,
+        rating = ep.score?.toDouble(10)?.takeIf { it >= 0.1 },
+        airDateEpochMs = ep.date
     )
 
     fun mapExtractorLink(
@@ -164,7 +196,6 @@ internal object CloudStreamMappers {
         val qualityLabel = Qualities.entries.firstOrNull { it.value == link.quality }?.let {
             if (it == Qualities.Unknown) "Auto" else "${it.value}p"
         } ?: if (link.quality > 0) "${link.quality}p" else "Auto"
-
         return StreamSource(
             id = stableId("$providerId:${link.url}:${link.name}"),
             providerId = providerId,
@@ -186,10 +217,23 @@ internal object CloudStreamMappers {
         headers = sub.headers.orEmpty()
     )
 
+    private fun resolveUrl(raw: String?, baseUrl: String): String? {
+        val trimmed = raw?.trim()?.takeIf { it.isNotBlank() } ?: return null
+        return when {
+            trimmed.startsWith("http://", ignoreCase = true) ||
+                trimmed.startsWith("https://", ignoreCase = true) -> trimmed
+            trimmed.startsWith("//") -> "https:$trimmed"
+            trimmed.startsWith("/") && baseUrl.isNotBlank() ->
+                "${baseUrl.trimEnd('/')}$trimmed"
+            baseUrl.isNotBlank() -> "${baseUrl.trimEnd('/')}/$trimmed"
+            else -> trimmed
+        }
+    }
+
     private fun inferFormatFromUrl(url: String): StreamFormat {
         val lower = url.lowercase()
         return when {
-            ".m3u8" in lower -> StreamFormat.HLS
+            ".m3u8" in lower || "/hls/" in lower || "m3u8" in lower -> StreamFormat.HLS
             ".mpd" in lower -> StreamFormat.DASH
             ".mp4" in lower || ".mkv" in lower -> StreamFormat.MP4
             else -> StreamFormat.OTHER

@@ -3,10 +3,12 @@ package com.lagradost.cloudstream3.plugins
 
 import android.content.Context
 import android.content.res.Resources
+import android.util.Log
 import com.lagradost.cloudstream3.actions.VideoClickAction
+import com.lagradost.cloudstream3.actions.VideoClickActionHolder
 
 /**
- * Thin compatibility shim matching CloudStream's Android Plugin base class
+ * Compatibility shim matching CloudStream's Android Plugin base class
  * expected by compiled .cs3 extensions at runtime.
  */
 abstract class Plugin : BasePlugin() {
@@ -16,9 +18,12 @@ abstract class Plugin : BasePlugin() {
     }
 
     var resources: Resources? = null
+
     var openSettings: ((context: Context) -> Unit)? = null
 
     fun registerVideoClickAction(element: VideoClickAction) {
-        // VideoClickAction hooks are host-optional in Kestrel.
+        Log.i("KestrelCS3", "Registering VideoClickAction: ${element.name}")
+        element.sourcePlugin = this.filename
+        VideoClickActionHolder.allVideoClickActions.add(element)
     }
 }

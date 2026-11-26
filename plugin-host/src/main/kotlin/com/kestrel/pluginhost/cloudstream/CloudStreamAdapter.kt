@@ -14,11 +14,13 @@ import com.kestrel.pluginhost.PluginSandbox
 import com.lagradost.cloudstream3.MainAPI
 import com.lagradost.cloudstream3.MainPageData
 import com.lagradost.cloudstream3.MainPageRequest
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.Collections
 
 /**
@@ -49,7 +51,7 @@ class CloudStreamAdapter(
     override suspend fun getCatalog(page: Int): Result<List<CatalogRow>> =
         sandbox.execute(
             pluginId = pluginId,
-            timeoutMs = api.getMainPageTimeoutMs ?: PluginSandbox.DEFAULT_TIMEOUT_MS
+            timeoutMs = maxOf(api.getMainPageTimeoutMs ?: 0L, 40_000L)
         ) {
             if (!api.hasMainPage) return@execute emptyList()
             val sections = api.mainPage
@@ -57,8 +59,7 @@ class CloudStreamAdapter(
                 .ifEmpty { listOf(MainPageData("", "", false)) }
 
             val sectionErrors = Collections.synchronizedList(mutableListOf<Throwable>())
-            val sectionSemaphore = Semaphore(3)
-
+            val sectionSemaphore = Semaphore(4)
             val rows = coroutineScope {
                 sections.map { section ->
                     async {
@@ -68,18 +69,23 @@ class CloudStreamAdapter(
                                 data = section.data,
                                 horizontalImages = section.horizontalImages
                             )
-                            val response = try {
-                                api.getMainPage(page, req)
-                            } catch (t: Throwable) {
-                                sectionErrors.add(t)
-                                null
+                            val response = withTimeoutOrNull(14_000L) {
+                                try {
+                                    api.getMainPage(page, req)
+                                } catch (ce: CancellationException) {
+                                    throw ce
+                                } catch (t: Throwable) {
+                                    sectionErrors.add(t)
+                                    null
+                                }
                             }
                             response?.items.orEmpty().map { list ->
                                 CloudStreamMappers.mapHomePageList(
                                     list = list,
                                     providerId = providerId,
                                     providerName = name,
-                                    hasNext = response?.hasNext == true
+                                    hasNext = response?.hasNext == true,
+                                    baseUrl = api.mainUrl
                                 )
                             }
                         }
@@ -94,28 +100,27 @@ class CloudStreamAdapter(
         }
 
     override suspend fun search(query: String, page: Int): Result<List<MediaSummary>> =
-        sandbox.execute(pluginId = pluginId) {
+        sandbox.execute(pluginId = pluginId, timeoutMs = 28_000L) {
             val paged = try {
                 api.search(query, page)?.items
             } catch (_: NotImplementedError) {
                 if (page == 1) api.search(query) else emptyList()
             }
             paged.orEmpty().map {
-                CloudStreamMappers.mapSearchResponse(it, providerId, name)
+                CloudStreamMappers.mapSearchResponse(it, providerId, name, api.mainUrl)
             }
         }
 
     override suspend fun load(url: String): Result<MediaDetails> =
-        sandbox.execute(pluginId = pluginId) {
+        sandbox.execute(pluginId = pluginId, timeoutMs = 30_000L) {
             val loaded = api.load(url) ?: error("$name returned no details for $url")
-            CloudStreamMappers.mapLoadResponse(loaded, providerId, name)
+            CloudStreamMappers.mapLoadResponse(loaded, providerId, name, api.mainUrl)
         }
 
     override suspend fun getLinks(data: String): Result<ResolvedLinks> =
-        sandbox.execute(pluginId = pluginId, timeoutMs = 30_000L) {
+        sandbox.execute(pluginId = pluginId, timeoutMs = 35_000L) {
             val collectedStreams = Collections.synchronizedList(mutableListOf<StreamSource>())
             val collectedSubtitles = Collections.synchronizedList(mutableListOf<SubtitleTrack>())
-
             api.loadLinks(
                 data = data,
                 isCasting = false,
@@ -126,7 +131,6 @@ class CloudStreamAdapter(
                     collectedStreams.add(CloudStreamMappers.mapExtractorLink(link, providerId, name))
                 }
             )
-
             ResolvedLinks(
                 streams = collectedStreams.distinctBy { "${it.url}|${it.extractorName}" }
                     .sortedByDescending { it.qualityScore },

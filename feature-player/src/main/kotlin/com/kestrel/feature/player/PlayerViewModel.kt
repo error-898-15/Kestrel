@@ -16,6 +16,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import okhttp3.OkHttpClient
 import javax.inject.Inject
 
 data class TrackOption(
@@ -37,7 +38,8 @@ data class PlayerUiState(
 class PlayerViewModel @Inject constructor(
     private val playbackSessionManager: PlaybackSessionManager,
     private val catalogRepository: CatalogRepository,
-    private val libraryRepository: LibraryRepository
+    private val libraryRepository: LibraryRepository,
+    val okHttpClient: OkHttpClient
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(PlayerUiState(session = playbackSessionManager.session.value))

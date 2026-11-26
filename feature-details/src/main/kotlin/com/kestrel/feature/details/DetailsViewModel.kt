@@ -102,18 +102,50 @@ class DetailsViewModel @Inject constructor(
         }
     }
 
+    fun markWatched() {
+        val details = _uiState.value.details ?: return
+        val existing = _uiState.value.libraryEntry
+        val firstEp = details.episodes.firstOrNull()
+        viewModelScope.launch {
+            if (existing != null && existing.lastPositionMs > 0L) {
+                libraryRepository.removeFromHistory(details.id)
+            } else {
+                libraryRepository.saveProgress(
+                    LibraryEntry(
+                        mediaId = details.id,
+                        providerId = details.providerId,
+                        providerName = details.providerName,
+                        title = details.title,
+                        url = details.url,
+                        type = details.type,
+                        posterUrl = details.posterUrl,
+                        isFavorite = existing?.isFavorite ?: false,
+                        lastPositionMs = 60_000L,
+                        durationMs = 60_000L,
+                        lastEpisodeId = firstEp?.id,
+                        lastEpisodeLabel = firstEp?.let {
+                            if (it.season != null && it.episodeNumber != null) {
+                                "S${it.season}E${it.episodeNumber} • ${it.name}"
+                            } else it.name
+                        }
+                    )
+                )
+            }
+        }
+    }
+
     fun resolveForPlay(episode: Episode? = null) {
         val details = _uiState.value.details ?: return
-        val dataUrl = episode?.dataUrl
+        val targetEpisode = episode ?: details.episodes.firstOrNull()
+        val dataUrl = targetEpisode?.dataUrl
             ?: details.playDataUrl
-            ?: details.episodes.firstOrNull()?.dataUrl
             ?: details.url
 
         viewModelScope.launch {
             _uiState.update {
                 it.copy(
                     isResolvingLinks = true,
-                    resolvingEpisode = episode ?: details.episodes.firstOrNull(),
+                    resolvingEpisode = targetEpisode,
                     resolvedLinks = null,
                     linkError = null
                 )

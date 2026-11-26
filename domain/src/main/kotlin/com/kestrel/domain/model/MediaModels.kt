@@ -37,7 +37,9 @@ data class Episode(
     val dataUrl: String,
     val posterUrl: String? = null,
     val description: String? = null,
-    val runtimeMinutes: Int? = null
+    val runtimeMinutes: Int? = null,
+    val rating: Double? = null,
+    val airDateEpochMs: Long? = null
 )
 
 @Serializable
@@ -45,6 +47,20 @@ data class ActorCredit(
     val name: String,
     val role: String? = null,
     val imageUrl: String? = null
+)
+
+@Serializable
+data class TrailerInfo(
+    val url: String,
+    val title: String = "Trailer",
+    val thumbnailUrl: String? = null
+)
+
+@Serializable
+data class SeasonInfo(
+    val season: Int,
+    val name: String? = null,
+    val posterUrl: String? = null
 )
 
 @Serializable
@@ -58,12 +74,18 @@ data class MediaDetails(
     val plot: String? = null,
     val posterUrl: String? = null,
     val backdropUrl: String? = null,
+    val logoUrl: String? = null,
     val posterHeaders: Map<String, String> = emptyMap(),
     val year: Int? = null,
     val durationMinutes: Int? = null,
     val rating: Double? = null,
+    val contentRating: String? = null,
+    val showStatus: String? = null,
+    val director: String? = null,
     val tags: List<String> = emptyList(),
     val actors: List<ActorCredit> = emptyList(),
+    val trailers: List<TrailerInfo> = emptyList(),
+    val seasons: List<SeasonInfo> = emptyList(),
     val episodes: List<Episode> = emptyList(),
     val recommendations: List<MediaSummary> = emptyList(),
     val playDataUrl: String? = null

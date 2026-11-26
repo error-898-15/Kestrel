@@ -3,6 +3,7 @@ package com.kestrel.pluginhost
 
 import com.kestrel.domain.model.PluginHealth
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -36,6 +37,11 @@ class PluginSandbox @Inject constructor() {
                 val value = withTimeout(timeoutMs) { block() }
                 markHealthy(pluginId)
                 return Result.success(value)
+            } catch (te: TimeoutCancellationException) {
+                // TimeoutCancellationException is a CancellationException subclass; handle it here
+                // so a slow provider reports a clean failure instead of silently cancelling callers.
+                lastError = te
+                break
             } catch (ce: CancellationException) {
                 throw ce
             } catch (t: Throwable) {
@@ -47,7 +53,12 @@ class PluginSandbox @Inject constructor() {
             }
         }
         val error = lastError ?: IllegalStateException("Unknown plugin error")
-        markError(pluginId, error.message ?: error::class.java.simpleName)
+        val message = if (error is TimeoutCancellationException) {
+            "Timed out after ${timeoutMs / 1000}s"
+        } else {
+            error.message ?: error::class.java.simpleName
+        }
+        markError(pluginId, message)
         return Result.failure(error)
     }
 
@@ -74,7 +85,7 @@ class PluginSandbox @Inject constructor() {
     }
 
     companion object {
-        const val DEFAULT_TIMEOUT_MS = 20_000L
+        const val DEFAULT_TIMEOUT_MS = 28_000L
         const val SUPPORTED_CLOUDSTREAM_API_VERSION = 1
     }
 }

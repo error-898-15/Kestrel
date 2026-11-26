@@ -15,6 +15,7 @@ import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.longOrNull
 import java.security.MessageDigest
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -224,7 +225,6 @@ class RepoJsonParser @Inject constructor(
         val repoName = obj?.stringField("name")?.ifBlank { null } ?: "Nuvio Scrapers"
         val repoDesc = obj?.stringField("description").orEmpty()
         val manifestBaseUrl = obj?.stringField("baseUrl")?.takeIf { it.isNotBlank() } ?: resolvedUrl
-
         val scraperArray = when {
             root is JsonArray -> root
             obj != null && "scrapers" in obj && obj["scrapers"] is JsonArray -> obj["scrapers"]!!.jsonArray
@@ -250,31 +250,25 @@ class RepoJsonParser @Inject constructor(
             val scriptPath = listOf("url", "rawUrl", "scriptUrl", "filename", "file", "script", "path")
                 .firstNotNullOfOrNull { key -> item.stringField(key)?.takeIf { it.isNotBlank() } }
                 ?: return@mapIndexedNotNull null
-
             val scriptUrl = rewriteGitUrl(resolveRelativeUrl(manifestBaseUrl, scriptPath))
             val name = item.stringField("name")?.ifBlank { null }
             val internal = item.stringField("id")?.ifBlank { null }
                 ?: name
                 ?: scriptPath.substringAfterLast('/').removeSuffix(".js").ifBlank { "scraper_$index" }
-
             val langs = item.stringListField("contentLanguage") + item.stringListField("language")
             val primaryLang = langs.firstOrNull { it.isNotBlank() }
                 ?: item.stringField("language")?.ifBlank { null }
                 ?: "en"
-
             val authors = (item.stringListField("authors") + listOfNotNull(item.stringField("author")))
                 .filter { it.isNotBlank() }
                 .distinct()
-
             val supportedTypes = (item.stringListField("supportedTypes") +
                 item.stringListField("tvTypes") +
                 item.stringListField("types")).distinct()
-
             val logoPath = item.stringField("logo") ?: item.stringField("icon") ?: item.stringField("iconUrl")
             val iconUrl = logoPath?.takeIf { it.isNotBlank() }?.let {
                 expandIconSize(rewriteGitUrl(resolveRelativeUrl(manifestBaseUrl, it)))
             }
-
             val versionStr = item.primitiveText("version") ?: "1"
             val versionInt = parseSemverMajorMinor(versionStr)
 
@@ -293,12 +287,10 @@ class RepoJsonParser @Inject constructor(
                 description = item.stringField("description").orEmpty(),
                 iconUrl = iconUrl,
                 tvTypes = supportedTypes,
-                // Nuvio scrapers start disabled until explicitly installed/enabled by the user.
                 isEnabled = false,
                 installState = PluginInstallState.NOT_INSTALLED
             )
         }
-
         return ParsedRepoPayload.Nuvio(repo = repo, plugins = plugins)
     }
 
@@ -308,40 +300,61 @@ class RepoJsonParser @Inject constructor(
         rawJson: String,
         supportedApiVersion: Int
     ): List<PluginMetadata> {
-        val entries = json.decodeFromString<List<CloudStreamPluginDto>>(rawJson)
-        return entries
-            .filter { it.url.isNotBlank() && (it.internalName.isNotBlank() || it.name.isNotBlank()) }
-            .map { dto ->
-                val internal = dto.internalName.ifBlank { dto.name }
-                val display = dto.name.ifBlank { internal }
-                val resolvedDownload = rewriteGitUrl(resolveRelativeUrl(listUrl, dto.url))
-                val supported = dto.apiVersion in 0..supportedApiVersion
-                PluginMetadata(
-                    id = stableId("$repoId:$internal"),
-                    repoId = repoId,
-                    repoType = RepoType.CLOUDSTREAM,
-                    internalName = internal,
-                    displayName = display,
-                    downloadUrl = resolvedDownload,
-                    version = dto.version,
-                    apiVersion = dto.apiVersion,
-                    status = dto.status,
-                    language = dto.language.ifBlank { "en" },
-                    authors = dto.authors,
-                    description = dto.description,
-                    iconUrl = dto.iconUrl?.let { expandIconSize(rewriteGitUrl(resolveRelativeUrl(listUrl, it))) },
-                    tvTypes = dto.tvTypes,
-                    fileSizeBytes = dto.fileSize,
-                    repositoryUrl = dto.repositoryUrl,
-                    isEnabled = false,
-                    installState = if (supported) {
-                        PluginInstallState.NOT_INSTALLED
-                    } else {
-                        PluginInstallState.UNSUPPORTED_API
-                    },
-                    lastError = if (supported) null else "Requires API v${dto.apiVersion} (supported: v$supportedApiVersion)"
-                )
+        val array = json.parseToJsonElement(rawJson).jsonArray
+        return array.mapNotNull { el ->
+            val obj = el as? JsonObject ?: return@mapNotNull null
+            val url = obj.stringField("url").orEmpty()
+            val name = obj.stringField("name").orEmpty()
+            val internalName = obj.stringField("internalName").orEmpty()
+            if (url.isBlank() || (internalName.isBlank() && name.isBlank())) {
+                return@mapNotNull null
             }
+
+            val internal = internalName.ifBlank { name }
+            val display = name.ifBlank { internal }
+            val resolvedDownload = rewriteGitUrl(resolveRelativeUrl(listUrl, url))
+            val apiVersion = (obj["apiVersion"] as? JsonPrimitive)?.intOrNull ?: 1
+            val version = (obj["version"] as? JsonPrimitive)?.intOrNull
+                ?: obj.primitiveText("version")?.let { parseSemverMajorMinor(it) }
+                ?: 1
+            val status = (obj["status"] as? JsonPrimitive)?.intOrNull ?: 1
+            val language = obj.stringField("language")?.ifBlank { null } ?: "en"
+            val authors = obj.stringListField("authors")
+            val description = obj.stringField("description").orEmpty()
+            val iconUrl = obj.stringField("iconUrl")?.takeIf { it.isNotBlank() }?.let {
+                expandIconSize(rewriteGitUrl(resolveRelativeUrl(listUrl, it)))
+            }
+            val tvTypes = obj.stringListField("tvTypes")
+            val fileSize = (obj["fileSize"] as? JsonPrimitive)?.longOrNull
+            val repositoryUrl = obj.stringField("repositoryUrl")?.takeIf { it.isNotBlank() }
+            val supported = apiVersion in 0..supportedApiVersion
+
+            PluginMetadata(
+                id = stableId("$repoId:$internal"),
+                repoId = repoId,
+                repoType = RepoType.CLOUDSTREAM,
+                internalName = internal,
+                displayName = display,
+                downloadUrl = resolvedDownload,
+                version = version,
+                apiVersion = apiVersion,
+                status = status,
+                language = language,
+                authors = authors,
+                description = description,
+                iconUrl = iconUrl,
+                tvTypes = tvTypes,
+                fileSizeBytes = fileSize,
+                repositoryUrl = repositoryUrl,
+                isEnabled = false,
+                installState = if (supported) {
+                    PluginInstallState.NOT_INSTALLED
+                } else {
+                    PluginInstallState.UNSUPPORTED_API
+                },
+                lastError = if (supported) null else "Requires API v$apiVersion (supported: v$supportedApiVersion)"
+            )
+        }
     }
 
     fun expandIconSize(url: String, sizePx: Int = 128): String =
@@ -360,13 +373,18 @@ class RepoJsonParser @Inject constructor(
     }
 
     private fun rewriteGitUrl(url: String): String {
-        val ghBlob = Regex("^https?://github\\.com/([^/]+)/([^/]+)/blob/([^/]+)/(.*)$")
+        val ghBlob = Regex("^https?://github\\.com/([^/]+)/([^/]+)/(?:blob|raw)/([^/]+)/(.*)$")
         ghBlob.matchEntire(url)?.let { m ->
             return "https://raw.githubusercontent.com/${m.groupValues[1]}/${m.groupValues[2]}/${m.groupValues[3]}/${m.groupValues[4]}"
         }
-        val cbSrc = Regex("^https?://codeberg\\.org/([^/]+)/([^/]+)/src/(branch|commit|tag)/([^/]+)/(.*)$")
+        val cbSrc = Regex("^https?://codeberg\\.org/([^/]+)/([^/]+)/src/(branch|commit|tag)/([^/]+)(?:/(.*))?$")
         cbSrc.matchEntire(url)?.let { m ->
-            return "https://codeberg.org/${m.groupValues[1]}/${m.groupValues[2]}/raw/${m.groupValues[3]}/${m.groupValues[4]}/${m.groupValues[5]}"
+            val path = m.groupValues[5].trim('/')
+            return if (path.isEmpty()) {
+                "https://codeberg.org/${m.groupValues[1]}/${m.groupValues[2]}/raw/${m.groupValues[3]}/${m.groupValues[4]}"
+            } else {
+                "https://codeberg.org/${m.groupValues[1]}/${m.groupValues[2]}/raw/${m.groupValues[3]}/${m.groupValues[4]}/$path"
+            }
         }
         return url
     }

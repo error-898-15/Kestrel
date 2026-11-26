@@ -7,22 +7,16 @@ import com.kestrel.domain.model.PluginMetadata
 import com.kestrel.domain.model.RepoType
 import com.kestrel.pluginhost.PluginSandbox
 import dagger.hilt.android.qualifiers.ApplicationContext
-import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonObject
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
 import java.util.zip.ZipFile
 import javax.inject.Inject
 import javax.inject.Singleton
-
-@Serializable
-private data class Cs3ArchiveManifest(
-    val name: String? = null,
-    val pluginClassName: String? = null,
-    val requiresResources: Boolean = false,
-    val version: Int? = null
-)
 
 @Singleton
 class PluginInstaller @Inject constructor(
@@ -67,24 +61,26 @@ class PluginInstaller @Inject constructor(
         var downloaded = false
 
         for (candidateUrl in candidates) {
-            try {
-                downloadToFile(candidateUrl, tmpFile)
-                downloaded = true
-                break
-            } catch (t: Throwable) {
-                lastError = t
-                if (tmpFile.exists()) tmpFile.delete()
+            for (attempt in 1..2) {
+                try {
+                    downloadToFile(candidateUrl, tmpFile)
+                    when (plugin.repoType) {
+                        RepoType.CLOUDSTREAM -> verifyCs3Archive(tmpFile)
+                        RepoType.NUVIO -> verifyNuvioScript(tmpFile)
+                        RepoType.STREMIO -> require(tmpFile.length() > 0L) { "Empty Stremio manifest" }
+                    }
+                    downloaded = true
+                    break
+                } catch (t: Throwable) {
+                    lastError = t
+                    if (tmpFile.exists()) tmpFile.delete()
+                }
             }
+            if (downloaded) break
         }
 
         if (!downloaded) {
             throw lastError ?: IllegalStateException("Download failed for ${plugin.displayName}")
-        }
-
-        when (plugin.repoType) {
-            RepoType.CLOUDSTREAM -> verifyCs3Archive(tmpFile)
-            RepoType.NUVIO -> verifyNuvioScript(tmpFile)
-            RepoType.STREMIO -> require(tmpFile.length() > 0L) { "Empty Stremio manifest" }
         }
 
         if (destFile.exists()) {
@@ -106,15 +102,28 @@ class PluginInstaller @Inject constructor(
 
     private fun buildDownloadCandidates(plugin: PluginMetadata): List<String> {
         val primary = urlResolver.rewriteGitHostUrl(plugin.downloadUrl.trim()).replace(" ", "%20")
-        if (plugin.repoType != RepoType.NUVIO) return listOf(primary)
-
         val candidates = mutableListOf(primary)
-        val base = primary.substringBeforeLast('/')
-        val fileName = primary.substringAfterLast('/')
-        if (!primary.contains("/providers/", ignoreCase = true) && fileName.isNotBlank()) {
-            candidates.add("$base/providers/$fileName")
+
+        // Add jsDelivr CDN fallback when raw.githubusercontent.com is throttled/blocked by ISP.
+        toJsDelivrMirror(primary)?.let { candidates.add(it) }
+
+        if (plugin.repoType == RepoType.NUVIO) {
+            val base = primary.substringBeforeLast('/')
+            val fileName = primary.substringAfterLast('/')
+            if (!primary.contains("/providers/", ignoreCase = true) && fileName.isNotBlank()) {
+                val alt = "$base/providers/$fileName"
+                candidates.add(alt)
+                toJsDelivrMirror(alt)?.let { candidates.add(it) }
+            }
         }
         return candidates.distinct()
+    }
+
+    private fun toJsDelivrMirror(url: String): String? {
+        val rawRegex = Regex("^https?://raw\\.githubusercontent\\.com/([^/]+)/([^/]+)/([^/]+)/(.*)$")
+        val match = rawRegex.matchEntire(url) ?: return null
+        val (owner, repo, branch, path) = match.destructured
+        return "https://cdn.jsdelivr.net/gh/$owner/$repo@$branch/$path"
     }
 
     private fun downloadToFile(url: String, outFile: File) {
@@ -162,8 +171,9 @@ class PluginInstaller @Inject constructor(
             val manifestEntry = zip.getEntry("manifest.json")
                 ?: error("Invalid .cs3 archive: missing manifest.json")
             val manifestText = zip.getInputStream(manifestEntry).bufferedReader().use { it.readText() }
-            val manifest = json.decodeFromString(Cs3ArchiveManifest.serializer(), manifestText)
-            require(!manifest.pluginClassName.isNullOrBlank()) {
+            val manifestObj = json.parseToJsonElement(manifestText).jsonObject
+            val pluginClassName = (manifestObj["pluginClassName"] as? JsonPrimitive)?.contentOrNull
+            require(!pluginClassName.isNullOrBlank()) {
                 "Invalid .cs3 manifest.json: missing pluginClassName"
             }
         }

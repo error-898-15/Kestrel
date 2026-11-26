@@ -1,6 +1,7 @@
 plugins {
     alias(libs.plugins.android.library)
     alias(libs.plugins.kotlin.android)
+    alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.kotlin.serialization)
     alias(libs.plugins.hilt)
     alias(libs.plugins.ksp)
@@ -15,18 +16,20 @@ android {
         consumerProguardFiles("consumer-rules.pro")
     }
 
+    buildFeatures {
+        compose = true
+    }
+
     compileOptions {
         isCoreLibraryDesugaringEnabled = true
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
     }
-
 }
 
 dependencies {
     implementation(project(":core"))
     implementation(project(":domain"))
-
     coreLibraryDesugaring(libs.desugar.jdk.libs)
 
     // Pinned CloudStream library & runtime dependencies expected by .cs3 plugins
@@ -37,7 +40,6 @@ dependencies {
     implementation(libs.rhino)
     implementation(libs.quickjs.kt)
     implementation(libs.androidx.appcompat)
-
     implementation(libs.okhttp)
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.kotlinx.serialization.json)

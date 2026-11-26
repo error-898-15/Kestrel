@@ -68,6 +68,7 @@ import com.kestrel.core.designsystem.KestrelTheme
 import com.kestrel.core.designsystem.LocalGlassState
 import com.kestrel.core.designsystem.MediaPosterCard
 import com.kestrel.core.designsystem.SectionHeader
+import com.kestrel.core.designsystem.glassPanel
 import com.kestrel.core.designsystem.glassSource
 import com.kestrel.core.designsystem.kestrelNavClearance
 import com.kestrel.core.designsystem.rememberGlassState
@@ -86,7 +87,7 @@ fun HomeScreen(
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     val colors = KestrelTheme.colors
     val navClearance = kestrelNavClearance()
-    val heroHeight = (LocalConfiguration.current.screenHeightDp * 0.62f).dp
+    val heroHeight = (LocalConfiguration.current.screenHeightDp * 0.60f).dp
     val homeGlass = rememberGlassState()
 
     val heroItems = remember(state.rows) {
@@ -101,132 +102,148 @@ fun HomeScreen(
         modifier = modifier.fillMaxSize(),
         style = KestrelBackdrop.Dark
     ) {
-        when {
-            state.isLoading && state.rows.isEmpty() -> {
+        if (state.providers.isEmpty()) {
+            if (state.isLoading) {
                 Box(
-                    modifier = Modifier.fillMaxSize(),
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(bottom = navClearance),
                     contentAlignment = Alignment.Center
                 ) {
                     CircularProgressIndicator(color = colors.accentAmber)
                 }
-            }
-
-            state.providers.isEmpty() -> {
+            } else {
                 EmptyStateView(
                     icon = Icons.Outlined.Explore,
                     title = "No active sources",
                     description = "Kestrel ships with zero built-in content. Install and enable a CloudStream .cs3, Nuvio, or Stremio repository in Extensions to browse catalogs.",
                     actionLabel = "Manage Extensions",
                     onAction = onOpenExtensions,
-                    modifier = Modifier.statusBarsPadding()
+                    modifier = Modifier
+                        .statusBarsPadding()
+                        .padding(bottom = navClearance)
                 )
             }
-
-            else -> {
-                LazyColumn(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .glassSource(homeGlass),
-                    contentPadding = PaddingValues(bottom = navClearance),
-                    verticalArrangement = Arrangement.spacedBy(22.dp)
-                ) {
-                    if (heroItems.isNotEmpty()) {
-                        item(key = "hero", contentType = "hero") {
-                            HeroCarousel(
-                                items = heroItems,
-                                height = heroHeight,
-                                onOpen = onOpenMedia
-                            )
-                        }
-                    } else {
-                        item(key = "top_spacer", contentType = "spacer") {
-                            Spacer(modifier = Modifier.statusBarsPadding().height(72.dp))
-                        }
+        } else {
+            LazyColumn(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .glassSource(homeGlass),
+                contentPadding = PaddingValues(bottom = navClearance),
+                verticalArrangement = Arrangement.spacedBy(22.dp)
+            ) {
+                if (heroItems.isNotEmpty()) {
+                    item(key = "hero", contentType = "hero") {
+                        HeroCarousel(
+                            items = heroItems,
+                            height = heroHeight,
+                            onOpen = onOpenMedia
+                        )
                     }
+                } else {
+                    item(key = "top_spacer", contentType = "spacer") {
+                        Spacer(
+                            modifier = Modifier
+                                .statusBarsPadding()
+                                .height(68.dp)
+                        )
+                    }
+                }
 
-                    if (state.providerErrors.isNotEmpty()) {
-                        item(key = "provider_errors", contentType = "error_banner") {
-                            KestrelCard(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(horizontal = 20.dp)
+                if (state.providerErrors.isNotEmpty()) {
+                    item(key = "provider_errors", contentType = "error_banner") {
+                        KestrelCard(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 20.dp)
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
                             ) {
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Outlined.ErrorOutline,
-                                        contentDescription = null,
-                                        tint = colors.statusWarning,
-                                        modifier = Modifier.size(18.dp)
-                                    )
-                                    Text(
-                                        text = state.providerErrors.joinToString("\n"),
-                                        style = MaterialTheme.typography.bodyMedium,
-                                        color = colors.textSecondary
-                                    )
-                                }
-                            }
-                        }
-                    }
-
-                    if (state.rows.isEmpty()) {
-                        item(key = "empty_rows", contentType = "empty") {
-                            Box(modifier = Modifier.height(260.dp)) {
-                                EmptyStateView(
-                                    icon = Icons.Outlined.Explore,
-                                    title = "No catalog rows returned",
-                                    description = "Active providers returned no items for this selection. Try refreshing or switching sources."
+                                Icon(
+                                    imageVector = Icons.Outlined.ErrorOutline,
+                                    contentDescription = null,
+                                    tint = colors.statusWarning,
+                                    modifier = Modifier.size(18.dp)
                                 )
-                            }
-                        }
-                    } else {
-                        itemsIndexed(
-                            items = state.rows,
-                            key = { index, row -> "${row.id}_$index" },
-                            contentType = { _, _ -> "catalog_row" }
-                        ) { _, row ->
-                            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                                SectionHeader(
-                                    title = row.title,
-                                    modifier = Modifier.padding(horizontal = 20.dp),
-                                    trailing = {
-                                        GlassCircleButton(
-                                            icon = Icons.AutoMirrored.Filled.KeyboardArrowRight,
-                                            contentDescription = "Only ${row.providerName}",
-                                            onClick = { viewModel.selectProvider(row.providerId) },
-                                            diameter = 36.dp,
-                                            modifier = Modifier.padding(start = 12.dp)
-                                        )
-                                    }
+                                Text(
+                                    text = state.providerErrors.joinToString("\n"),
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = colors.textSecondary
                                 )
-                                LazyRow(
-                                    contentPadding = PaddingValues(horizontal = 20.dp),
-                                    horizontalArrangement = Arrangement.spacedBy(12.dp)
-                                ) {
-                                    itemsIndexed(
-                                        items = row.items,
-                                        key = { idx, item -> "${item.id}_$idx" },
-                                        contentType = { _, _ -> "poster_card" }
-                                    ) { _, item ->
-                                        MediaPosterCard(
-                                            title = item.title,
-                                            posterUrl = item.posterUrl,
-                                            sourceTag = item.qualityLabel ?: item.type.name,
-                                            subtitle = item.year?.toString(),
-                                            posterHeaders = item.posterHeaders,
-                                            onClick = { onOpenMedia(item) }
-                                        )
-                                    }
-                                }
                             }
                         }
                     }
                 }
 
-                // Floating glass source chips + refresh, drawn over the hero.
-                CompositionLocalProvider(LocalGlassState provides homeGlass) {
+                if (state.isLoading && state.rows.isEmpty()) {
+                    item(key = "loading_rows", contentType = "loading") {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(260.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            CircularProgressIndicator(color = colors.accentAmber)
+                        }
+                    }
+                } else if (state.rows.isEmpty()) {
+                    item(key = "empty_rows", contentType = "empty") {
+                        Box(modifier = Modifier.height(260.dp)) {
+                            EmptyStateView(
+                                icon = Icons.Outlined.Explore,
+                                title = "No catalog rows returned",
+                                description = "Active providers returned no items for this selection. Try refreshing or switching sources."
+                            )
+                        }
+                    }
+                } else {
+                    itemsIndexed(
+                        items = state.rows,
+                        key = { index, row -> "${row.id}_$index" },
+                        contentType = { _, _ -> "catalog_row" }
+                    ) { _, row ->
+                        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                            SectionHeader(
+                                title = row.title,
+                                modifier = Modifier.padding(horizontal = 20.dp),
+                                trailing = {
+                                    GlassCircleButton(
+                                        icon = Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                                        contentDescription = "Only ${row.providerName}",
+                                        onClick = { viewModel.selectProvider(row.providerId) },
+                                        diameter = 36.dp,
+                                        modifier = Modifier.padding(start = 12.dp)
+                                    )
+                                }
+                            )
+                            LazyRow(
+                                contentPadding = PaddingValues(horizontal = 20.dp),
+                                horizontalArrangement = Arrangement.spacedBy(12.dp)
+                            ) {
+                                itemsIndexed(
+                                    items = row.items,
+                                    key = { idx, item -> "${item.id}_$idx" },
+                                    contentType = { _, _ -> "poster_card" }
+                                ) { _, item ->
+                                    MediaPosterCard(
+                                        title = item.title,
+                                        posterUrl = item.posterUrl,
+                                        sourceTag = item.qualityLabel ?: item.type.name,
+                                        subtitle = item.year?.toString(),
+                                        posterHeaders = item.posterHeaders,
+                                        onClick = { onOpenMedia(item) }
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Floating liquid-glass source chips + refresh, always accessible over content.
+            CompositionLocalProvider(LocalGlassState provides homeGlass) {
                 Column(
                     modifier = Modifier
                         .align(Alignment.TopStart)
@@ -277,7 +294,6 @@ fun HomeScreen(
                         )
                     }
                 }
-                }
             }
         }
     }
@@ -291,7 +307,6 @@ private fun HeroCarousel(
     onOpen: (MediaSummary) -> Unit
 ) {
     val pagerState = rememberPagerState(pageCount = { items.size })
-
     LaunchedEffect(items.size) {
         if (items.size > 1) {
             while (true) {
@@ -301,7 +316,6 @@ private fun HeroCarousel(
             }
         }
     }
-
     Box(
         modifier = Modifier
             .fillMaxWidth()
@@ -313,7 +327,6 @@ private fun HeroCarousel(
         ) { page ->
             HeroPage(item = items[page], onOpen = onOpen)
         }
-
         Row(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
@@ -348,7 +361,6 @@ private fun HeroPage(
     val request = rememberKestrelImageRequest(item.posterUrl, item.posterHeaders, 900, 1350)
     val metaText = listOfNotNull(item.type.heroLabel(), item.year?.toString()).joinToString("  \u2022  ")
     val rating = item.rating?.takeIf { it > 0.0 }
-
     Box(modifier = Modifier.fillMaxSize()) {
         if (request != null) {
             AsyncImage(
@@ -383,8 +395,8 @@ private fun HeroPage(
             Text(
                 text = item.title,
                 style = TextStyle(
-                    fontSize = 34.sp,
-                    lineHeight = 38.sp,
+                    fontSize = 32.sp,
+                    lineHeight = 36.sp,
                     fontWeight = FontWeight.ExtraBold,
                     letterSpacing = (-0.5).sp
                 ),
@@ -424,16 +436,22 @@ private fun HeroPage(
             Box(
                 modifier = Modifier
                     .clip(CircleShape)
-                    .background(Color.White.copy(alpha = 0.94f))
+                    .glassPanel(
+                        cornerRadius = 26.dp,
+                        tint = Color.White.copy(alpha = 0.18f),
+                        rimColor = Color.White,
+                        rimAlpha = 0.65f,
+                        state = null
+                    )
                     .clickable { onOpen(item) }
-                    .padding(horizontal = 40.dp, vertical = 13.dp),
+                    .padding(horizontal = 36.dp, vertical = 12.dp),
                 contentAlignment = Alignment.Center
             ) {
                 Text(
                     text = "View Details",
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.Bold,
-                    color = Color(0xFF0B0D12),
+                    color = Color.White,
                     maxLines = 1
                 )
             }
@@ -448,6 +466,4 @@ private fun MediaType.heroLabel(): String = when (this) {
     MediaType.LIVE -> "Live"
     MediaType.OVA -> "OVA"
     MediaType.CARTOON -> "Cartoon"
-    MediaType.DOCUMENTARY -> "Documentary"
-    MediaType.OTHER -> "Title"
 }

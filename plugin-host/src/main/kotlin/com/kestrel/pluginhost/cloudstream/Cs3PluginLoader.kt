@@ -27,6 +27,10 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonObject
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 import java.util.zip.ZipFile
@@ -54,6 +58,11 @@ class Cs3PluginLoader @Inject constructor(
         val providers: List<SourceProvider>
     )
 
+    private data class ParsedCs3Manifest(
+        val pluginClassName: String?,
+        val requiresResources: Boolean
+    )
+
     private val mutex = Mutex()
     private val loadedByPluginId = ConcurrentHashMap<String, LoadedPluginRecord>()
 
@@ -78,7 +87,6 @@ class Cs3PluginLoader @Inject constructor(
                 sandbox.markError(plugin.id, msg)
                 return@withContext Result.failure(IllegalStateException(msg))
             }
-
             val path = plugin.localFilePath
             if (path.isNullOrBlank()) {
                 return@withContext Result.failure(IllegalStateException("Plugin file is not installed"))
@@ -129,7 +137,6 @@ class Cs3PluginLoader @Inject constructor(
                     }
 
                     val beforeApis = APIHolder.allProviders.toSet()
-
                     if (instance is Plugin) {
                         instance.load(context)
                     } else {
@@ -192,14 +199,17 @@ class Cs3PluginLoader @Inject constructor(
         }
     }
 
-    private fun readManifest(loader: ClassLoader, file: File): BasePlugin.Manifest {
+    private fun readManifest(loader: ClassLoader, file: File): ParsedCs3Manifest {
         val rawText = loader.getResourceAsStream("manifest.json")?.bufferedReader()?.use { it.readText() }
             ?: ZipFile(file).use { zip ->
                 val entry = zip.getEntry("manifest.json")
                     ?: error("No manifest.json in ${file.name}")
                 zip.getInputStream(entry).bufferedReader().use { it.readText() }
             }
-        return json.decodeFromString(BasePlugin.Manifest.serializer(), rawText)
+        val obj = json.parseToJsonElement(rawText).jsonObject
+        val className = (obj["pluginClassName"] as? JsonPrimitive)?.contentOrNull
+        val reqRes = (obj["requiresResources"] as? JsonPrimitive)?.booleanOrNull ?: false
+        return ParsedCs3Manifest(pluginClassName = className, requiresResources = reqRes)
     }
 
     private fun attachPluginResources(file: File, plugin: Plugin) {

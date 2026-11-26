@@ -9,8 +9,11 @@ plugins {
 android {
     namespace = "com.kestrel.feature.player"
     compileSdk = libs.versions.compileSdk.get().toInt()
+
     defaultConfig { minSdk = libs.versions.minSdk.get().toInt() }
+
     buildFeatures { compose = true }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
@@ -21,16 +24,17 @@ dependencies {
     implementation(project(":core"))
     implementation(project(":domain"))
 
+    implementation(libs.androidx.core.ktx)
     implementation(libs.media3.exoplayer)
     implementation(libs.media3.exoplayer.hls)
     implementation(libs.media3.exoplayer.dash)
     implementation(libs.media3.datasource.okhttp)
     implementation(libs.media3.ui)
     implementation(libs.media3.session)
-
     implementation(libs.androidx.lifecycle.runtime.compose)
     implementation(libs.androidx.lifecycle.viewmodel.compose)
     implementation(libs.androidx.hilt.navigation.compose)
+
     implementation(libs.hilt.android)
     ksp(libs.hilt.compiler)
 }

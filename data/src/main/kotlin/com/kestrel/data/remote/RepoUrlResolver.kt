@@ -51,8 +51,8 @@ class RepoUrlResolver @Inject constructor(
     fun rewriteGitHostUrl(url: String): String {
         val clean = url.trim().removeSuffix("/")
 
-        // GitHub blob: https://github.com/user/repo/blob/branch/path -> https://raw.githubusercontent.com/user/repo/branch/path
-        val ghBlobRegex = Regex("^https?://github\\.com/([^/]+)/([^/]+)/blob/([^/]+)/(.*)$")
+        // GitHub blob/raw: https://github.com/user/repo/(blob|raw)/branch/path -> https://raw.githubusercontent.com/user/repo/branch/path
+        val ghBlobRegex = Regex("^https?://github\\.com/([^/]+)/([^/]+)/(?:blob|raw)/([^/]+)/(.*)$")
         ghBlobRegex.matchEntire(clean)?.let { match ->
             val (owner, repo, branch, path) = match.destructured
             return "https://raw.githubusercontent.com/$owner/$repo/$branch/$path"
@@ -97,7 +97,13 @@ class RepoUrlResolver @Inject constructor(
         val normalized = normalizeInput(rawInput)
         require(normalized.isNotBlank()) { "Repository URL cannot be blank" }
 
-        val candidates = expandManifestCandidates(normalized)
+        val baseCandidates = expandManifestCandidates(normalized)
+        val candidates = buildList {
+            for (c in baseCandidates) {
+                add(c)
+                toJsDelivrMirror(c)?.let { add(it) }
+            }
+        }.distinct()
         var lastFailure: Throwable? = null
 
         for (candidate in candidates) {
@@ -115,6 +121,13 @@ class RepoUrlResolver @Inject constructor(
         }
 
         throw lastFailure ?: IllegalStateException("Failed to fetch repository manifest from $normalized")
+    }
+
+    private fun toJsDelivrMirror(url: String): String? {
+        val rawRegex = Regex("^https?://raw\\.githubusercontent\\.com/([^/]+)/([^/]+)/([^/]+)/(.*)$")
+        val match = rawRegex.matchEntire(url) ?: return null
+        val (owner, repo, branch, path) = match.destructured
+        return "https://cdn.jsdelivr.net/gh/$owner/$repo@$branch/$path"
     }
 
     private fun expandManifestCandidates(normalized: String): List<String> {
@@ -186,6 +199,6 @@ class RepoUrlResolver @Inject constructor(
     companion object {
         const val SHORTCODE_BASE_URL = "https://cs3.to"
         const val BROWSER_USER_AGENT =
-            "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
+            "Mozilla/5.0 (Linux; Android 14; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
     }
 }
