@@ -11,6 +11,7 @@ import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonArray
@@ -75,6 +76,32 @@ sealed interface ParsedRepoPayload {
         override val repo: RepoConfig,
         val addonPlugin: PluginMetadata
     ) : ParsedRepoPayload
+
+    data class Vega(
+        override val repo: RepoConfig,
+        val plugins: List<PluginMetadata>
+    ) : ParsedRepoPayload
+
+    data class Zangetsu(
+        override val repo: RepoConfig,
+        val plugins: List<PluginMetadata>
+    ) : ParsedRepoPayload
+
+    data class SkyStream(
+        override val repo: RepoConfig,
+        val pluginListUrls: List<String>,
+        val inlinePlugins: List<PluginMetadata> = emptyList()
+    ) : ParsedRepoPayload
+
+    data class SkyStreamMega(
+        override val repo: RepoConfig,
+        val childRepoUrls: List<String>
+    ) : ParsedRepoPayload
+
+    data class Hikari(
+        override val repo: RepoConfig,
+        val plugins: List<PluginMetadata>
+    ) : ParsedRepoPayload
 }
 
 @Singleton
@@ -85,19 +112,38 @@ class RepoJsonParser @Inject constructor(
         val root = json.parseToJsonElement(rawJson)
         if (root is JsonArray) {
             val firstObj = root.firstOrNull() as? JsonObject
-            if (firstObj != null && ("filename" in firstObj || "file" in firstObj || "script" in firstObj || "supportedTypes" in firstObj) &&
-                "internalName" !in firstObj && "apiVersion" !in firstObj
-            ) {
-                return RepoType.NUVIO
+            if (firstObj != null) {
+                if ("display_name" in firstObj && "value" in firstObj) {
+                    return RepoType.VEGA
+                }
+                val itemUrl = firstObj.stringField("url").orEmpty()
+                if ("packageName" in firstObj || itemUrl.endsWith(".sky", ignoreCase = true)) {
+                    return RepoType.SKYSTREAM
+                }
+                if (("filename" in firstObj || "file" in firstObj || "script" in firstObj || "supportedTypes" in firstObj) &&
+                    "internalName" !in firstObj && "apiVersion" !in firstObj
+                ) {
+                    return RepoType.NUVIO
+                }
             }
             return RepoType.CLOUDSTREAM
         }
 
         val obj: JsonObject = root.jsonObject
         return when {
-            // Check Nuvio keys BEFORE manifestVersion, because some Nuvio manifests include manifestVersion.
+            // Zangetsu index.json
+            "sources" in obj && obj["sources"] is JsonArray -> RepoType.ZANGETSU
+            // SkyStream mega_repo.json
+            "repos" in obj && obj["repos"] is JsonArray -> RepoType.SKYSTREAM
+            // Hikari repo.json
+            "plugins" in obj && obj["plugins"] is JsonArray -> RepoType.HIKARI
+            // Nuvio manifests (check before manifestVersion because some Nuvio manifests include manifestVersion)
             "scrapers" in obj || "providers" in obj -> RepoType.NUVIO
+            // SkyStream repo.json (uses packageName + pluginLists)
+            "pluginLists" in obj && "packageName" in obj -> RepoType.SKYSTREAM
+            // CloudStream repo.json (note: SkyStream repos without packageName are auto-upgraded when pluginLists contain .sky)
             "pluginLists" in obj || "manifestVersion" in obj -> RepoType.CLOUDSTREAM
+            // Stremio addon manifest
             ("resources" in obj || "catalogs" in obj) && "id" in obj -> RepoType.STREMIO
             resolvedUrl.endsWith("/manifest.json", ignoreCase = true) && "id" in obj -> RepoType.STREMIO
             else -> throw IllegalArgumentException("Unrecognized repository manifest format")
@@ -117,12 +163,7 @@ class RepoJsonParser @Inject constructor(
         return when (type) {
             RepoType.CLOUDSTREAM -> {
                 if (root is JsonArray) {
-                    // Direct plugins.json URL provided by the user.
-                    val repoName = resolvedUrl.substringAfter("://")
-                        .split('/')
-                        .getOrNull(2)
-                        ?.takeIf { it.isNotBlank() }
-                        ?: "CloudStream Plugins"
+                    val repoName = deriveRepoLabel(resolvedUrl, "CloudStream Plugins")
                     val repo = RepoConfig(
                         id = repoId,
                         url = rawInputUrl,
@@ -211,7 +252,308 @@ class RepoJsonParser @Inject constructor(
                 )
                 ParsedRepoPayload.Stremio(repo = repo, addonPlugin = addon)
             }
+
+            RepoType.VEGA -> parseVegaPayload(
+                repoId = repoId,
+                rawInputUrl = rawInputUrl,
+                resolvedUrl = resolvedUrl,
+                array = root.jsonArray,
+                nowEpochMs = nowEpochMs
+            )
+
+            RepoType.ZANGETSU -> parseZangetsuPayload(
+                repoId = repoId,
+                rawInputUrl = rawInputUrl,
+                resolvedUrl = resolvedUrl,
+                obj = root.jsonObject,
+                nowEpochMs = nowEpochMs
+            )
+
+            RepoType.SKYSTREAM -> parseSkyStreamPayload(
+                repoId = repoId,
+                rawInputUrl = rawInputUrl,
+                resolvedUrl = resolvedUrl,
+                root = root,
+                nowEpochMs = nowEpochMs
+            )
+
+            RepoType.HIKARI -> parseHikariPayload(
+                repoId = repoId,
+                rawInputUrl = rawInputUrl,
+                resolvedUrl = resolvedUrl,
+                obj = root.jsonObject,
+                nowEpochMs = nowEpochMs
+            )
         }
+    }
+
+    private fun parseVegaPayload(
+        repoId: String,
+        rawInputUrl: String,
+        resolvedUrl: String,
+        array: JsonArray,
+        nowEpochMs: Long
+    ): ParsedRepoPayload.Vega {
+        val baseUrl = resolvedUrl.substringBeforeLast('/', missingDelimiterValue = resolvedUrl)
+        val ownerName = extractRepoOwner(resolvedUrl)
+        val repoName = if (!ownerName.isNullOrBlank()) "$ownerName Vega Providers" else "Vega Providers"
+
+        val repo = RepoConfig(
+            id = repoId,
+            url = rawInputUrl,
+            resolvedUrl = resolvedUrl,
+            name = repoName,
+            description = "Vega modular JavaScript providers",
+            type = RepoType.VEGA,
+            manifestVersion = 1,
+            pluginListUrls = listOf(resolvedUrl),
+            addedAtEpochMs = nowEpochMs,
+            lastCheckedEpochMs = nowEpochMs,
+            isHealthy = true
+        )
+
+        val plugins = array.mapIndexedNotNull { _, el ->
+            val item = el as? JsonObject ?: return@mapIndexedNotNull null
+            val disabled = (item["disabled"] as? JsonPrimitive)?.booleanOrNull ?: false
+            if (disabled) return@mapIndexedNotNull null
+            val value = item.stringField("value")?.trim()?.takeIf { it.isNotBlank() }
+                ?: return@mapIndexedNotNull null
+            val displayName = item.stringField("display_name")?.trim()?.ifBlank { value } ?: value
+            val versionStr = item.primitiveText("version") ?: "1"
+            val providerType = item.stringField("type")?.trim().orEmpty()
+            val iconUrl = item.stringField("icon")?.takeIf { it.isNotBlank() }?.let {
+                expandIconSize(rewriteGitUrl(resolveRelativeUrl(resolvedUrl, it)))
+            }
+
+            PluginMetadata(
+                id = stableId("$repoId:$value"),
+                repoId = repoId,
+                repoType = RepoType.VEGA,
+                internalName = value,
+                displayName = displayName,
+                downloadUrl = "vega://$baseUrl/dist/$value",
+                version = parseSemverMajorMinor(versionStr),
+                apiVersion = 1,
+                status = 1,
+                language = "en",
+                description = if (providerType.isNotBlank()) "Vega $providerType provider ($value)" else "Vega provider",
+                iconUrl = iconUrl,
+                tvTypes = listOfNotNull(providerType.takeIf { it.isNotBlank() }),
+                isEnabled = false,
+                installState = PluginInstallState.NOT_INSTALLED
+            )
+        }
+
+        return ParsedRepoPayload.Vega(repo = repo, plugins = plugins)
+    }
+
+    private fun parseZangetsuPayload(
+        repoId: String,
+        rawInputUrl: String,
+        resolvedUrl: String,
+        obj: JsonObject,
+        nowEpochMs: Long
+    ): ParsedRepoPayload.Zangetsu {
+        val repoName = obj.stringField("name")?.ifBlank { null } ?: "Zangetsu Providers"
+        val repoDesc = obj.stringField("description").orEmpty()
+        val sources = obj["sources"]?.jsonArray ?: JsonArray(emptyList())
+
+        val repo = RepoConfig(
+            id = repoId,
+            url = rawInputUrl,
+            resolvedUrl = resolvedUrl,
+            name = repoName,
+            description = repoDesc,
+            type = RepoType.ZANGETSU,
+            manifestVersion = 1,
+            pluginListUrls = listOf(resolvedUrl),
+            addedAtEpochMs = nowEpochMs,
+            lastCheckedEpochMs = nowEpochMs,
+            isHealthy = true
+        )
+
+        val plugins = sources.mapIndexedNotNull { index, el ->
+            val item = el as? JsonObject ?: return@mapIndexedNotNull null
+            val filePath = item.stringField("file")?.trim()?.takeIf { it.isNotBlank() }
+                ?: return@mapIndexedNotNull null
+            val internal = item.stringField("id")?.trim()?.ifBlank { null }
+                ?: filePath.substringAfterLast('/').removeSuffix(".js").ifBlank { "zangetsu_$index" }
+            val displayName = item.stringField("name")?.trim()?.ifBlank { internal } ?: internal
+            val downloadUrl = rewriteGitUrl(resolveRelativeUrl(resolvedUrl, filePath))
+            val logoPath = item.stringField("logo")?.takeIf { it.isNotBlank() }
+            val iconUrl = logoPath?.let { expandIconSize(rewriteGitUrl(resolveRelativeUrl(resolvedUrl, it))) }
+            val versionStr = item.primitiveText("version") ?: "1"
+            val lang = item.stringField("lang")?.ifBlank { null } ?: "en"
+            val mediaType = item.stringField("type")?.trim()?.takeIf { it.isNotBlank() }
+            val isNsfw = (item["nsfw"] as? JsonPrimitive)?.booleanOrNull ?: false
+
+            PluginMetadata(
+                id = stableId("$repoId:$internal"),
+                repoId = repoId,
+                repoType = RepoType.ZANGETSU,
+                internalName = internal,
+                displayName = displayName,
+                downloadUrl = downloadUrl,
+                version = parseSemverMajorMinor(versionStr),
+                apiVersion = 1,
+                status = 1,
+                language = lang,
+                description = if (isNsfw) "NSFW · Zangetsu provider" else "Zangetsu provider",
+                iconUrl = iconUrl,
+                tvTypes = listOfNotNull(mediaType),
+                isEnabled = false,
+                installState = PluginInstallState.NOT_INSTALLED
+            )
+        }
+
+        return ParsedRepoPayload.Zangetsu(repo = repo, plugins = plugins)
+    }
+
+    private fun parseSkyStreamPayload(
+        repoId: String,
+        rawInputUrl: String,
+        resolvedUrl: String,
+        root: JsonElement,
+        nowEpochMs: Long
+    ): ParsedRepoPayload {
+        if (root is JsonArray) {
+            val repoName = deriveRepoLabel(resolvedUrl, "SkyStream Plugins")
+            val repo = RepoConfig(
+                id = repoId,
+                url = rawInputUrl,
+                resolvedUrl = resolvedUrl,
+                name = repoName,
+                description = "SkyStream plugins repository",
+                type = RepoType.SKYSTREAM,
+                manifestVersion = 1,
+                pluginListUrls = listOf(resolvedUrl),
+                addedAtEpochMs = nowEpochMs,
+                lastCheckedEpochMs = nowEpochMs,
+                isHealthy = true
+            )
+            val inline = parseSkyStreamPluginsList(
+                repoId = repoId,
+                listUrl = resolvedUrl,
+                rawJson = root.toString()
+            )
+            return ParsedRepoPayload.SkyStream(
+                repo = repo,
+                pluginListUrls = emptyList(),
+                inlinePlugins = inline
+            )
+        }
+
+        val obj = root.jsonObject
+        val name = obj.stringField("name")?.ifBlank { null } ?: "SkyStream Repository"
+        val description = obj.stringField("description").orEmpty()
+        val manifestVersion = (obj["manifestVersion"] as? JsonPrimitive)?.intOrNull ?: 1
+
+        if ("repos" in obj && obj["repos"] is JsonArray) {
+            val childRepos = obj.stringListField("repos").map {
+                rewriteGitUrl(resolveRelativeUrl(resolvedUrl, it))
+            }
+            val repo = RepoConfig(
+                id = repoId,
+                url = rawInputUrl,
+                resolvedUrl = resolvedUrl,
+                name = name,
+                description = description,
+                type = RepoType.SKYSTREAM,
+                manifestVersion = manifestVersion,
+                pluginListUrls = childRepos,
+                addedAtEpochMs = nowEpochMs,
+                lastCheckedEpochMs = nowEpochMs,
+                isHealthy = true
+            )
+            return ParsedRepoPayload.SkyStreamMega(
+                repo = repo,
+                childRepoUrls = childRepos
+            )
+        }
+
+        val resolvedLists = obj.stringListField("pluginLists").map {
+            rewriteGitUrl(resolveRelativeUrl(resolvedUrl, it))
+        }
+        val repo = RepoConfig(
+            id = repoId,
+            url = rawInputUrl,
+            resolvedUrl = resolvedUrl,
+            name = name,
+            description = description,
+            type = RepoType.SKYSTREAM,
+            manifestVersion = manifestVersion,
+            pluginListUrls = resolvedLists,
+            addedAtEpochMs = nowEpochMs,
+            lastCheckedEpochMs = nowEpochMs,
+            isHealthy = true
+        )
+        return ParsedRepoPayload.SkyStream(
+            repo = repo,
+            pluginListUrls = resolvedLists
+        )
+    }
+
+    private fun parseHikariPayload(
+        repoId: String,
+        rawInputUrl: String,
+        resolvedUrl: String,
+        obj: JsonObject,
+        nowEpochMs: Long
+    ): ParsedRepoPayload.Hikari {
+        val repoName = obj.stringField("name")?.ifBlank { null } ?: "Hikari Extensions"
+        val repoDesc = obj.stringField("description").orEmpty()
+        val pluginsArr = obj["plugins"]?.jsonArray ?: JsonArray(emptyList())
+
+        val repo = RepoConfig(
+            id = repoId,
+            url = rawInputUrl,
+            resolvedUrl = resolvedUrl,
+            name = repoName,
+            description = repoDesc,
+            type = RepoType.HIKARI,
+            manifestVersion = 1,
+            pluginListUrls = listOf(resolvedUrl),
+            addedAtEpochMs = nowEpochMs,
+            lastCheckedEpochMs = nowEpochMs,
+            isHealthy = true
+        )
+
+        val plugins = pluginsArr.mapIndexedNotNull { index, el ->
+            val item = el as? JsonObject ?: return@mapIndexedNotNull null
+            val url = item.stringField("url")?.trim()?.takeIf { it.isNotBlank() }
+                ?: return@mapIndexedNotNull null
+            val displayName = item.stringField("name")?.trim()?.ifBlank { null }
+                ?: url.substringAfterLast('/').removeSuffix(".hiki").ifBlank { "hikari_$index" }
+            val internal = url.substringAfterLast('/').removeSuffix(".hiki").ifBlank { displayName }
+            val resolvedDownload = rewriteGitUrl(resolveRelativeUrl(resolvedUrl, url))
+            val version = (item["version"] as? JsonPrimitive)?.intOrNull
+                ?: item.primitiveText("version")?.let { parseSemverMajorMinor(it) }
+                ?: 1
+            val iconUrl = item.stringField("iconUrl")?.takeIf { it.isNotBlank() }?.let {
+                expandIconSize(rewriteGitUrl(resolveRelativeUrl(resolvedUrl, it)))
+            }
+
+            PluginMetadata(
+                id = stableId("$repoId:$internal"),
+                repoId = repoId,
+                repoType = RepoType.HIKARI,
+                internalName = internal,
+                displayName = displayName,
+                downloadUrl = resolvedDownload,
+                version = version,
+                apiVersion = 1,
+                status = 1,
+                language = item.stringField("language")?.ifBlank { null } ?: "en",
+                authors = item.stringListField("authors"),
+                description = item.stringField("description").orEmpty(),
+                iconUrl = iconUrl,
+                tvTypes = item.stringListField("tvTypes"),
+                isEnabled = false,
+                installState = PluginInstallState.NOT_INSTALLED
+            )
+        }
+
+        return ParsedRepoPayload.Hikari(repo = repo, plugins = plugins)
     }
 
     private fun parseNuvioPayload(
@@ -291,7 +633,67 @@ class RepoJsonParser @Inject constructor(
                 installState = PluginInstallState.NOT_INSTALLED
             )
         }
+
         return ParsedRepoPayload.Nuvio(repo = repo, plugins = plugins)
+    }
+
+    fun isSkyStreamPluginsList(rawJson: String): Boolean {
+        val root = runCatching { json.parseToJsonElement(rawJson) }.getOrNull() as? JsonArray ?: return false
+        val first = root.firstOrNull() as? JsonObject ?: return false
+        val url = first.stringField("url").orEmpty()
+        return "packageName" in first || url.endsWith(".sky", ignoreCase = true)
+    }
+
+    fun parseSkyStreamPluginsList(
+        repoId: String,
+        listUrl: String,
+        rawJson: String
+    ): List<PluginMetadata> {
+        val array = json.parseToJsonElement(rawJson).jsonArray
+        return array.mapIndexedNotNull { index, el ->
+            val obj = el as? JsonObject ?: return@mapIndexedNotNull null
+            val url = obj.stringField("url").orEmpty()
+            val name = obj.stringField("name").orEmpty()
+            val pkg = obj.stringField("packageName").orEmpty()
+            if (url.isBlank() || (pkg.isBlank() && name.isBlank())) {
+                return@mapIndexedNotNull null
+            }
+            val internal = pkg.ifBlank { name.ifBlank { "sky_$index" } }
+            val display = name.ifBlank { internal }
+            val resolvedDownload = rewriteGitUrl(resolveRelativeUrl(listUrl, url))
+            val version = (obj["version"] as? JsonPrimitive)?.intOrNull
+                ?: obj.primitiveText("version")?.let { parseSemverMajorMinor(it) }
+                ?: 1
+            val langs = obj.stringListField("languages") + listOfNotNull(obj.stringField("language"))
+            val primaryLang = langs.firstOrNull { it.isNotBlank() } ?: "en"
+            val authors = obj.stringListField("authors")
+            val description = obj.stringField("description").orEmpty()
+            val iconUrl = (obj.stringField("iconUrl") ?: obj.stringField("icon"))
+                ?.takeIf { it.isNotBlank() }
+                ?.let { expandIconSize(rewriteGitUrl(resolveRelativeUrl(listUrl, it))) }
+            val tvTypes = (obj.stringListField("categories") + obj.stringListField("tvTypes")).distinct()
+            val repositoryUrl = obj.stringField("baseUrl")?.takeIf { it.isNotBlank() }
+
+            PluginMetadata(
+                id = stableId("$repoId:$internal"),
+                repoId = repoId,
+                repoType = RepoType.SKYSTREAM,
+                internalName = internal,
+                displayName = display,
+                downloadUrl = resolvedDownload,
+                version = version,
+                apiVersion = 1,
+                status = 1,
+                language = primaryLang,
+                authors = authors,
+                description = description,
+                iconUrl = iconUrl,
+                tvTypes = tvTypes,
+                repositoryUrl = repositoryUrl,
+                isEnabled = false,
+                installState = PluginInstallState.NOT_INSTALLED
+            )
+        }
     }
 
     fun parseCloudStreamPluginsList(
@@ -309,7 +711,6 @@ class RepoJsonParser @Inject constructor(
             if (url.isBlank() || (internalName.isBlank() && name.isBlank())) {
                 return@mapNotNull null
             }
-
             val internal = internalName.ifBlank { name }
             val display = name.ifBlank { internal }
             val resolvedDownload = rewriteGitUrl(resolveRelativeUrl(listUrl, url))
@@ -327,8 +728,8 @@ class RepoJsonParser @Inject constructor(
             val tvTypes = obj.stringListField("tvTypes")
             val fileSize = (obj["fileSize"] as? JsonPrimitive)?.longOrNull
             val repositoryUrl = obj.stringField("repositoryUrl")?.takeIf { it.isNotBlank() }
-            val supported = apiVersion in 0..supportedApiVersion
 
+            val supported = apiVersion in 0..supportedApiVersion
             PluginMetadata(
                 id = stableId("$repoId:$internal"),
                 repoId = repoId,
@@ -371,6 +772,19 @@ class RepoJsonParser @Inject constructor(
         val cleanTarget = trimmed.removePrefix("./").removePrefix("/")
         return "$base/$cleanTarget".replace(" ", "%20")
     }
+
+    private fun deriveRepoLabel(resolvedUrl: String, fallback: String): String =
+        resolvedUrl.substringAfter("://")
+            .split('/')
+            .getOrNull(2)
+            ?.takeIf { it.isNotBlank() }
+            ?: fallback
+
+    private fun extractRepoOwner(resolvedUrl: String): String? =
+        resolvedUrl.substringAfter("://")
+            .split('/')
+            .getOrNull(1)
+            ?.takeIf { it.isNotBlank() }
 
     private fun rewriteGitUrl(url: String): String {
         val ghBlob = Regex("^https?://github\\.com/([^/]+)/([^/]+)/(?:blob|raw)/([^/]+)/(.*)$")

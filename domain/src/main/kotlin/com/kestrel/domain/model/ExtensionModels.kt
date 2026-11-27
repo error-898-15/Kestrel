@@ -7,7 +7,11 @@ import kotlinx.serialization.Serializable
 enum class RepoType {
     CLOUDSTREAM,
     NUVIO,
-    STREMIO
+    STREMIO,
+    VEGA,
+    ZANGETSU,
+    SKYSTREAM,
+    HIKARI
 }
 
 @Serializable

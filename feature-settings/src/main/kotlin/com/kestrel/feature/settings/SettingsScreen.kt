@@ -304,6 +304,10 @@ fun SettingsScreen(
             RepoType.NUVIO -> state.nuvioExtensions to state.settings.selectedNuvioIds
             RepoType.STREMIO -> state.stremioExtensions to state.settings.selectedStremioIds
             RepoType.CLOUDSTREAM -> state.cloudStreamExtensions to state.settings.selectedCloudStreamIds
+            RepoType.VEGA -> state.vegaExtensions to state.settings.selectedVegaIds
+            RepoType.ZANGETSU -> state.zangetsuExtensions to state.settings.selectedZangetsuIds
+            RepoType.SKYSTREAM -> state.skyStreamExtensions to state.settings.selectedSkyStreamIds
+            RepoType.HIKARI -> state.hikariExtensions to state.settings.selectedHikariIds
         }
         ServerExtensionPickerDialog(
             family = pickerFamily,
@@ -367,7 +371,7 @@ private fun SettingsHubPage(
             SettingsSearchEntry(
                 title = "Plugins",
                 breadcrumb = "Sources • Nuvio & CloudStream repositories",
-                keywords = "plugins nuvio cloudstream cs3 scraper repositories providers install",
+                keywords = "plugins nuvio cloudstream cs3 vega zangetsu skystream hikari scraper repositories providers install",
                 icon = Icons.Outlined.Extension,
                 destination = SettingsDestination.PLUGINS
             ),
@@ -381,7 +385,7 @@ private fun SettingsHubPage(
             SettingsSearchEntry(
                 title = "Allowed Plugins & Addons",
                 breadcrumb = "Servers • Multi-server search",
-                keywords = "allowed plugins addons nuvio stremio cloudstream server search",
+                keywords = "allowed plugins addons nuvio stremio cloudstream vega zangetsu skystream hikari server search",
                 icon = Icons.Outlined.Dns,
                 destination = SettingsDestination.SERVERS
             ),
@@ -1042,7 +1046,7 @@ private fun PluginsPage(
                         MetadataPill("$enabledCount enabled")
                     }
                     Text(
-                        text = "Add Nuvio or CloudStream repositories below, then install and enable individual providers for multi-server streaming.",
+                        text = "Add CloudStream, Vega, Zangetsu, SkyStream, Hikari, or Nuvio repositories below, then install and enable individual providers for multi-server streaming.",
                         style = MaterialTheme.typography.bodyMedium,
                         color = InkSecondary
                     )
@@ -1065,7 +1069,7 @@ private fun PluginsPage(
                     OledUrlTextField(
                         value = repoInput,
                         onValueChange = onRepoInputChanged,
-                        placeholder = "Plugin manifest URL (Nuvio / CloudStream repo)",
+                        placeholder = "Repository URL (CloudStream / Vega / Zangetsu / SkyStream / Hikari / Nuvio)",
                         onSubmit = onAddRepo
                     )
                     OledCrimsonButton(
@@ -1180,7 +1184,7 @@ private fun PluginsPage(
                             verticalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
                             MetadataPill("$count providers")
-                            MetadataPill(if (repo.type == RepoType.NUVIO) "Nuvio" else "CloudStream")
+                            MetadataPill(repoTypeLabel(repo.type))
                         }
                     }
                 }
@@ -1324,7 +1328,7 @@ private fun PluginsPage(
                             if (plugin.language.isNotBlank()) {
                                 MetadataPill(plugin.language.uppercase(Locale.US))
                             }
-                            MetadataPill(if (plugin.repoType == RepoType.NUVIO) "Nuvio" else "CloudStream")
+                            MetadataPill(repoTypeLabel(plugin.repoType))
                             plugin.fileSizeBytes?.takeIf { it > 0L }?.let { bytes ->
                                 MetadataPill(formatFileSize(bytes))
                             }
@@ -1484,6 +1488,10 @@ private fun PlaybackAndServersPage(
     var showCloudStreamTimers by remember { mutableStateOf(false) }
     var showNuvioTimers by remember { mutableStateOf(false) }
     var showStremioTimers by remember { mutableStateOf(false) }
+    var showVegaTimers by remember { mutableStateOf(false) }
+    var showZangetsuTimers by remember { mutableStateOf(false) }
+    var showSkyStreamTimers by remember { mutableStateOf(false) }
+    var showHikariTimers by remember { mutableStateOf(false) }
 
     LazyColumn(
         modifier = Modifier
@@ -1514,7 +1522,7 @@ private fun PlaybackAndServersPage(
                     OledSwitchRow(
                         title = "Search all installed extensions",
                         subtitle = if (s.searchAllInstalled) {
-                            "Every enabled Nuvio, Stremio & CloudStream source is queried"
+                            "Every enabled source across all installed ecosystems is queried"
                         } else {
                             "Search origin extension plus enabled families below"
                         },
@@ -1579,6 +1587,82 @@ private fun PlaybackAndServersPage(
                         switchEnabled = !s.searchAllInstalled,
                         onCheckedChange = { onToggleSearchEvery(RepoType.CLOUDSTREAM, it) },
                         onOpenPicker = { onOpenFamilyPicker(RepoType.CLOUDSTREAM) }
+                    )
+
+                    OledFamilyBlock(
+                        toggleTitle = "Search every Vega provider",
+                        toggleSubtitle = if (s.searchEveryVega) {
+                            "All enabled Vega providers are searched"
+                        } else {
+                            "Only selected Vega providers below"
+                        },
+                        pickerTitle = "Allowed Vega Providers",
+                        pickerSubtitle = if (s.searchEveryVega) {
+                            "All enabled Vega providers (${state.vegaExtensions.size})"
+                        } else {
+                            "${s.selectedVegaIds.size} of ${state.vegaExtensions.size} selected"
+                        },
+                        checked = s.searchEveryVega || s.searchAllInstalled,
+                        switchEnabled = !s.searchAllInstalled,
+                        onCheckedChange = { onToggleSearchEvery(RepoType.VEGA, it) },
+                        onOpenPicker = { onOpenFamilyPicker(RepoType.VEGA) }
+                    )
+
+                    OledFamilyBlock(
+                        toggleTitle = "Search every Zangetsu source",
+                        toggleSubtitle = if (s.searchEveryZangetsu) {
+                            "All enabled Zangetsu sources are searched"
+                        } else {
+                            "Only selected Zangetsu sources below"
+                        },
+                        pickerTitle = "Allowed Zangetsu Sources",
+                        pickerSubtitle = if (s.searchEveryZangetsu) {
+                            "All enabled Zangetsu sources (${state.zangetsuExtensions.size})"
+                        } else {
+                            "${s.selectedZangetsuIds.size} of ${state.zangetsuExtensions.size} selected"
+                        },
+                        checked = s.searchEveryZangetsu || s.searchAllInstalled,
+                        switchEnabled = !s.searchAllInstalled,
+                        onCheckedChange = { onToggleSearchEvery(RepoType.ZANGETSU, it) },
+                        onOpenPicker = { onOpenFamilyPicker(RepoType.ZANGETSU) }
+                    )
+
+                    OledFamilyBlock(
+                        toggleTitle = "Search every SkyStream plugin",
+                        toggleSubtitle = if (s.searchEverySkyStream) {
+                            "All enabled SkyStream plugins are searched"
+                        } else {
+                            "Only selected SkyStream plugins below"
+                        },
+                        pickerTitle = "Allowed SkyStream Plugins",
+                        pickerSubtitle = if (s.searchEverySkyStream) {
+                            "All enabled SkyStream plugins (${state.skyStreamExtensions.size})"
+                        } else {
+                            "${s.selectedSkyStreamIds.size} of ${state.skyStreamExtensions.size} selected"
+                        },
+                        checked = s.searchEverySkyStream || s.searchAllInstalled,
+                        switchEnabled = !s.searchAllInstalled,
+                        onCheckedChange = { onToggleSearchEvery(RepoType.SKYSTREAM, it) },
+                        onOpenPicker = { onOpenFamilyPicker(RepoType.SKYSTREAM) }
+                    )
+
+                    OledFamilyBlock(
+                        toggleTitle = "Search every Hikari extension",
+                        toggleSubtitle = if (s.searchEveryHikari) {
+                            "All enabled Hikari extensions are searched"
+                        } else {
+                            "Only selected Hikari extensions below"
+                        },
+                        pickerTitle = "Allowed Hikari Extensions",
+                        pickerSubtitle = if (s.searchEveryHikari) {
+                            "All enabled Hikari extensions (${state.hikariExtensions.size})"
+                        } else {
+                            "${s.selectedHikariIds.size} of ${state.hikariExtensions.size} selected"
+                        },
+                        checked = s.searchEveryHikari || s.searchAllInstalled,
+                        switchEnabled = !s.searchAllInstalled,
+                        onCheckedChange = { onToggleSearchEvery(RepoType.HIKARI, it) },
+                        onOpenPicker = { onOpenFamilyPicker(RepoType.HIKARI) }
                     )
                 }
             }
@@ -1663,6 +1747,42 @@ private fun PlaybackAndServersPage(
                         settings = s,
                         expanded = showCloudStreamTimers,
                         onToggleExpand = { showCloudStreamTimers = !showCloudStreamTimers },
+                        onChangeExtensionTime = onChangeExtensionTime
+                    )
+
+                    OledFamilyTimerExpandable(
+                        familyTitle = "Vega",
+                        extensions = state.vegaExtensions,
+                        settings = s,
+                        expanded = showVegaTimers,
+                        onToggleExpand = { showVegaTimers = !showVegaTimers },
+                        onChangeExtensionTime = onChangeExtensionTime
+                    )
+
+                    OledFamilyTimerExpandable(
+                        familyTitle = "Zangetsu",
+                        extensions = state.zangetsuExtensions,
+                        settings = s,
+                        expanded = showZangetsuTimers,
+                        onToggleExpand = { showZangetsuTimers = !showZangetsuTimers },
+                        onChangeExtensionTime = onChangeExtensionTime
+                    )
+
+                    OledFamilyTimerExpandable(
+                        familyTitle = "SkyStream",
+                        extensions = state.skyStreamExtensions,
+                        settings = s,
+                        expanded = showSkyStreamTimers,
+                        onToggleExpand = { showSkyStreamTimers = !showSkyStreamTimers },
+                        onChangeExtensionTime = onChangeExtensionTime
+                    )
+
+                    OledFamilyTimerExpandable(
+                        familyTitle = "Hikari",
+                        extensions = state.hikariExtensions,
+                        settings = s,
+                        expanded = showHikariTimers,
+                        onToggleExpand = { showHikariTimers = !showHikariTimers },
                         onChangeExtensionTime = onChangeExtensionTime
                     )
                 }
@@ -2133,6 +2253,16 @@ private fun OverviewStatColumn(
 }
 
 @Composable
+private fun repoTypeLabel(type: RepoType): String = when (type) {
+    RepoType.CLOUDSTREAM -> "CloudStream"
+    RepoType.NUVIO -> "Nuvio"
+    RepoType.STREMIO -> "Stremio"
+    RepoType.VEGA -> "Vega"
+    RepoType.ZANGETSU -> "Zangetsu"
+    RepoType.SKYSTREAM -> "SkyStream"
+    RepoType.HIKARI -> "Hikari"
+}
+
 private fun MetadataPill(text: String) {
     Box(
         modifier = Modifier
@@ -2481,11 +2611,7 @@ private fun ServerExtensionPickerDialog(
     onDismiss: () -> Unit
 ) {
     var query by remember { mutableStateOf("") }
-    val familyLabel = when (family) {
-        RepoType.NUVIO -> "Nuvio"
-        RepoType.STREMIO -> "Stremio"
-        RepoType.CLOUDSTREAM -> "CloudStream"
-    }
+    val familyLabel = repoTypeLabel(family)
     val filtered = remember(extensions, query) {
         val q = query.trim().lowercase(Locale.US)
         if (q.isEmpty()) extensions

@@ -310,6 +310,23 @@ class NuvioJsEngine @Inject constructor(
         scriptCode: String,
         callScript: String,
         timeoutMs: Long
+    ): JSONObject = evaluateCustomScript(
+        pluginId = pluginId,
+        scraperId = scraperId,
+        setupScript = "",
+        scriptCode = prepareNuvioScript(scriptCode),
+        callScript = callScript,
+        timeoutMs = timeoutMs
+    )
+
+    suspend fun evaluateCustomScript(
+        pluginId: String,
+        scraperId: String,
+        setupScript: String,
+        scriptCode: String,
+        callScript: String,
+        timeoutMs: Long = 20_000L,
+        extraAsyncBindings: Map<String, suspend (Array<Any?>) -> String> = emptyMap()
     ): JSONObject {
         val resultDeferred = CompletableDeferred<String>()
         val capturedJson = AtomicReference<String?>(null)
@@ -361,23 +378,44 @@ class NuvioJsEngine @Inject constructor(
                     }
                 )
 
+                extraAsyncBindings.forEach { (bindingName, handler) ->
+                    defineBinding(
+                        bindingName,
+                        object : AsyncFunctionBinding<String> {
+                            override suspend fun invoke(args: Array<Any?>): String =
+                                handler(args)
+                        }
+                    )
+                }
+
                 evaluate<Any?>(NuvioPolyfill.build(), "nuvio-polyfill.js")
                 evaluate<Any?>(settingsInjection, "nuvio-settings.js")
-                val preparedCode = prepareNuvioScript(scriptCode)
-                val scriptError = runCatching {
-                    evaluate<Any?>(preparedCode, "$scraperId.js")
-                }.exceptionOrNull()
-                if (scriptError != null) {
-                    return@quickJs JSONObject()
-                        .put("error", scriptError.message ?: "Nuvio script evaluation error")
-                        .toString()
+                if (setupScript.isNotBlank()) {
+                    val setupError = runCatching {
+                        evaluate<Any?>(setupScript, "$scraperId-setup.js")
+                    }.exceptionOrNull()
+                    if (setupError != null) {
+                        return@quickJs JSONObject()
+                            .put("error", setupError.message ?: "Script setup error")
+                            .toString()
+                    }
+                }
+                if (scriptCode.isNotBlank()) {
+                    val scriptError = runCatching {
+                        evaluate<Any?>(scriptCode, "$scraperId.js")
+                    }.exceptionOrNull()
+                    if (scriptError != null) {
+                        return@quickJs JSONObject()
+                            .put("error", scriptError.message ?: "Script evaluation error")
+                            .toString()
+                    }
                 }
                 val invokeError = runCatching {
                     evaluate<Any?>(callScript, "nuvio-invoke.js")
                 }.exceptionOrNull()
                 if (invokeError != null && capturedJson.get() == null) {
                     return@quickJs JSONObject()
-                        .put("error", invokeError.message ?: "Nuvio script invocation error")
+                        .put("error", invokeError.message ?: "Script invocation error")
                         .toString()
                 }
 
@@ -386,10 +424,10 @@ class NuvioJsEngine @Inject constructor(
         } ?: capturedJson.get()
 
         if (raw.isNullOrBlank()) {
-            return JSONObject().put("error", "Nuvio scraper timed out or returned no output")
+            return JSONObject().put("error", "Script timed out or returned no output")
         }
         return runCatching { JSONObject(raw) }
-            .getOrElse { JSONObject().put("error", "Malformed JSON from scraper") }
+            .getOrElse { JSONObject().put("error", "Malformed JSON from script") }
     }
 
     private fun handleSyncCall(
@@ -457,6 +495,10 @@ class NuvioJsEngine @Inject constructor(
                     selector = req.optString("selector")
                 )
                 "domIndex" -> domRegistry.indexOf(req.optInt("nodeId", -1))
+                "htmlText" -> {
+                    val parsed = runCatching { Jsoup.parse(req.optString("html")).text() }.getOrDefault("")
+                    JSONObject().put("text", parsed).toString()
+                }
                 else -> "{}"
             }
         } catch (t: Throwable) {

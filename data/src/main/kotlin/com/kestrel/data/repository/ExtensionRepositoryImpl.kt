@@ -6,6 +6,7 @@ import com.kestrel.data.local.PluginDao
 import com.kestrel.data.local.RepoDao
 import com.kestrel.data.local.toDomain
 import com.kestrel.data.local.toEntity
+import com.kestrel.data.preferences.AppPreferences
 import com.kestrel.data.remote.ParsedRepoPayload
 import com.kestrel.data.remote.RepoJsonParser
 import com.kestrel.data.remote.RepoUrlResolver
@@ -26,7 +27,9 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
@@ -43,9 +46,12 @@ class ExtensionRepositoryImpl @Inject constructor(
     private val runtimeLoader: PluginRuntimeLoader,
     private val stremioClient: StremioClient,
     private val settingsStore: ProviderSettingsStore,
+    private val appPreferences: AppPreferences,
     private val json: Json,
     @IoDispatcher private val ioDispatcher: CoroutineDispatcher
 ) : ExtensionRepository {
+
+    private val seedMutex = Mutex()
 
     override val repositories: Flow<List<RepoConfig>> =
         repoDao.observeAll().map { rows -> rows.map { it.toDomain(json) } }
@@ -56,18 +62,72 @@ class ExtensionRepositoryImpl @Inject constructor(
     override val configurablePluginIds: Flow<Set<String>> =
         runtimeLoader.configurablePluginIds
 
-    override suspend fun addRepository(rawInput: String): Result<RepoConfig> =
-        withContext(ioDispatcher) {
-            runCatching {
-                val (resolvedUrl, manifestBody) = urlResolver.fetchText(rawInput)
-                val parsed = jsonParser.parseRepositoryManifest(
-                    rawInputUrl = rawInput.trim(),
-                    resolvedUrl = resolvedUrl,
-                    rawJson = manifestBody
-                )
-                syncParsedRepo(parsed)
+    override suspend fun ensureDefaultRepositoriesSeeded() = withContext(ioDispatcher) {
+        seedMutex.withLock {
+            val alreadySeeded = appPreferences.getSeededDefaultRepoUrls()
+            val pending = DefaultRepositories.ALL.filterNot { it in alreadySeeded }
+            if (pending.isEmpty()) return@withContext
+
+            val existingUrls = repoDao.observeAll().first()
+                .flatMap { listOf(it.url, it.resolvedUrl) }
+                .toSet()
+
+            val semaphore = Semaphore(3)
+            coroutineScope {
+                pending.map { repoUrl ->
+                    async {
+                        semaphore.withPermit {
+                            if (repoUrl in existingUrls) {
+                                appPreferences.markDefaultRepoSeeded(repoUrl)
+                                return@withPermit
+                            }
+                            runCatching {
+                                addRepositoryInternal(repoUrl)
+                                appPreferences.markDefaultRepoSeeded(repoUrl)
+                            }
+                        }
+                    }
+                }.awaitAll()
             }
         }
+    }
+
+    override suspend fun restoreDefaultRepositories(): Result<Int> = withContext(ioDispatcher) {
+        runCatching {
+            appPreferences.clearSeededDefaultRepos()
+            val existingUrls = repoDao.observeAll().first()
+                .flatMap { listOf(it.url, it.resolvedUrl) }
+                .toSet()
+            var added = 0
+            for (repoUrl in DefaultRepositories.ALL) {
+                if (repoUrl !in existingUrls) {
+                    val res = runCatching { addRepositoryInternal(repoUrl) }
+                    if (res.isSuccess) {
+                        added++
+                        appPreferences.markDefaultRepoSeeded(repoUrl)
+                    }
+                } else {
+                    appPreferences.markDefaultRepoSeeded(repoUrl)
+                }
+            }
+            added
+        }
+    }
+
+    override suspend fun addRepository(rawInput: String): Result<RepoConfig> =
+        withContext(ioDispatcher) {
+            runCatching { addRepositoryInternal(rawInput) }
+        }
+
+    private suspend fun addRepositoryInternal(rawInput: String): RepoConfig {
+        val (resolvedUrl, manifestBody) = urlResolver.fetchText(rawInput)
+        val parsed = jsonParser.parseRepositoryManifest(
+            rawInputUrl = rawInput.trim(),
+            resolvedUrl = resolvedUrl,
+            rawJson = manifestBody
+        )
+        return syncParsedRepo(parsed)
+    }
 
     override suspend fun refreshRepository(repoId: String): Result<RepoConfig> =
         withContext(ioDispatcher) {
@@ -287,9 +347,6 @@ class ExtensionRepositoryImpl @Inject constructor(
                 manifestUrl.ifBlank { existing.downloadUrl }
             )
 
-            // If the user kept the same base URL while editing/clearing manifest.config fields,
-            // compute the Stremio SDK JSON-encoded manifest URL and probe it; only preserve an
-            // existing web-configurator URL when no configValues were modified.
             val candidateUrl = if (normalizedInput == existingNormalized && configValues.isNotEmpty()) {
                 val encodedUrl = stremioClient.buildConfigEncodedManifestUrl(normalizedInput, configValues)
                 if (encodedUrl != normalizedInput) {
@@ -334,7 +391,6 @@ class ExtensionRepositoryImpl @Inject constructor(
                 runtimeLoader.unloadPlugin(updatedPlugin.id)
                 runtimeLoader.loadPlugin(updatedPlugin).getOrThrow()
             }
-
             updatedPlugin
         }
     }
@@ -344,7 +400,7 @@ class ExtensionRepositoryImpl @Inject constructor(
         existingRepo: RepoConfig? = null
     ): RepoConfig {
         val targetRepoId = existingRepo?.id ?: parsed.repo.id
-        val repo = parsed.repo.copy(
+        var repo = parsed.repo.copy(
             id = targetRepoId,
             addedAtEpochMs = existingRepo?.addedAtEpochMs ?: parsed.repo.addedAtEpochMs
         )
@@ -356,18 +412,58 @@ class ExtensionRepositoryImpl @Inject constructor(
                 if (parsed.inlinePlugins.isNotEmpty()) {
                     parsed.inlinePlugins
                 } else {
+                    val fetched = parsed.pluginListUrls.flatMap { listUrl ->
+                        val (_, listBody) = urlResolver.fetchText(listUrl)
+                        if (jsonParser.isSkyStreamPluginsList(listBody)) {
+                            jsonParser.parseSkyStreamPluginsList(
+                                repoId = targetRepoId,
+                                listUrl = listUrl,
+                                rawJson = listBody
+                            )
+                        } else {
+                            jsonParser.parseCloudStreamPluginsList(
+                                repoId = targetRepoId,
+                                listUrl = listUrl,
+                                rawJson = listBody,
+                                supportedApiVersion = PluginSandbox.SUPPORTED_CLOUDSTREAM_API_VERSION
+                            )
+                        }
+                    }
+                    if (fetched.isNotEmpty() && fetched.all { it.repoType == RepoType.SKYSTREAM }) {
+                        repo = repo.copy(type = RepoType.SKYSTREAM)
+                    }
+                    fetched
+                }
+            }
+
+            is ParsedRepoPayload.SkyStream -> {
+                if (parsed.inlinePlugins.isNotEmpty()) {
+                    parsed.inlinePlugins.map { it.copy(repoId = targetRepoId) }
+                } else {
                     parsed.pluginListUrls.flatMap { listUrl ->
                         val (_, listBody) = urlResolver.fetchText(listUrl)
-                        jsonParser.parseCloudStreamPluginsList(
+                        jsonParser.parseSkyStreamPluginsList(
                             repoId = targetRepoId,
                             listUrl = listUrl,
-                            rawJson = listBody,
-                            supportedApiVersion = PluginSandbox.SUPPORTED_CLOUDSTREAM_API_VERSION
+                            rawJson = listBody
                         )
                     }
                 }
             }
+
+            is ParsedRepoPayload.SkyStreamMega -> {
+                fetchSkyStreamMegaPlugins(
+                    targetRepoId = targetRepoId,
+                    childRepoUrls = parsed.childRepoUrls,
+                    visited = mutableSetOf(parsed.repo.resolvedUrl)
+                )
+            }
+
+            is ParsedRepoPayload.Vega -> parsed.plugins.map { it.copy(repoId = targetRepoId) }
+            is ParsedRepoPayload.Zangetsu -> parsed.plugins.map { it.copy(repoId = targetRepoId) }
+            is ParsedRepoPayload.Hikari -> parsed.plugins.map { it.copy(repoId = targetRepoId) }
             is ParsedRepoPayload.Nuvio -> parsed.plugins.map { it.copy(repoId = targetRepoId) }
+
             is ParsedRepoPayload.Stremio -> {
                 val existingAddon = existingPlugins.firstOrNull { it.repoType == RepoType.STREMIO }
                 val adjustedAddon = if (existingAddon != null) {
@@ -379,7 +475,8 @@ class ExtensionRepositoryImpl @Inject constructor(
             }
         }
 
-        val merged = incomingPlugins.map { remote ->
+        val deduplicatedIncoming = incomingPlugins.distinctBy { it.id }
+        val merged = deduplicatedIncoming.map { remote ->
             val local = existingById[remote.id]
             if (local == null) {
                 remote
@@ -414,5 +511,52 @@ class ExtensionRepositoryImpl @Inject constructor(
         repoDao.upsert(repo.toEntity(json))
         pluginDao.upsertAll(merged.map { it.toEntity(json) })
         return repo
+    }
+
+    private suspend fun fetchSkyStreamMegaPlugins(
+        targetRepoId: String,
+        childRepoUrls: List<String>,
+        visited: MutableSet<String>
+    ): List<PluginMetadata> = coroutineScope {
+        val semaphore = Semaphore(4)
+        childRepoUrls.map { childUrl ->
+            async {
+                semaphore.withPermit {
+                    if (!visited.add(childUrl)) return@withPermit emptyList()
+                    runCatching {
+                        val (resolvedChildUrl, childBody) = urlResolver.fetchText(childUrl)
+                        when (val childParsed = jsonParser.parseRepositoryManifest(childUrl, resolvedChildUrl, childBody)) {
+                            is ParsedRepoPayload.SkyStreamMega ->
+                                fetchSkyStreamMegaPlugins(targetRepoId, childParsed.childRepoUrls, visited)
+                            is ParsedRepoPayload.SkyStream -> {
+                                if (childParsed.inlinePlugins.isNotEmpty()) {
+                                    childParsed.inlinePlugins.map { it.copy(repoId = targetRepoId) }
+                                } else {
+                                    childParsed.pluginListUrls.flatMap { listUrl ->
+                                        runCatching {
+                                            val (_, listBody) = urlResolver.fetchText(listUrl)
+                                            jsonParser.parseSkyStreamPluginsList(targetRepoId, listUrl, listBody)
+                                        }.getOrDefault(emptyList())
+                                    }
+                                }
+                            }
+                            is ParsedRepoPayload.CloudStream -> {
+                                childParsed.pluginListUrls.flatMap { listUrl ->
+                                    runCatching {
+                                        val (_, listBody) = urlResolver.fetchText(listUrl)
+                                        if (jsonParser.isSkyStreamPluginsList(listBody)) {
+                                            jsonParser.parseSkyStreamPluginsList(targetRepoId, listUrl, listBody)
+                                        } else {
+                                            emptyList()
+                                        }
+                                    }.getOrDefault(emptyList())
+                                }
+                            }
+                            else -> emptyList()
+                        }
+                    }.getOrDefault(emptyList())
+                }
+            }
+        }.awaitAll().flatten()
     }
 }

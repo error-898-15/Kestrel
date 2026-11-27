@@ -142,7 +142,11 @@ private enum class RepoFilter(
     val icon: ImageVector
 ) {
     ALL("ALL", "All installed repos", "All repos you've added", null, Icons.Outlined.Folder),
-    CLOUDSTREAM("CLOUDSTREAM", "CloudStream repos", "repo.json · CloudStream extensions", RepoType.CLOUDSTREAM, Icons.Outlined.Cloud),
+    CLOUDSTREAM("CLOUDSTREAM", "CloudStream repos", "repo.json · .cs3 extensions", RepoType.CLOUDSTREAM, Icons.Outlined.Cloud),
+    VEGA("VEGA", "Vega repos", "manifest.json · Vega providers", RepoType.VEGA, Icons.Outlined.Language),
+    ZANGETSU("ZANGETSU", "Zangetsu repos", "index.json · Zangetsu JS sources", RepoType.ZANGETSU, Icons.Outlined.PlayArrow),
+    SKYSTREAM("SKYSTREAM", "SkyStream repos", "repo.json / mega_repo.json · .sky plugins", RepoType.SKYSTREAM, Icons.Outlined.Extension),
+    HIKARI("HIKARI", "Hikari repos", "repo.json · .hiki extensions", RepoType.HIKARI, Icons.Outlined.SystemUpdateAlt),
     NUVIO("NUVIO", "Nuvio repos", "manifest.json · Nuvio providers", RepoType.NUVIO, Icons.Outlined.PlayArrow),
     STREMIO("STREMIO", "Stremio repos", "manifest.json · Stremio addons", RepoType.STREMIO, Icons.Outlined.Movie);
 
@@ -220,13 +224,14 @@ fun ExtensionsScreen(
                 page == PAGE_HUB -> {
                     GlassScreenHeader(
                         title = "Extensions",
-                        subtitle = "CloudStream .cs3, Nuvio & Stremio repositories"
+                        subtitle = "CloudStream, Vega, Zangetsu, SkyStream, Hikari, Nuvio & Stremio"
                     )
                     BannerCard(state = state, onDismiss = viewModel::dismissBanner)
                     HubPage(
                         state = state,
                         bottomPadding = navClearance + 76.dp,
-                        onNavigate = { target -> go(target) }
+                        onNavigate = { target -> go(target) },
+                        onRestoreDefaults = viewModel::restoreDefaultRepositories
                     )
                 }
 
@@ -344,7 +349,7 @@ fun ExtensionsScreen(
                         EmptyStateView(
                             icon = filter.icon,
                             title = "No repositories",
-                            description = "Tap Add repo and paste a CloudStream repo.json URL, cloudstreamrepo:// link, shortcode, Nuvio manifest.json, or Stremio manifest.json."
+                            description = "Tap Add repo and paste a CloudStream, Vega, Zangetsu, SkyStream, Hikari, Nuvio, or Stremio repository URL."
                         )
                     } else {
                         LazyColumn(
@@ -462,13 +467,18 @@ fun ExtensionsScreen(
 private fun HubPage(
     state: ExtensionsUiState,
     bottomPadding: Dp,
-    onNavigate: (String) -> Unit
+    onNavigate: (String) -> Unit,
+    onRestoreDefaults: () -> Unit
 ) {
     val installed = state.plugins.count { it.isInstalled() }
     val enabled = state.plugins.count { it.isInstalled() && it.isEnabled }
     val rows = listOf(
         Triple(RepoFilter.ALL, "${state.repositories.size} total", PAGE_LIST_PREFIX + RepoFilter.ALL.key),
         Triple(RepoFilter.CLOUDSTREAM, "${state.repositories.count { it.type == RepoType.CLOUDSTREAM }} repos", PAGE_LIST_PREFIX + RepoFilter.CLOUDSTREAM.key),
+        Triple(RepoFilter.VEGA, "${state.repositories.count { it.type == RepoType.VEGA }} repos", PAGE_LIST_PREFIX + RepoFilter.VEGA.key),
+        Triple(RepoFilter.ZANGETSU, "${state.repositories.count { it.type == RepoType.ZANGETSU }} repos", PAGE_LIST_PREFIX + RepoFilter.ZANGETSU.key),
+        Triple(RepoFilter.SKYSTREAM, "${state.repositories.count { it.type == RepoType.SKYSTREAM }} repos", PAGE_LIST_PREFIX + RepoFilter.SKYSTREAM.key),
+        Triple(RepoFilter.HIKARI, "${state.repositories.count { it.type == RepoType.HIKARI }} repos", PAGE_LIST_PREFIX + RepoFilter.HIKARI.key),
         Triple(RepoFilter.NUVIO, "${state.repositories.count { it.type == RepoType.NUVIO }} repos", PAGE_LIST_PREFIX + RepoFilter.NUVIO.key),
         Triple(RepoFilter.STREMIO, "${state.repositories.count { it.type == RepoType.STREMIO }} repos", PAGE_LIST_PREFIX + RepoFilter.STREMIO.key)
     )
@@ -529,6 +539,20 @@ private fun HubPage(
                         )
                     }
                 }
+            }
+        }
+
+        item(key = "restore_defaults") {
+            KestrelCard(
+                onClick = onRestoreDefaults,
+                modifier = Modifier.fillMaxWidth(),
+                contentPadding = PaddingValues(16.dp)
+            ) {
+                MenuRowContent(
+                    icon = Icons.Outlined.Refresh,
+                    title = "Restore default repositories",
+                    subtitle = "Re-add bundled Vega, Zangetsu, SkyStream & Hikari repos"
+                )
             }
         }
     }
@@ -661,7 +685,10 @@ private fun PluginList(
         items(plugins, key = { it.id }, contentType = { "plugin_row" }) { plugin ->
             val canOpenSettings = plugin.id in state.configurablePluginIds ||
                 plugin.repoType == RepoType.STREMIO ||
-                (plugin.repoType == RepoType.NUVIO && plugin.isInstalled())
+                ((plugin.repoType == RepoType.NUVIO ||
+                    plugin.repoType == RepoType.VEGA ||
+                    plugin.repoType == RepoType.ZANGETSU ||
+                    plugin.repoType == RepoType.SKYSTREAM) && plugin.isInstalled())
             PluginCard(
                 plugin = plugin,
                 isBusy = plugin.id in state.busyPluginIds,
@@ -1087,7 +1114,7 @@ private fun AddRepoDialog(
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text(
-                    text = "Supports GitHub/Codeberg URLs, cloudstreamrepo://, shortcodes, Nuvio, and Stremio manifests.",
+                    text = "Supports CloudStream, Vega, Zangetsu, SkyStream, Hikari, Nuvio, and Stremio repository URLs, shortcodes, or deep links.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = colors.textSecondary
                 )

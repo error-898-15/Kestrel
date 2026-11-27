@@ -1,9 +1,13 @@
-# Preserve CloudStream plugin API classes under original package names for runtime DexClassLoader resolution
+# Preserve CloudStream & Hikari plugin API classes under original package names for runtime DexClassLoader resolution
 -keep class com.lagradost.cloudstream3.** { *; }
 -keep interface com.lagradost.cloudstream3.** { *; }
 -keep enum com.lagradost.cloudstream3.** { *; }
 -keep class com.lagradost.api.** { *; }
 -keep class com.lagradost.nicehttp.** { *; }
+-keep class com.hikari.ext.** { *; }
+-keep interface com.hikari.ext.** { *; }
+-keep enum com.hikari.ext.** { *; }
+-keep class com.hikari.app.** { *; }
 -keep class com.google.android.material.** { *; }
 -keep class com.google.gson.** { *; }
 -keep class com.fasterxml.jackson.** { *; }
@@ -14,4 +18,5 @@
 -keep class androidx.fragment.app.** { *; }
 -keepattributes *Annotation*,Signature,InnerClasses,EnclosingMethod
 -dontwarn com.lagradost.cloudstream3.**
+-dontwarn com.hikari.**
 -dontwarn com.google.android.material.**

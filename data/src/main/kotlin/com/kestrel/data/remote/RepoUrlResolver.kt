@@ -7,10 +7,10 @@ import javax.inject.Inject
 import javax.inject.Singleton
 
 /**
- * Normalizes user-provided repository inputs:
- * - https:// / http:// direct links
- * - cloudstreamrepo://, nuvio://, stremio:// links
- * - GitHub / Codeberg repo, tree, or blob web URLs (auto-resolving raw manifest.json / repo.json)
+ * Normalizes repository inputs across:
+ * - Direct HTTP/HTTPS URLs
+ * - Custom schemes: cloudstreamrepo://, nuvio://, stremio://, vegarepo://, zangetsurepo://, skystreamrepo://, hikarirepo://
+ * - GitHub / Codeberg web URLs (blob, tree, repo root -> raw manifest)
  * - CloudStream shortcodes (e.g. "hexated")
  */
 @Singleton
@@ -28,6 +28,14 @@ class RepoUrlResolver @Inject constructor(
                 stripSchemeWithHttps(trimmed, "nuvio://")
             trimmed.startsWith("stremio://", ignoreCase = true) ->
                 stripSchemeWithHttps(trimmed, "stremio://")
+            trimmed.startsWith("vegarepo://", ignoreCase = true) ->
+                stripSchemeWithHttps(trimmed, "vegarepo://")
+            trimmed.startsWith("zangetsurepo://", ignoreCase = true) ->
+                stripSchemeWithHttps(trimmed, "zangetsurepo://")
+            trimmed.startsWith("skystreamrepo://", ignoreCase = true) ->
+                stripSchemeWithHttps(trimmed, "skystreamrepo://")
+            trimmed.startsWith("hikarirepo://", ignoreCase = true) ->
+                stripSchemeWithHttps(trimmed, "hikarirepo://")
             !trimmed.contains("://") && !trimmed.contains('/') && !trimmed.contains('.') ->
                 "$SHORTCODE_BASE_URL/$trimmed"
             !trimmed.contains("://") -> "https://$trimmed"
@@ -104,8 +112,8 @@ class RepoUrlResolver @Inject constructor(
                 toJsDelivrMirror(c)?.let { add(it) }
             }
         }.distinct()
-        var lastFailure: Throwable? = null
 
+        var lastFailure: Throwable? = null
         for (candidate in candidates) {
             try {
                 val pair = executeGet(candidate)
@@ -119,7 +127,6 @@ class RepoUrlResolver @Inject constructor(
                 lastFailure = t
             }
         }
-
         throw lastFailure ?: IllegalStateException("Failed to fetch repository manifest from $normalized")
     }
 
@@ -141,9 +148,12 @@ class RepoUrlResolver @Inject constructor(
             return listOf(
                 "https://raw.githubusercontent.com/$owner/$repo/main/manifest.json",
                 "https://raw.githubusercontent.com/$owner/$repo/main/repo.json",
+                "https://raw.githubusercontent.com/$owner/$repo/main/index.json",
+                "https://raw.githubusercontent.com/$owner/$repo/main/mega_repo.json",
                 "https://raw.githubusercontent.com/$owner/$repo/builds/repo.json",
                 "https://raw.githubusercontent.com/$owner/$repo/master/manifest.json",
                 "https://raw.githubusercontent.com/$owner/$repo/master/repo.json",
+                "https://raw.githubusercontent.com/$owner/$repo/master/index.json",
                 "https://raw.githubusercontent.com/$owner/$repo/main/plugins.json",
                 "https://raw.githubusercontent.com/$owner/$repo/builds/plugins.json",
                 "https://raw.githubusercontent.com/$owner/$repo/master/plugins.json"
@@ -158,8 +168,10 @@ class RepoUrlResolver @Inject constructor(
             return listOf(
                 "https://codeberg.org/$owner/$repo/raw/branch/main/manifest.json",
                 "https://codeberg.org/$owner/$repo/raw/branch/main/repo.json",
+                "https://codeberg.org/$owner/$repo/raw/branch/main/index.json",
                 "https://codeberg.org/$owner/$repo/raw/branch/master/manifest.json",
-                "https://codeberg.org/$owner/$repo/raw/branch/master/repo.json"
+                "https://codeberg.org/$owner/$repo/raw/branch/master/repo.json",
+                "https://codeberg.org/$owner/$repo/raw/branch/master/index.json"
             )
         }
 
@@ -171,6 +183,8 @@ class RepoUrlResolver @Inject constructor(
             return listOf(
                 "$clean/manifest.json",
                 "$clean/repo.json",
+                "$clean/index.json",
+                "$clean/mega_repo.json",
                 "$clean/plugins.json",
                 normalized
             )

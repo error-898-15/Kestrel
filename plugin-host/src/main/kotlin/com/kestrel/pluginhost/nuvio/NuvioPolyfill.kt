@@ -359,6 +359,7 @@ internal object NuvioPolyfill {
                 statusText: res.statusText || '',
                 url: res.url || payload.url,
                 redirected: Boolean(res.redirected),
+                body: bodyText,
                 headers: {
                   get: function(name) {
                     var lower = String(name).toLowerCase();
@@ -906,6 +907,17 @@ internal object NuvioPolyfill {
             return fn;
           }
           var axiosShim = buildAxiosInstance({});
+          global.axios = axiosShim;
+          global.htmlText = function(str) {
+            var res = JSON.parse(__nuvioCall(JSON.stringify({ op: 'htmlText', html: String(str || '') })) || '{}');
+            return res.text || '';
+          };
+          global.base64ToBytes = function(b64) {
+            var bin = global.atob(String(b64 || ''));
+            var out = new Uint8Array(bin.length);
+            for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+            return out;
+          };
 
           function encodeCryptoOut(hexStr, encoding) {
             var wa = makeWordArray(hexStr);

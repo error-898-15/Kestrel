@@ -237,6 +237,18 @@ class CatalogRepositoryImpl @Inject constructor(
                         RepoType.CLOUDSTREAM -> settings.searchEveryCloudStream ||
                             provider.providerId in settings.selectedCloudStreamIds ||
                             provider.pluginId in settings.selectedCloudStreamIds
+                        RepoType.VEGA -> settings.searchEveryVega ||
+                            provider.providerId in settings.selectedVegaIds ||
+                            provider.pluginId in settings.selectedVegaIds
+                        RepoType.ZANGETSU -> settings.searchEveryZangetsu ||
+                            provider.providerId in settings.selectedZangetsuIds ||
+                            provider.pluginId in settings.selectedZangetsuIds
+                        RepoType.SKYSTREAM -> settings.searchEverySkyStream ||
+                            provider.providerId in settings.selectedSkyStreamIds ||
+                            provider.pluginId in settings.selectedSkyStreamIds
+                        RepoType.HIKARI -> settings.searchEveryHikari ||
+                            provider.providerId in settings.selectedHikariIds ||
+                            provider.pluginId in settings.selectedHikariIds
                     }
                 }
                 if (include) {
@@ -251,6 +263,10 @@ class CatalogRepositoryImpl @Inject constructor(
                             RepoType.NUVIO -> 0
                             RepoType.STREMIO -> 1
                             RepoType.CLOUDSTREAM -> 2
+                            RepoType.HIKARI -> 3
+                            RepoType.SKYSTREAM -> 4
+                            RepoType.VEGA -> 5
+                            RepoType.ZANGETSU -> 6
                         }
                     },
                     { it.name.lowercase(Locale.US) }
@@ -417,7 +433,11 @@ class CatalogRepositoryImpl @Inject constructor(
                 provider.getLinks("$stremioType::$stremioId", timeoutMs)
             }
 
-            RepoType.CLOUDSTREAM -> {
+            RepoType.CLOUDSTREAM,
+            RepoType.VEGA,
+            RepoType.ZANGETSU,
+            RepoType.SKYSTREAM,
+            RepoType.HIKARI -> {
                 val query = target.title
                     .replace(Regex("\\(\\d{4}\\)"), " ")
                     .replace(Regex("\\s+"), " ")

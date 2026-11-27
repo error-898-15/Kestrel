@@ -8,12 +8,14 @@ import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
+import androidx.datastore.preferences.core.stringSetPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.kestrel.domain.model.PlayerOrientationMode
 import com.kestrel.domain.model.ServerSearchSettings
 import com.kestrel.domain.repository.SettingsRepository
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.serialization.json.Json
 import javax.inject.Inject
@@ -26,11 +28,13 @@ class AppPreferences @Inject constructor(
     @ApplicationContext private val context: Context,
     private val json: Json
 ) : SettingsRepository {
+
     private object Keys {
         val DISCLAIMER_ACCEPTED = booleanPreferencesKey("disclaimer_accepted")
         val DEFAULT_SPEED = floatPreferencesKey("default_playback_speed")
         val PLAYER_ORIENTATION_MODE = stringPreferencesKey("player_orientation_mode")
         val SERVER_SEARCH_SETTINGS = stringPreferencesKey("server_search_settings_json")
+        val SEEDED_DEFAULT_REPO_URLS = stringSetPreferencesKey("seeded_default_repo_urls")
     }
 
     val disclaimerAccepted: Flow<Boolean> = context.kestrelDataStore.data.map { prefs ->
@@ -59,6 +63,22 @@ class AppPreferences @Inject constructor(
             runCatching {
                 json.decodeFromString(ServerSearchSettings.serializer(), raw)
             }.getOrDefault(ServerSearchSettings())
+        }
+    }
+
+    suspend fun getSeededDefaultRepoUrls(): Set<String> =
+        context.kestrelDataStore.data.first()[Keys.SEEDED_DEFAULT_REPO_URLS].orEmpty()
+
+    suspend fun markDefaultRepoSeeded(url: String) {
+        context.kestrelDataStore.edit { prefs ->
+            val current = prefs[Keys.SEEDED_DEFAULT_REPO_URLS].orEmpty()
+            prefs[Keys.SEEDED_DEFAULT_REPO_URLS] = current + url
+        }
+    }
+
+    suspend fun clearSeededDefaultRepos() {
+        context.kestrelDataStore.edit { prefs ->
+            prefs.remove(Keys.SEEDED_DEFAULT_REPO_URLS)
         }
     }
 

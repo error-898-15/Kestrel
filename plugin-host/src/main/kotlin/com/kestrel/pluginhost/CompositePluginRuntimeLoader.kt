@@ -11,12 +11,19 @@ import com.kestrel.domain.model.RepoType
 import com.kestrel.domain.provider.SourceProvider
 import com.kestrel.domain.repository.PluginRuntimeLoader
 import com.kestrel.pluginhost.cloudstream.Cs3PluginLoader
+import com.kestrel.pluginhost.hikari.HikiPluginLoader
 import com.kestrel.pluginhost.nuvio.CinemetaCatalogClient
 import com.kestrel.pluginhost.nuvio.NuvioAdapter
 import com.kestrel.pluginhost.nuvio.NuvioJsEngine
 import com.kestrel.pluginhost.settings.ProviderSettingsStore
+import com.kestrel.pluginhost.skystream.SkyStreamAdapter
+import com.kestrel.pluginhost.skystream.SkyStreamJsEngine
 import com.kestrel.pluginhost.stremio.StremioAdapter
 import com.kestrel.pluginhost.stremio.StremioClient
+import com.kestrel.pluginhost.vega.VegaAdapter
+import com.kestrel.pluginhost.vega.VegaJsEngine
+import com.kestrel.pluginhost.zangetsu.ZangetsuAdapter
+import com.kestrel.pluginhost.zangetsu.ZangetsuJsEngine
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -36,12 +43,16 @@ import javax.inject.Singleton
 
 /**
  * Routes plugin load/unload/settings requests across CloudStream (.cs3),
- * Nuvio (QuickJS), and Stremio HTTP add-on adapters.
+ * Hikari (.hiki), SkyStream (.sky), Vega, Zangetsu, Nuvio (QuickJS), and Stremio HTTP add-on adapters.
  */
 @Singleton
 class CompositePluginRuntimeLoader @Inject constructor(
     private val cs3PluginLoader: Cs3PluginLoader,
+    private val hikiPluginLoader: HikiPluginLoader,
     private val nuvioJsEngine: NuvioJsEngine,
+    private val vegaJsEngine: VegaJsEngine,
+    private val zangetsuJsEngine: ZangetsuJsEngine,
+    private val skyStreamJsEngine: SkyStreamJsEngine,
     private val cinemetaCatalogClient: CinemetaCatalogClient,
     private val stremioClient: StremioClient,
     private val settingsStore: ProviderSettingsStore,
@@ -69,6 +80,74 @@ class CompositePluginRuntimeLoader @Inject constructor(
         when (plugin.repoType) {
             RepoType.CLOUDSTREAM -> cs3PluginLoader.loadPlugin(plugin)
 
+            RepoType.HIKARI -> hikiPluginLoader.loadPlugin(plugin)
+
+            RepoType.VEGA -> withContext(ioDispatcher) {
+                runCatching {
+                    val filePath = plugin.localFilePath ?: error("Vega bundle is not installed")
+                    require(File(filePath).exists()) { "Missing Vega bundle at $filePath" }
+                    val adapter = VegaAdapter(
+                        plugin = plugin,
+                        engine = vegaJsEngine,
+                        sandbox = sandbox
+                    )
+                    adapterRegistry.register(adapter)
+                    _otherConfigurableIds.update { it + plugin.id }
+                    sandbox.markHealthy(plugin.id)
+                    if (pendingReloadPluginIds.remove(plugin.id)) {
+                        _localHomeReloadRequests.tryEmit(Unit)
+                    }
+                    listOf<SourceProvider>(adapter)
+                }.onFailure { err ->
+                    pendingReloadPluginIds.remove(plugin.id)
+                    sandbox.markError(plugin.id, err.message ?: "Vega load failed")
+                }
+            }
+
+            RepoType.ZANGETSU -> withContext(ioDispatcher) {
+                runCatching {
+                    val filePath = plugin.localFilePath ?: error("Zangetsu script is not installed")
+                    require(File(filePath).exists()) { "Missing Zangetsu script at $filePath" }
+                    val adapter = ZangetsuAdapter(
+                        plugin = plugin,
+                        engine = zangetsuJsEngine,
+                        sandbox = sandbox
+                    )
+                    adapterRegistry.register(adapter)
+                    _otherConfigurableIds.update { it + plugin.id }
+                    sandbox.markHealthy(plugin.id)
+                    if (pendingReloadPluginIds.remove(plugin.id)) {
+                        _localHomeReloadRequests.tryEmit(Unit)
+                    }
+                    listOf<SourceProvider>(adapter)
+                }.onFailure { err ->
+                    pendingReloadPluginIds.remove(plugin.id)
+                    sandbox.markError(plugin.id, err.message ?: "Zangetsu load failed")
+                }
+            }
+
+            RepoType.SKYSTREAM -> withContext(ioDispatcher) {
+                runCatching {
+                    val filePath = plugin.localFilePath ?: error("SkyStream archive is not installed")
+                    require(File(filePath).exists()) { "Missing SkyStream archive at $filePath" }
+                    val adapter = SkyStreamAdapter(
+                        plugin = plugin,
+                        engine = skyStreamJsEngine,
+                        sandbox = sandbox
+                    )
+                    adapterRegistry.register(adapter)
+                    _otherConfigurableIds.update { it + plugin.id }
+                    sandbox.markHealthy(plugin.id)
+                    if (pendingReloadPluginIds.remove(plugin.id)) {
+                        _localHomeReloadRequests.tryEmit(Unit)
+                    }
+                    listOf<SourceProvider>(adapter)
+                }.onFailure { err ->
+                    pendingReloadPluginIds.remove(plugin.id)
+                    sandbox.markError(plugin.id, err.message ?: "SkyStream load failed")
+                }
+            }
+
             RepoType.NUVIO -> withContext(ioDispatcher) {
                 runCatching {
                     val filePath = plugin.localFilePath ?: error("Nuvio scraper file is not installed")
@@ -86,7 +165,7 @@ class CompositePluginRuntimeLoader @Inject constructor(
                     if (pendingReloadPluginIds.remove(plugin.id)) {
                         _localHomeReloadRequests.tryEmit(Unit)
                     }
-                    listOf(adapter)
+                    listOf<SourceProvider>(adapter)
                 }.onFailure { err ->
                     pendingReloadPluginIds.remove(plugin.id)
                     sandbox.markError(plugin.id, err.message ?: "Nuvio load failed")
@@ -110,7 +189,7 @@ class CompositePluginRuntimeLoader @Inject constructor(
                     if (pendingReloadPluginIds.remove(plugin.id)) {
                         _localHomeReloadRequests.tryEmit(Unit)
                     }
-                    listOf(adapter)
+                    listOf<SourceProvider>(adapter)
                 }.onFailure { err ->
                     pendingReloadPluginIds.remove(plugin.id)
                     sandbox.markError(plugin.id, err.message ?: "Stremio manifest load failed")
@@ -120,6 +199,7 @@ class CompositePluginRuntimeLoader @Inject constructor(
 
     override suspend fun unloadPlugin(pluginId: String) {
         cs3PluginLoader.unloadPlugin(pluginId)
+        hikiPluginLoader.unloadPlugin(pluginId)
         _otherConfigurableIds.update { it - pluginId }
         adapterRegistry.unregisterByPlugin(pluginId)
     }
@@ -130,6 +210,19 @@ class CompositePluginRuntimeLoader @Inject constructor(
     override suspend fun openOrLoadSettings(plugin: PluginMetadata): Result<ProviderSettingsUiTarget> =
         when (plugin.repoType) {
             RepoType.CLOUDSTREAM -> cs3PluginLoader.openOrLoadSettings(plugin)
+
+            RepoType.HIKARI -> Result.failure(IllegalStateException("${plugin.displayName} has no settings menu"))
+
+            RepoType.VEGA, RepoType.ZANGETSU, RepoType.SKYSTREAM -> withContext(ioDispatcher) {
+                runCatching {
+                    ProviderSettingsUiTarget.NuvioConfig(
+                        pluginId = plugin.id,
+                        displayName = plugin.displayName,
+                        fields = emptyList(),
+                        customHeaders = settingsStore.getHeaders(plugin.id)
+                    )
+                }
+            }
 
             RepoType.NUVIO -> withContext(ioDispatcher) {
                 runCatching {
@@ -219,19 +312,22 @@ class CompositePluginRuntimeLoader @Inject constructor(
     ): Result<Unit> = withContext(ioDispatcher) {
         runCatching {
             when (plugin.repoType) {
-                RepoType.CLOUDSTREAM -> Unit
-                RepoType.NUVIO, RepoType.STREMIO -> {
+                RepoType.CLOUDSTREAM, RepoType.HIKARI -> Unit
+                RepoType.NUVIO,
+                RepoType.STREMIO,
+                RepoType.VEGA,
+                RepoType.ZANGETSU,
+                RepoType.SKYSTREAM -> {
                     settingsStore.saveValues(plugin.id, values)
                     settingsStore.saveHeaders(plugin.id, customHeaders)
                     if (plugin.isEnabled) {
-                        // loadPlugin() will emit homeReloadRequests after registering the updated adapter.
                         pendingReloadPluginIds.add(plugin.id)
                     } else {
                         _localHomeReloadRequests.tryEmit(Unit)
                     }
                 }
             }
-            Unit // <-- FIX: force Result<Unit> (the if/else above yields Boolean)
+            Unit
         }
     }
 }

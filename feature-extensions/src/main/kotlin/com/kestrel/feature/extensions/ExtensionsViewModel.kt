@@ -79,6 +79,7 @@ class ExtensionsViewModel @Inject constructor(
 
     init {
         viewModelScope.launch {
+            repository.ensureDefaultRepositoriesSeeded()
             repository.reconcileMissingFiles()
         }
     }
@@ -166,6 +167,36 @@ class ExtensionsViewModel @Inject constructor(
 
     fun dismissBanner() {
         actionState.update { it.copy(bannerMessage = null) }
+    }
+
+    fun restoreDefaultRepositories() {
+        viewModelScope.launch {
+            actionState.update { it.copy(isAddingRepo = true, bannerMessage = null) }
+            repository.restoreDefaultRepositories()
+                .onSuccess { added ->
+                    val msg = if (added > 0) {
+                        "Restored $added default source repositories"
+                    } else {
+                        "All default repositories are already installed"
+                    }
+                    actionState.update {
+                        it.copy(
+                            isAddingRepo = false,
+                            bannerMessage = msg,
+                            bannerIsError = false
+                        )
+                    }
+                }
+                .onFailure { err ->
+                    actionState.update {
+                        it.copy(
+                            isAddingRepo = false,
+                            bannerMessage = err.message ?: "Failed to restore default repositories",
+                            bannerIsError = true
+                        )
+                    }
+                }
+        }
     }
 
     fun addRepository() {

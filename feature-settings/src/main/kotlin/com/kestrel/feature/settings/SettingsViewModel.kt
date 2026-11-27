@@ -66,6 +66,10 @@ data class SettingsUiState(
     val nuvioExtensions: List<InstalledServerExtension> = emptyList(),
     val stremioExtensions: List<InstalledServerExtension> = emptyList(),
     val cloudStreamExtensions: List<InstalledServerExtension> = emptyList(),
+    val vegaExtensions: List<InstalledServerExtension> = emptyList(),
+    val zangetsuExtensions: List<InstalledServerExtension> = emptyList(),
+    val skyStreamExtensions: List<InstalledServerExtension> = emptyList(),
+    val hikariExtensions: List<InstalledServerExtension> = emptyList(),
     val totalActiveExtensions: Int = 0,
     val stremioRepos: List<RepoConfig> = emptyList(),
     val stremioAddons: List<PluginMetadata> = emptyList(),
@@ -92,6 +96,7 @@ class SettingsViewModel @Inject constructor(
 
     init {
         viewModelScope.launch {
+            extensionRepository.ensureDefaultRepositoriesSeeded()
             extensionRepository.reconcileMissingFiles()
             catalogRepository.syncEnabledPlugins(force = false)
         }
@@ -193,6 +198,10 @@ class SettingsViewModel @Inject constructor(
                     nuvioExtensions = sortedActive.filter { it.repoType == RepoType.NUVIO },
                     stremioExtensions = sortedActive.filter { it.repoType == RepoType.STREMIO },
                     cloudStreamExtensions = sortedActive.filter { it.repoType == RepoType.CLOUDSTREAM },
+                    vegaExtensions = sortedActive.filter { it.repoType == RepoType.VEGA },
+                    zangetsuExtensions = sortedActive.filter { it.repoType == RepoType.ZANGETSU },
+                    skyStreamExtensions = sortedActive.filter { it.repoType == RepoType.SKYSTREAM },
+                    hikariExtensions = sortedActive.filter { it.repoType == RepoType.HIKARI },
                     totalActiveExtensions = sortedActive.size,
                     stremioRepos = stremioRepos,
                     stremioAddons = stremioAddons,
@@ -559,6 +568,10 @@ class SettingsViewModel @Inject constructor(
                 RepoType.NUVIO -> s.copy(searchEveryNuvio = enabled)
                 RepoType.STREMIO -> s.copy(searchEveryStremio = enabled)
                 RepoType.CLOUDSTREAM -> s.copy(searchEveryCloudStream = enabled)
+                RepoType.VEGA -> s.copy(searchEveryVega = enabled)
+                RepoType.ZANGETSU -> s.copy(searchEveryZangetsu = enabled)
+                RepoType.SKYSTREAM -> s.copy(searchEverySkyStream = enabled)
+                RepoType.HIKARI -> s.copy(searchEveryHikari = enabled)
             }
         }
     }
@@ -569,12 +582,20 @@ class SettingsViewModel @Inject constructor(
                 RepoType.NUVIO -> s.selectedNuvioIds
                 RepoType.STREMIO -> s.selectedStremioIds
                 RepoType.CLOUDSTREAM -> s.selectedCloudStreamIds
+                RepoType.VEGA -> s.selectedVegaIds
+                RepoType.ZANGETSU -> s.selectedZangetsuIds
+                RepoType.SKYSTREAM -> s.selectedSkyStreamIds
+                RepoType.HIKARI -> s.selectedHikariIds
             }
             val updated = if (extensionId in current) current - extensionId else current + extensionId
             when (repoType) {
                 RepoType.NUVIO -> s.copy(selectedNuvioIds = updated)
                 RepoType.STREMIO -> s.copy(selectedStremioIds = updated)
                 RepoType.CLOUDSTREAM -> s.copy(selectedCloudStreamIds = updated)
+                RepoType.VEGA -> s.copy(selectedVegaIds = updated)
+                RepoType.ZANGETSU -> s.copy(selectedZangetsuIds = updated)
+                RepoType.SKYSTREAM -> s.copy(selectedSkyStreamIds = updated)
+                RepoType.HIKARI -> s.copy(selectedHikariIds = updated)
             }
         }
     }
@@ -584,12 +605,20 @@ class SettingsViewModel @Inject constructor(
             RepoType.NUVIO -> _uiState.value.nuvioExtensions.map { it.id }.toSet()
             RepoType.STREMIO -> _uiState.value.stremioExtensions.map { it.id }.toSet()
             RepoType.CLOUDSTREAM -> _uiState.value.cloudStreamExtensions.map { it.id }.toSet()
+            RepoType.VEGA -> _uiState.value.vegaExtensions.map { it.id }.toSet()
+            RepoType.ZANGETSU -> _uiState.value.zangetsuExtensions.map { it.id }.toSet()
+            RepoType.SKYSTREAM -> _uiState.value.skyStreamExtensions.map { it.id }.toSet()
+            RepoType.HIKARI -> _uiState.value.hikariExtensions.map { it.id }.toSet()
         }
         updateSettings { s ->
             when (repoType) {
                 RepoType.NUVIO -> s.copy(selectedNuvioIds = ids)
                 RepoType.STREMIO -> s.copy(selectedStremioIds = ids)
                 RepoType.CLOUDSTREAM -> s.copy(selectedCloudStreamIds = ids)
+                RepoType.VEGA -> s.copy(selectedVegaIds = ids)
+                RepoType.ZANGETSU -> s.copy(selectedZangetsuIds = ids)
+                RepoType.SKYSTREAM -> s.copy(selectedSkyStreamIds = ids)
+                RepoType.HIKARI -> s.copy(selectedHikariIds = ids)
             }
         }
     }
@@ -600,6 +629,10 @@ class SettingsViewModel @Inject constructor(
                 RepoType.NUVIO -> s.copy(selectedNuvioIds = emptySet())
                 RepoType.STREMIO -> s.copy(selectedStremioIds = emptySet())
                 RepoType.CLOUDSTREAM -> s.copy(selectedCloudStreamIds = emptySet())
+                RepoType.VEGA -> s.copy(selectedVegaIds = emptySet())
+                RepoType.ZANGETSU -> s.copy(selectedZangetsuIds = emptySet())
+                RepoType.SKYSTREAM -> s.copy(selectedSkyStreamIds = emptySet())
+                RepoType.HIKARI -> s.copy(selectedHikariIds = emptySet())
             }
         }
     }

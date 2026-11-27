@@ -11,6 +11,8 @@ interface ExtensionRepository {
     val plugins: Flow<List<PluginMetadata>>
     val configurablePluginIds: Flow<Set<String>>
 
+    suspend fun ensureDefaultRepositoriesSeeded()
+    suspend fun restoreDefaultRepositories(): Result<Int>
     suspend fun addRepository(rawInput: String): Result<RepoConfig>
     suspend fun refreshRepository(repoId: String): Result<RepoConfig>
     suspend fun removeRepository(repoId: String)
