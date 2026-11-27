@@ -62,7 +62,7 @@ class ExtensionRepositoryImpl @Inject constructor(
     override val configurablePluginIds: Flow<Set<String>> =
         runtimeLoader.configurablePluginIds
 
-    override suspend fun ensureDefaultRepositoriesSeeded() = withContext(ioDispatcher) {
+    override suspend fun ensureDefaultRepositoriesSeeded(): Unit = withContext(ioDispatcher) {
         seedMutex.withLock {
             val alreadySeeded = appPreferences.getSeededDefaultRepoUrls()
             val pending = DefaultRepositories.ALL.filterNot { it in alreadySeeded }
@@ -88,6 +88,7 @@ class ExtensionRepositoryImpl @Inject constructor(
                         }
                     }
                 }.awaitAll()
+                Unit
             }
         }
     }
