@@ -8,17 +8,18 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Bookmarks
 import androidx.compose.material.icons.filled.Explore
-import androidx.compose.material.icons.filled.Extension
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.outlined.Bookmarks
 import androidx.compose.material.icons.outlined.Explore
-import androidx.compose.material.icons.outlined.Extension
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -36,11 +37,11 @@ import com.kestrel.core.designsystem.GlassNavItem
 import com.kestrel.core.designsystem.glassSource
 import com.kestrel.core.designsystem.rememberGlassState
 import com.kestrel.feature.details.DetailsScreen
-import com.kestrel.feature.extensions.ExtensionsScreen
 import com.kestrel.feature.home.HomeScreen
 import com.kestrel.feature.library.LibraryScreen
 import com.kestrel.feature.player.PlayerScreen
 import com.kestrel.feature.search.SearchScreen
+import com.kestrel.feature.settings.SettingsDestination
 import com.kestrel.feature.settings.SettingsScreen
 import java.net.URLEncoder
 
@@ -71,13 +72,6 @@ sealed class KestrelRoute(
         selectedIcon = Icons.Filled.Bookmarks
     )
 
-    data object Extensions : KestrelRoute(
-        route = "extensions",
-        label = "Extensions",
-        icon = Icons.Outlined.Extension,
-        selectedIcon = Icons.Filled.Extension
-    )
-
     data object Settings : KestrelRoute(
         route = "settings",
         label = "Settings",
@@ -90,7 +84,6 @@ private val TopLevelRoutes = listOf(
     KestrelRoute.Home,
     KestrelRoute.Search,
     KestrelRoute.Library,
-    KestrelRoute.Extensions,
     KestrelRoute.Settings
 )
 
@@ -120,6 +113,9 @@ fun KestrelAppShell() {
         }
     }
 
+    var pendingSettingsDestination by remember { mutableStateOf<SettingsDestination?>(null) }
+    var settingsNavNonce by remember { mutableIntStateOf(0) }
+
     val navigateToTopTab: (String) -> Unit = { route ->
         navController.navigate(route) {
             popUpTo(navController.graph.findStartDestination().id) {
@@ -128,6 +124,12 @@ fun KestrelAppShell() {
             launchSingleTop = true
             restoreState = true
         }
+    }
+
+    val openSourcesInSettings: () -> Unit = {
+        pendingSettingsDestination = SettingsDestination.CONTENT_DISCOVERY
+        settingsNavNonce++
+        navigateToTopTab(KestrelRoute.Settings.route)
     }
 
     Box(modifier = Modifier.fillMaxSize()) {
@@ -140,7 +142,7 @@ fun KestrelAppShell() {
         ) {
             composable(KestrelRoute.Home.route) {
                 HomeScreen(
-                    onOpenExtensions = { navigateToTopTab(KestrelRoute.Extensions.route) },
+                    onOpenExtensions = openSourcesInSettings,
                     onOpenMedia = { media ->
                         navController.navigate(detailsRoute(media.providerId, media.url))
                     }
@@ -148,7 +150,7 @@ fun KestrelAppShell() {
             }
             composable(KestrelRoute.Search.route) {
                 SearchScreen(
-                    onOpenExtensions = { navigateToTopTab(KestrelRoute.Extensions.route) },
+                    onOpenExtensions = openSourcesInSettings,
                     onOpenMedia = { media ->
                         navController.navigate(detailsRoute(media.providerId, media.url))
                     }
@@ -159,15 +161,13 @@ fun KestrelAppShell() {
                     onOpenEntry = { entry ->
                         navController.navigate(detailsRoute(entry.providerId, entry.url))
                     },
-                    onOpenExtensions = { navigateToTopTab(KestrelRoute.Extensions.route) }
+                    onOpenExtensions = openSourcesInSettings
                 )
-            }
-            composable(KestrelRoute.Extensions.route) {
-                ExtensionsScreen()
             }
             composable(KestrelRoute.Settings.route) {
                 SettingsScreen(
-                    onOpenExtensions = { navigateToTopTab(KestrelRoute.Extensions.route) }
+                    initialDestination = pendingSettingsDestination,
+                    navigationNonce = settingsNavNonce
                 )
             }
             composable(
@@ -194,12 +194,18 @@ fun KestrelAppShell() {
             GlassNavBar(
                 items = navItems,
                 selectedIndex = selectedIndex,
-                onSelect = { index -> navigateToTopTab(TopLevelRoutes[index].route) },
+                onSelect = { index ->
+                    val dest = TopLevelRoutes[index]
+                    if (dest == KestrelRoute.Settings) {
+                        pendingSettingsDestination = null
+                    }
+                    navigateToTopTab(dest.route)
+                },
                 state = shellGlass,
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .navigationBarsPadding()
-                    .padding(horizontal = 20.dp, vertical = 12.dp)
+                    .padding(horizontal = 24.dp, vertical = 14.dp)
             )
         }
     }

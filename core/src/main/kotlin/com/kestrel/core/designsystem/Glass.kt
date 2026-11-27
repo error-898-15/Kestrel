@@ -606,16 +606,20 @@ fun GlassNavBar(
 ) {
     val count = items.size
     if (count == 0) return
-    val colors = KestrelTheme.colors
     val density = LocalDensity.current
     val inset = 6.dp
     val maxIndex = (count - 1).toFloat()
+
+    val crimsonAccent = Color(0xFFE53935)
+    val inactiveTint = Color(0xFFA0A0AA)
+    val barTint = Color(0xEC141113)
+    val indicatorFill = Color(0xFF3A1619)
 
     var dragPos by remember { mutableStateOf<Float?>(null) }
     val target = dragPos ?: selectedIndex.toFloat()
     val position by animateFloatAsState(
         targetValue = target,
-        animationSpec = spring(dampingRatio = 0.68f, stiffness = 420f),
+        animationSpec = spring(dampingRatio = 0.70f, stiffness = 360f),
         label = "glassNavPosition"
     )
 
@@ -626,9 +630,10 @@ fun GlassNavBar(
             .glassPanel(
                 cornerRadius = NavBarHeight / 2,
                 state = state,
-                blurRadius = 28.dp,
-                tint = Color(0xFF14110F).copy(alpha = 0.38f),
-                rimAlpha = 0.55f
+                blurRadius = 24.dp,
+                tint = barTint,
+                rimColor = Color.White,
+                rimAlpha = 0.22f
             )
     ) {
         val itemWidth = (maxWidth - inset * 2) / count
@@ -636,21 +641,22 @@ fun GlassNavBar(
         val insetPx = with(density) { inset.toPx() }
         val indicatorHeight = NavBarHeight - inset * 2
 
-        // Sliding highlight that stretches while it travels between tabs.
+        // Sliding crimson capsule highlight with stretch + lens pop while traveling between tabs.
         Box(
             modifier = Modifier
                 .offset { IntOffset((insetPx + position * itemWidthPx).roundToInt(), insetPx.roundToInt()) }
                 .size(width = itemWidth, height = indicatorHeight)
                 .graphicsLayer {
                     val stretch = min(abs(position - target), 1f)
-                    val lens = if (dragPos != null) 1.10f else 1f
-                    scaleX = (1f + 0.16f * stretch) * lens
-                    scaleY = (1f + 0.05f * stretch) * lens
+                    val lens = if (dragPos != null) 1.08f else 1f
+                    scaleX = (1f + 0.22f * stretch) * lens
+                    scaleY = (1f - 0.06f * stretch) * lens
                 }
                 .glassPanel(
                     cornerRadius = indicatorHeight / 2,
-                    tint = Color.White.copy(alpha = if (dragPos != null) 0.24f else 0.17f),
-                    rimAlpha = 0.75f,
+                    tint = indicatorFill.copy(alpha = if (dragPos != null) 0.94f else 0.88f),
+                    rimColor = crimsonAccent,
+                    rimAlpha = 0.45f,
                     state = null
                 )
         )
@@ -682,8 +688,13 @@ fun GlassNavBar(
         ) {
             items.forEachIndexed { index, item ->
                 val interaction = remember { MutableInteractionSource() }
-                val closeness = 1f - min(abs(position - index), 1f)
-                val tintColor = lerp(colors.textSecondary, colors.accentAmber, closeness)
+                val closeness = (1f - min(abs(position - index), 1f)).coerceIn(0f, 1f)
+                val tintColor = lerp(inactiveTint, crimsonAccent, closeness)
+                val iconScale by animateFloatAsState(
+                    targetValue = if (index == selectedIndex && dragPos == null) 1.10f else 1.0f,
+                    animationSpec = spring(dampingRatio = 0.58f, stiffness = 420f),
+                    label = "tabIconScale"
+                )
                 Box(
                     modifier = Modifier
                         .weight(1f)
@@ -699,12 +710,17 @@ fun GlassNavBar(
                             imageVector = if (closeness > 0.5f) item.selectedIcon else item.icon,
                             contentDescription = item.label,
                             tint = tintColor,
-                            modifier = Modifier.size(24.dp)
+                            modifier = Modifier
+                                .size(23.dp)
+                                .graphicsLayer {
+                                    scaleX = iconScale
+                                    scaleY = iconScale
+                                }
                         )
                         Text(
                             text = item.label,
                             fontSize = 11.sp,
-                            fontWeight = FontWeight.Medium,
+                            fontWeight = if (closeness > 0.5f) FontWeight.SemiBold else FontWeight.Medium,
                             color = tintColor,
                             maxLines = 1
                         )
