@@ -19,6 +19,9 @@ import com.kestrel.pluginhost.settings.ProviderSettingsStore
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
 import java.security.MessageDigest
 
 /**
@@ -39,21 +42,30 @@ class StremioAdapter(
     override val name: String = manifest.name.ifBlank { plugin.displayName }
     override val language: String = plugin.language
     override val repoType: RepoType = RepoType.STREMIO
-
     override val supportedTypes: Set<MediaType> = manifest.types.map { mapStremioType(it) }
         .toSet().ifEmpty { setOf(MediaType.MOVIE, MediaType.TV_SERIES) }
-
     override val hasCatalog: Boolean = manifest.catalogs.isNotEmpty()
 
     private fun customHeaders(): Map<String, String> =
         settingsStore?.getHeaders(pluginId).orEmpty()
+
+    private fun declaresMetaResource(): Boolean {
+        if (manifest.resources.isEmpty()) return true
+        return manifest.resources.any { el ->
+            when (el) {
+                is JsonPrimitive -> el.contentOrNull.equals("meta", ignoreCase = true)
+                is JsonObject -> (el["name"] as? JsonPrimitive)?.contentOrNull.equals("meta", ignoreCase = true)
+                else -> false
+            }
+        }
+    }
 
     override suspend fun getCatalog(page: Int): Result<List<CatalogRow>> =
         sandbox.execute(pluginId) {
             if (page > 1) return@execute emptyList()
             val headers = customHeaders()
             coroutineScope {
-                manifest.catalogs.take(6).map { catalog ->
+                manifest.catalogs.take(24).map { catalog ->
                     async {
                         val res = runCatching {
                             client.fetchCatalog(baseUrl, catalog.type, catalog.id, customHeaders = headers)
@@ -79,7 +91,7 @@ class StremioAdapter(
             if (page > 1) return@execute emptyList()
             val headers = customHeaders()
             coroutineScope {
-                manifest.catalogs.take(4).map { catalog ->
+                manifest.catalogs.take(6).map { catalog ->
                     async {
                         runCatching {
                             client.fetchCatalog(
@@ -99,8 +111,18 @@ class StremioAdapter(
         sandbox.execute(pluginId) {
             val (type, id) = parseMetaToken(url)
             val headers = customHeaders()
-            val meta = client.fetchMeta(baseUrl, type, id, headers).meta
-                ?: error("$name returned no meta for $id")
+            val addonMeta = if (declaresMetaResource()) {
+                runCatching { client.fetchMeta(baseUrl, type, id, headers).meta }.getOrNull()
+            } else {
+                null
+            }
+            val meta = addonMeta ?: if (id.startsWith("tt", ignoreCase = true)) {
+                runCatching {
+                    client.fetchMeta(CINEMETA_BASE_URL, type, id).meta
+                }.getOrNull()
+            } else {
+                null
+            } ?: error("$name returned no meta for $id")
 
             val episodes = meta.videos.mapIndexed { idx, v ->
                 Episode(
@@ -138,7 +160,6 @@ class StremioAdapter(
         sandbox.execute(pluginId, timeoutMs = 25_000L) {
             val (type, id) = parseMetaToken(data)
             val response = client.fetchStreams(baseUrl, type, id, customHeaders())
-
             val streams = mutableListOf<StreamSource>()
             val subtitles = mutableListOf<SubtitleTrack>()
 
@@ -155,7 +176,6 @@ class StremioAdapter(
                         ".mp4" in directUrl.lowercase() -> StreamFormat.MP4
                         else -> StreamFormat.OTHER
                     }
-
                     streams.add(
                         StreamSource(
                             id = stableId("$providerId:$directUrl:$idx"),
@@ -213,5 +233,9 @@ class StremioAdapter(
     private fun stableId(seed: String): String {
         val bytes = MessageDigest.getInstance("SHA-256").digest(seed.toByteArray())
         return bytes.take(12).joinToString("") { "%02x".format(it) }
+    }
+
+    companion object {
+        private const val CINEMETA_BASE_URL = "https://v3-cinemeta.strem.io"
     }
 }

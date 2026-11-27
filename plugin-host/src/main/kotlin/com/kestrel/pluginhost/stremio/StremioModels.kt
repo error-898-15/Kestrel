@@ -7,7 +7,7 @@ import kotlinx.serialization.json.JsonElement
 @Serializable
 data class StremioCatalogDescriptor(
     val type: String = "movie",
-    val id: String = "",
+    val id: String = "top",
     val name: String = ""
 )
 
@@ -15,6 +15,7 @@ data class StremioCatalogDescriptor(
 data class StremioManifestBehaviorHints(
     val configurable: Boolean = false,
     val configurationRequired: Boolean = false,
+    val configurationURL: String? = null,
     val adult: Boolean = false
 )
 

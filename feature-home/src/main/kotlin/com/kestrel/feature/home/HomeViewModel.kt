@@ -77,6 +77,8 @@ class HomeViewModel @Inject constructor(
         }
         viewModelScope.launch {
             catalogRepository.homeReloadRequests.collect {
+                allCachedRows = emptyList()
+                allCachedErrors = emptyMap()
                 if (lastLoadedProviderIds.isNotEmpty()) {
                     refreshCatalogs()
                 }

@@ -19,15 +19,18 @@ import com.kestrel.pluginhost.stremio.StremioAdapter
 import com.kestrel.pluginhost.stremio.StremioClient
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
 import java.io.File
+import java.util.Collections
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -48,11 +51,14 @@ class CompositePluginRuntimeLoader @Inject constructor(
 ) : PluginRuntimeLoader {
 
     private val _otherConfigurableIds = MutableStateFlow<Set<String>>(emptySet())
+    private val _localHomeReloadRequests = MutableSharedFlow<Unit>(extraBufferCapacity = 4)
+    private val pendingReloadPluginIds = Collections.synchronizedSet(HashSet<String>())
 
     override val activeProviders: Flow<List<SourceProvider>> =
         adapterRegistry.providers.map { it.values.toList() }
 
-    override val homeReloadRequests: Flow<Unit> = cs3PluginLoader.homeReloadRequests
+    override val homeReloadRequests: Flow<Unit> =
+        merge(cs3PluginLoader.homeReloadRequests, _localHomeReloadRequests)
 
     override val configurablePluginIds: Flow<Set<String>> =
         combine(cs3PluginLoader.configurablePluginIds, _otherConfigurableIds) { cs3Ids, otherIds ->
@@ -71,13 +77,18 @@ class CompositePluginRuntimeLoader @Inject constructor(
                         plugin = plugin,
                         engine = nuvioJsEngine,
                         catalogClient = cinemetaCatalogClient,
-                        sandbox = sandbox
+                        sandbox = sandbox,
+                        settingsStore = settingsStore
                     )
                     adapterRegistry.register(adapter)
                     _otherConfigurableIds.update { it + plugin.id }
                     sandbox.markHealthy(plugin.id)
+                    if (pendingReloadPluginIds.remove(plugin.id)) {
+                        _localHomeReloadRequests.tryEmit(Unit)
+                    }
                     listOf(adapter)
                 }.onFailure { err ->
+                    pendingReloadPluginIds.remove(plugin.id)
                     sandbox.markError(plugin.id, err.message ?: "Nuvio load failed")
                 }
             }
@@ -96,8 +107,12 @@ class CompositePluginRuntimeLoader @Inject constructor(
                     adapterRegistry.register(adapter)
                     _otherConfigurableIds.update { it + plugin.id }
                     sandbox.markHealthy(plugin.id)
+                    if (pendingReloadPluginIds.remove(plugin.id)) {
+                        _localHomeReloadRequests.tryEmit(Unit)
+                    }
                     listOf(adapter)
                 }.onFailure { err ->
+                    pendingReloadPluginIds.remove(plugin.id)
                     sandbox.markError(plugin.id, err.message ?: "Stremio manifest load failed")
                 }
             }
@@ -186,8 +201,10 @@ class CompositePluginRuntimeLoader @Inject constructor(
                         pluginId = plugin.id,
                         displayName = plugin.displayName,
                         manifestUrl = plugin.downloadUrl,
-                        configureWebUrl = stremioClient.configureUrlOf(plugin.downloadUrl),
-                        isConfigurable = manifest?.behaviorHints?.configurable == true || fields.isNotEmpty(),
+                        configureWebUrl = stremioClient.configureUrlOf(plugin.downloadUrl, manifest),
+                        isConfigurable = manifest?.behaviorHints?.configurable == true ||
+                            !manifest?.behaviorHints?.configurationURL.isNullOrBlank() ||
+                            fields.isNotEmpty(),
                         fields = fields,
                         customHeaders = savedHeaders
                     )
@@ -206,6 +223,12 @@ class CompositePluginRuntimeLoader @Inject constructor(
                 RepoType.NUVIO, RepoType.STREMIO -> {
                     settingsStore.saveValues(plugin.id, values)
                     settingsStore.saveHeaders(plugin.id, customHeaders)
+                    if (plugin.isEnabled) {
+                        // loadPlugin() will emit homeReloadRequests after registering the updated adapter.
+                        pendingReloadPluginIds.add(plugin.id)
+                    } else {
+                        _localHomeReloadRequests.tryEmit(Unit)
+                    }
                 }
             }
         }

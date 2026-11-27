@@ -14,6 +14,8 @@ import com.kestrel.domain.repository.CatalogRepository
 import com.kestrel.domain.repository.PluginRuntimeLoader
 import com.kestrel.domain.repository.ProviderCatalogResult
 import com.kestrel.domain.repository.ProviderSearchResult
+import com.kestrel.pluginhost.nuvio.CinemetaCatalogClient
+import com.kestrel.pluginhost.nuvio.NuvioNiche
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -38,6 +40,7 @@ class CatalogRepositoryImpl @Inject constructor(
     private val pluginDao: PluginDao,
     private val installer: PluginInstaller,
     private val runtimeLoader: PluginRuntimeLoader,
+    private val cinemetaCatalogClient: CinemetaCatalogClient,
     private val json: Json,
     @IoDispatcher private val ioDispatcher: CoroutineDispatcher
 ) : CatalogRepository {
@@ -99,16 +102,22 @@ class CatalogRepositoryImpl @Inject constructor(
             .filter { it.hasCatalog }
             .filter { providerFilterId == null || it.providerId == providerFilterId }
 
-        // Nuvio scrapers share Cinemeta home catalogs; in "All" mode fetch once to avoid duplicate rows,
-        // while selecting a specific Nuvio provider chip loads rows attributed to that provider.
+        // In "All" mode, include up to one representative Nuvio provider per distinct niche
+        // (e.g. Anime, Hindi/Bollywood, South Indian, Asian Drama, General) so Home displays
+        // diverse catalogs instead of collapsing all Nuvio providers to a single one, while
+        // selecting any specific provider chip loads that provider's own tailored catalog rows.
         val providers = if (providerFilterId == null) {
-            var seenNuvio = false
+            val seenNuvioNiches = HashSet<NuvioNiche>()
             matching.filter { provider ->
                 if (provider.repoType == RepoType.NUVIO) {
-                    if (seenNuvio) false else {
-                        seenNuvio = true
-                        true
-                    }
+                    val niche = cinemetaCatalogClient.classifyNiche(
+                        internalName = provider.providerId,
+                        displayName = provider.name,
+                        description = "",
+                        language = provider.language,
+                        supportedTypes = provider.supportedTypes
+                    )
+                    seenNuvioNiches.add(niche)
                 } else {
                     true
                 }

@@ -2,10 +2,14 @@
 package com.kestrel.feature.extensions
 
 import android.annotation.SuppressLint
+import android.os.Message
 import android.webkit.CookieManager
+import android.webkit.JavascriptInterface
+import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import java.net.URLDecoder
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.tween
@@ -268,7 +272,6 @@ fun ExtensionsScreen(
                         val pending = repoPlugins.count { it.needsInstall() }
                         val isRefreshing = repo.id in state.refreshingRepoIds
                         val isInstallingAll = repo.id in state.installingRepoIds
-
                         GlassScreenHeader(
                             title = repo.name,
                             subtitle = repo.description.ifBlank { repo.type.name.lowercase() + " repository" },
@@ -488,6 +491,7 @@ private fun HubPage(
                 )
             }
         }
+
         item(key = "add_source_label") {
             Text(
                 text = "ADD A SOURCE",
@@ -496,6 +500,7 @@ private fun HubPage(
                 modifier = Modifier.padding(start = 6.dp, top = 4.dp)
             )
         }
+
         item(key = "sources") {
             KestrelCard(
                 modifier = Modifier.fillMaxWidth(),
@@ -958,7 +963,6 @@ private fun PluginCard(
                 }
             }
         }
-
         Spacer(modifier = Modifier.height(12.dp))
 
         val switchColors = SwitchDefaults.colors(
@@ -1225,6 +1229,7 @@ private fun StremioSettingsDialog(
     val colors = KestrelTheme.colors
     var manifestUrl by remember(target) { mutableStateOf(target.manifestUrl) }
     var showWebConfigure by remember(target) { mutableStateOf(false) }
+    var capturedFromWeb by remember(target) { mutableStateOf(false) }
 
     val fieldValues = remember(target) {
         mutableStateMapOf<String, String>().apply {
@@ -1280,13 +1285,24 @@ private fun StremioSettingsDialog(
                 )
                 OutlinedTextField(
                     value = manifestUrl,
-                    onValueChange = { manifestUrl = it },
+                    onValueChange = {
+                        manifestUrl = it
+                        capturedFromWeb = false
+                    },
                     singleLine = true,
                     placeholder = { Text("https://.../manifest.json") },
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(16.dp),
                     colors = kestrelDialogFieldColors()
                 )
+
+                if (capturedFromWeb) {
+                    Text(
+                        text = "Configured manifest URL captured from web configurator. Tap Save to apply.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = colors.accentTeal
+                    )
+                }
 
                 if (target.fields.isNotEmpty()) {
                     SettingsFieldsSection(
@@ -1336,6 +1352,7 @@ private fun StremioSettingsDialog(
             configureUrl = webUrl,
             onManifestCaptured = { capturedUrl ->
                 manifestUrl = capturedUrl
+                capturedFromWeb = true
                 showWebConfigure = false
             },
             onDismiss = { showWebConfigure = false }
@@ -1568,7 +1585,7 @@ private fun CustomHeadersSection(
     }
 }
 
-@SuppressLint("SetJavaScriptEnabled")
+@SuppressLint("SetJavaScriptEnabled", "JavascriptInterface")
 @Composable
 private fun StremioWebConfigureDialog(
     title: String,
@@ -1619,29 +1636,96 @@ private fun StremioWebConfigureDialog(
                         .weight(1f),
                     factory = { ctx ->
                         WebView(ctx).apply {
+                            fun tryCaptureManifestUrl(rawUrl: String): Boolean {
+                                val normalized = extractConfiguredStremioManifestUrl(rawUrl) ?: return false
+                                post { onManifestCaptured(normalized) }
+                                return true
+                            }
+
                             settings.javaScriptEnabled = true
                             settings.domStorageEnabled = true
                             settings.useWideViewPort = true
                             settings.loadWithOverviewMode = true
+                            settings.setSupportMultipleWindows(true)
+                            settings.javaScriptCanOpenWindowsAutomatically = true
                             CookieManager.getInstance().setAcceptCookie(true)
                             CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+
+                            addJavascriptInterface(
+                                object {
+                                    @JavascriptInterface
+                                    fun onUrlCaptured(raw: String?) {
+                                        if (!raw.isNullOrBlank()) {
+                                            tryCaptureManifestUrl(raw)
+                                        }
+                                    }
+                                },
+                                "__kestrelStremio"
+                            )
+
+                            webChromeClient = object : WebChromeClient() {
+                                override fun onCreateWindow(
+                                    view: WebView?,
+                                    isDialog: Boolean,
+                                    isUserGesture: Boolean,
+                                    resultMsg: Message?
+                                ): Boolean {
+                                    val transport = resultMsg?.obj as? WebView.WebViewTransport ?: return false
+                                    val popup = WebView(ctx).apply {
+                                        webViewClient = object : WebViewClient() {
+                                            override fun shouldOverrideUrlLoading(
+                                                v: WebView?,
+                                                req: WebResourceRequest?
+                                            ): Boolean {
+                                                val target = req?.url?.toString().orEmpty()
+                                                if (tryCaptureManifestUrl(target)) {
+                                                    return true
+                                                }
+                                                view?.loadUrl(target)
+                                                return true
+                                            }
+                                        }
+                                    }
+                                    transport.webView = popup
+                                    resultMsg.sendToTarget()
+                                    return true
+                                }
+                            }
+
                             webViewClient = object : WebViewClient() {
                                 override fun shouldOverrideUrlLoading(
                                     view: WebView?,
                                     request: WebResourceRequest?
                                 ): Boolean {
                                     val url = request?.url?.toString().orEmpty()
-                                    val lower = url.lowercase()
-                                    if (lower.startsWith("stremio://")) {
-                                        val converted = "https://" + url.substring("stremio://".length).trimStart('/')
-                                        onManifestCaptured(converted)
-                                        return true
-                                    }
-                                    if (lower.endsWith("/manifest.json") || "/manifest.json?" in lower) {
-                                        onManifestCaptured(url)
-                                        return true
-                                    }
-                                    return false
+                                    return tryCaptureManifestUrl(url)
+                                }
+
+                                override fun onPageFinished(view: WebView?, url: String?) {
+                                    super.onPageFinished(view, url)
+                                    val hookJs = """
+                                        (function() {
+                                          if (window.__kestrelHooked) return;
+                                          window.__kestrelHooked = true;
+                                          var origOpen = window.open;
+                                          window.open = function(u) {
+                                            try {
+                                              if (u && window.__kestrelStremio) window.__kestrelStremio.onUrlCaptured(String(u));
+                                            } catch (e) {}
+                                            return origOpen ? origOpen.apply(window, arguments) : null;
+                                          };
+                                          if (navigator.clipboard && navigator.clipboard.writeText) {
+                                            var origCopy = navigator.clipboard.writeText.bind(navigator.clipboard);
+                                            navigator.clipboard.writeText = function(text) {
+                                              try {
+                                                if (text && window.__kestrelStremio) window.__kestrelStremio.onUrlCaptured(String(text));
+                                              } catch (e) {}
+                                              return origCopy(text);
+                                            };
+                                          }
+                                        })();
+                                    """.trimIndent()
+                                    view?.evaluateJavascript(hookJs, null)
                                 }
                             }
                             loadUrl(configureUrl)
@@ -1651,6 +1735,38 @@ private fun StremioWebConfigureDialog(
             }
         }
     }
+}
+
+private fun extractConfiguredStremioManifestUrl(rawUrl: String): String? {
+    val trimmed = rawUrl.trim()
+    if (trimmed.isEmpty()) return null
+    val lower = trimmed.lowercase()
+
+    if (lower.startsWith("stremio://")) {
+        val rest = trimmed.substring("stremio://".length).trimStart('/')
+        return if (rest.startsWith("http://", ignoreCase = true) ||
+            rest.startsWith("https://", ignoreCase = true)
+        ) {
+            rest
+        } else {
+            "https://$rest"
+        }
+    }
+
+    if ("web.stremio.com" in lower && "addon=" in lower) {
+        val encodedAddon = trimmed.substringAfter("addon=").substringBefore('&')
+        val decoded = runCatching { URLDecoder.decode(encodedAddon, "UTF-8") }.getOrNull()?.trim()
+        if (!decoded.isNullOrBlank()) {
+            return extractConfiguredStremioManifestUrl(decoded) ?: decoded
+        }
+    }
+
+    val pathPart = lower.substringBefore('?').substringBefore('#')
+    if (pathPart.endsWith("/manifest.json")) {
+        return trimmed
+    }
+
+    return null
 }
 
 @Composable

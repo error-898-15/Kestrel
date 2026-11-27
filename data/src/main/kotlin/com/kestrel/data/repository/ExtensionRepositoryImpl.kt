@@ -81,7 +81,7 @@ class ExtensionRepositoryImpl @Inject constructor(
                     resolvedUrl = resolvedUrl,
                     rawJson = manifestBody
                 )
-                syncParsedRepo(parsed)
+                syncParsedRepo(parsed, existingRepo = existing)
             }.onFailure { err ->
                 repoDao.upsert(
                     existing.copy(
@@ -282,18 +282,22 @@ class ExtensionRepositoryImpl @Inject constructor(
                 ?: error("Stremio addon not found")
             require(existing.repoType == RepoType.STREMIO) { "Not a Stremio addon" }
 
-            runtimeLoader.saveProviderSettings(existing, configValues, customHeaders).getOrThrow()
-
+            val existingNormalized = stremioClient.normalizeManifestUrl(existing.downloadUrl)
             val normalizedInput = stremioClient.normalizeManifestUrl(
                 manifestUrl.ifBlank { existing.downloadUrl }
             )
 
-            // If user filled manifest.config fields without changing URL manually,
-            // attempt standard Stremio SDK config-encoded URL first and verify it resolves.
-            val candidateUrl = if (normalizedInput == existing.downloadUrl && configValues.any { it.value.isNotBlank() }) {
+            // If the user kept the same base URL while editing/clearing manifest.config fields,
+            // compute the Stremio SDK JSON-encoded manifest URL and probe it; only preserve an
+            // existing web-configurator URL when no configValues were modified.
+            val candidateUrl = if (normalizedInput == existingNormalized && configValues.isNotEmpty()) {
                 val encodedUrl = stremioClient.buildConfigEncodedManifestUrl(normalizedInput, configValues)
-                val probe = runCatching { stremioClient.fetchManifest(encodedUrl, customHeaders) }
-                if (probe.isSuccess) encodedUrl else normalizedInput
+                if (encodedUrl != normalizedInput) {
+                    val probe = runCatching { stremioClient.fetchManifest(encodedUrl, customHeaders) }
+                    if (probe.isSuccess) encodedUrl else normalizedInput
+                } else {
+                    normalizedInput
+                }
             } else {
                 normalizedInput
             }
@@ -307,6 +311,8 @@ class ExtensionRepositoryImpl @Inject constructor(
                 tvTypes = manifest.types.ifEmpty { existing.tvTypes },
                 lastError = null
             )
+
+            runtimeLoader.saveProviderSettings(updatedPlugin, configValues, customHeaders).getOrThrow()
 
             repoDao.getById(existing.repoId)?.toDomain(json)?.let { repo ->
                 repoDao.upsert(
@@ -333,9 +339,17 @@ class ExtensionRepositoryImpl @Inject constructor(
         }
     }
 
-    private suspend fun syncParsedRepo(parsed: ParsedRepoPayload): RepoConfig {
-        val repo = parsed.repo
-        val existingPlugins = pluginDao.getByRepo(repo.id).map { it.toDomain(json) }.associateBy { it.id }
+    private suspend fun syncParsedRepo(
+        parsed: ParsedRepoPayload,
+        existingRepo: RepoConfig? = null
+    ): RepoConfig {
+        val targetRepoId = existingRepo?.id ?: parsed.repo.id
+        val repo = parsed.repo.copy(
+            id = targetRepoId,
+            addedAtEpochMs = existingRepo?.addedAtEpochMs ?: parsed.repo.addedAtEpochMs
+        )
+        val existingPlugins = pluginDao.getByRepo(targetRepoId).map { it.toDomain(json) }
+        val existingById = existingPlugins.associateBy { it.id }
 
         val incomingPlugins = when (parsed) {
             is ParsedRepoPayload.CloudStream -> {
@@ -345,7 +359,7 @@ class ExtensionRepositoryImpl @Inject constructor(
                     parsed.pluginListUrls.flatMap { listUrl ->
                         val (_, listBody) = urlResolver.fetchText(listUrl)
                         jsonParser.parseCloudStreamPluginsList(
-                            repoId = repo.id,
+                            repoId = targetRepoId,
                             listUrl = listUrl,
                             rawJson = listBody,
                             supportedApiVersion = PluginSandbox.SUPPORTED_CLOUDSTREAM_API_VERSION
@@ -353,12 +367,20 @@ class ExtensionRepositoryImpl @Inject constructor(
                     }
                 }
             }
-            is ParsedRepoPayload.Nuvio -> parsed.plugins
-            is ParsedRepoPayload.Stremio -> listOf(parsed.addonPlugin)
+            is ParsedRepoPayload.Nuvio -> parsed.plugins.map { it.copy(repoId = targetRepoId) }
+            is ParsedRepoPayload.Stremio -> {
+                val existingAddon = existingPlugins.firstOrNull { it.repoType == RepoType.STREMIO }
+                val adjustedAddon = if (existingAddon != null) {
+                    parsed.addonPlugin.copy(id = existingAddon.id, repoId = targetRepoId)
+                } else {
+                    parsed.addonPlugin.copy(repoId = targetRepoId)
+                }
+                listOf(adjustedAddon)
+            }
         }
 
         val merged = incomingPlugins.map { remote ->
-            val local = existingPlugins[remote.id]
+            val local = existingById[remote.id]
             if (local == null) {
                 remote
             } else if (remote.repoType == RepoType.STREMIO) {
