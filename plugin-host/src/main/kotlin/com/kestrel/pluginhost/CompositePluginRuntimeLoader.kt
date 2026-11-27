@@ -231,6 +231,7 @@ class CompositePluginRuntimeLoader @Inject constructor(
                     }
                 }
             }
+            Unit // <-- FIX: force Result<Unit> (the if/else above yields Boolean)
         }
     }
 }
