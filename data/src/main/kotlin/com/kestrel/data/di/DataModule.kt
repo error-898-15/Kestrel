@@ -50,7 +50,7 @@ object DataProvideModule {
     @Provides
     @Singleton
     fun provideDatabase(@ApplicationContext context: Context): KestrelDatabase =
-        Room.databaseBuilder(context, KestrelDatabase.class.java, "kestrel.db")
+        Room.databaseBuilder(context, KestrelDatabase::class.java, "kestrel.db")
             .fallbackToDestructiveMigration()
             .build()
 

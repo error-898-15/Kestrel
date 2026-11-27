@@ -379,12 +379,13 @@ class CatalogRepositoryImpl @Inject constructor(
         // 1. Originating provider uses its exact dataUrl directly unless it is a Nuvio provider whose
         //    playDataUrl fell back to an IMDb ID (`tmdb:tt...`) when numeric TMDB ID is now resolved.
         if (provider.providerId == target.originProviderId) {
+            val resolvedTmdbId = externalIds.tmdbId?.takeIf { it.isNotBlank() }
             val effectiveOriginData = if (
                 provider.repoType == RepoType.NUVIO &&
                 target.originDataUrl.startsWith("tmdb:tt", ignoreCase = true) &&
-                !externalIds.tmdbId.isNullOrBlank()
+                resolvedTmdbId != null
             ) {
-                buildNuvioDataToken(externalIds.tmdbId, target)
+                buildNuvioDataToken(resolvedTmdbId, target)
             } else {
                 target.originDataUrl
             }
