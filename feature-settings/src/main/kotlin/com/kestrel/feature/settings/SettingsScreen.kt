@@ -2263,6 +2263,7 @@ private fun repoTypeLabel(type: RepoType): String = when (type) {
     RepoType.HIKARI -> "Hikari"
 }
 
+@Composable
 private fun MetadataPill(text: String) {
     Box(
         modifier = Modifier
