@@ -69,7 +69,7 @@ class NuvioJsEngine @Inject constructor(
                   return;
                 }
                 var out = await fn(${JSONObject.quote(tmdbId)}, ${JSONObject.quote(mediaType)}, ${season ?: "null"}, ${episode ?: "null"});
-                var streams = Array.isArray(out) ? out : (out && Array.isArray(out.streams) ? out.streams : []);
+                var streams = Array.isArray(out) ? out : (out && Array.isArray(out.streams) ? out.streams : (out && (out.url || out.streamUrl || out.stream || out.file || out.link) ? [out] : []));
                 __nuvioResult({ streams: streams });
               } catch (e) {
                 __nuvioResult({ streams: [], error: (e && e.message) ? String(e.message) : String(e) });
@@ -363,8 +363,9 @@ class NuvioJsEngine @Inject constructor(
 
                 evaluate<Any?>(NuvioPolyfill.build(), "nuvio-polyfill.js")
                 evaluate<Any?>(settingsInjection, "nuvio-settings.js")
+                val preparedCode = prepareNuvioScript(scriptCode)
                 val scriptError = runCatching {
-                    evaluate<Any?>(scriptCode, "$scraperId.js")
+                    evaluate<Any?>(preparedCode, "$scraperId.js")
                 }.exceptionOrNull()
                 if (scriptError != null) {
                     return@quickJs JSONObject()
@@ -409,18 +410,27 @@ class NuvioJsEngine @Inject constructor(
                     "{}"
                 }
                 "btoa" -> {
-                    val encoded = Base64.encodeToString(
-                        req.optString("value").toByteArray(Charsets.UTF_8),
-                        Base64.NO_WRAP
-                    )
+                    val rawStr = req.optString("value")
+                    val bytes = ByteArray(rawStr.length) { i -> (rawStr[i].code and 0xFF).toByte() }
+                    val encoded = Base64.encodeToString(bytes, Base64.NO_WRAP)
                     JSONObject().put("value", encoded).toString()
                 }
                 "atob" -> {
+                    val cleanB64 = req.optString("value")
+                        .replace("-", "+")
+                        .replace("_", "/")
+                        .replace(Regex("\\s+"), "")
                     val decoded = String(
-                        Base64.decode(req.optString("value"), Base64.DEFAULT),
-                        Charsets.UTF_8
+                        Base64.decode(cleanB64, Base64.DEFAULT),
+                        Charsets.ISO_8859_1
                     )
                     JSONObject().put("value", decoded).toString()
+                }
+                "cryptoRandom" -> {
+                    val size = req.optInt("size", 16).coerceIn(1, 1024)
+                    val bytes = ByteArray(size)
+                    SecureRandom().nextBytes(bytes)
+                    JSONObject().put("hex", bytesToHex(bytes)).toString()
                 }
                 "cryptoDigest" -> handleCryptoDigest(req)
                 "cryptoHmac" -> handleCryptoHmac(req)
@@ -826,7 +836,9 @@ class NuvioJsEngine @Inject constructor(
                 val keys = headersObj.keys()
                 while (keys.hasNext()) {
                     val k = keys.next()
+                    if (headersObj.isNull(k)) continue
                     val v = headersObj.optString(k)
+                    if (v.isBlank()) continue
                     if (k.equals("user-agent", ignoreCase = true)) hasUa = true
                     if (k.equals("content-type", ignoreCase = true)) contentType = v
                     builder.header(k, v)
@@ -853,11 +865,22 @@ class NuvioJsEngine @Inject constructor(
                 )
             }
 
-            okHttpClient.newCall(builder.build()).execute().use { resp ->
+            val redirectMode = payload.optString("redirect", "follow").lowercase()
+            val callClient = if (redirectMode == "manual" || redirectMode == "error") {
+                okHttpClient.newBuilder()
+                    .followRedirects(false)
+                    .followSslRedirects(false)
+                    .build()
+            } else {
+                okHttpClient
+            }
+
+            callClient.newCall(builder.build()).execute().use { resp ->
                 val respHeaders = JSONObject()
                 resp.headers.names().forEach { hName ->
-                    if (!hName.equals("set-cookie", ignoreCase = true)) {
-                        respHeaders.put(hName, resp.header(hName).orEmpty())
+                    val values = resp.headers.values(hName)
+                    if (values.isNotEmpty()) {
+                        respHeaders.put(hName, values.joinToString("; "))
                     }
                 }
                 val bodyText = resp.body?.string().orEmpty().take(MAX_BODY_CHARS)
@@ -874,6 +897,29 @@ class NuvioJsEngine @Inject constructor(
         } catch (t: Throwable) {
             JSONObject().put("error", t.message ?: "fetch error").toString()
         }
+    }
+
+    private fun prepareNuvioScript(scriptCode: String): String {
+        var code = scriptCode
+        // Support ESM export syntax if a scraper uses `export async function getStreams` or `export default`
+        code = code
+            .replace(Regex("(?m)^\\s*export\\s+default\\s+"), "module.exports = ")
+            .replace(Regex("(?m)^\\s*export\\s+(async\\s+function|function|const|let|var)\\s+"), "$1 ")
+            .replace(Regex("(?m)^\\s*export\\s*\\{[^}]*\\};?\\s*$"), "")
+            .replace(
+                Regex("(?m)^\\s*import\\s+(\\w+)\\s+from\\s+['\"]([^'\"]+)['\"];?\\s*$"),
+                "const $1 = require('$2');"
+            )
+        val bridgeTail = """
+            ;try { if (typeof getStreams === 'function' && !globalThis.getStreams) globalThis.getStreams = getStreams; } catch (_) {}
+            try { if (typeof getCatalog === 'function' && !globalThis.getCatalog) globalThis.getCatalog = getCatalog; } catch (_) {}
+            try { if (typeof getHome === 'function' && !globalThis.getHome) globalThis.getHome = getHome; } catch (_) {}
+            try { if (typeof search === 'function' && !globalThis.search) globalThis.search = search; } catch (_) {}
+            try { if (typeof getItemDetails === 'function' && !globalThis.getItemDetails) globalThis.getItemDetails = getItemDetails; } catch (_) {}
+            try { if (typeof getDetails === 'function' && !globalThis.getDetails) globalThis.getDetails = getDetails; } catch (_) {}
+            try { if (typeof onSettings === 'function' && !globalThis.onSettings) globalThis.onSettings = onSettings; } catch (_) {}
+        """.trimIndent()
+        return code + "\n" + bridgeTail
     }
 
     companion object {

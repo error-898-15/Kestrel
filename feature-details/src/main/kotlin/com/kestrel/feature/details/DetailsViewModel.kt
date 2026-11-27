@@ -7,17 +7,26 @@ import androidx.lifecycle.viewModelScope
 import com.kestrel.domain.model.Episode
 import com.kestrel.domain.model.LibraryEntry
 import com.kestrel.domain.model.MediaDetails
+import com.kestrel.domain.model.PlaybackStartMode
+import com.kestrel.domain.model.ProviderServerProgress
 import com.kestrel.domain.model.ResolvedLinks
+import com.kestrel.domain.model.ServerSearchSettings
+import com.kestrel.domain.model.ServerSearchTarget
 import com.kestrel.domain.model.StreamSource
 import com.kestrel.domain.playback.PlaybackSession
 import com.kestrel.domain.playback.PlaybackSessionManager
 import com.kestrel.domain.repository.CatalogRepository
 import com.kestrel.domain.repository.LibraryRepository
+import com.kestrel.domain.repository.SettingsRepository
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import java.net.URLDecoder
@@ -32,7 +41,16 @@ data class DetailsUiState(
     val isResolvingLinks: Boolean = false,
     val resolvingEpisode: Episode? = null,
     val resolvedLinks: ResolvedLinks? = null,
-    val linkError: String? = null
+    val linkError: String? = null,
+    val isSourceSheetOpen: Boolean = false,
+    val isAskWhereToPlayOpen: Boolean = false,
+    val pendingPlayEpisode: Episode? = null,
+    val serverSearchProgress: List<ProviderServerProgress> = emptyList(),
+    val selectedServerFilterProviderId: String? = null,
+    val completedServerCount: Int = 0,
+    val totalServerCount: Int = 0,
+    val isWaitingForAutoPlay: Boolean = false,
+    val autoPlayEvent: Int = 0
 )
 
 @HiltViewModel
@@ -40,14 +58,22 @@ class DetailsViewModel @Inject constructor(
     savedStateHandle: SavedStateHandle,
     private val catalogRepository: CatalogRepository,
     private val libraryRepository: LibraryRepository,
+    private val settingsRepository: SettingsRepository,
     private val playbackSessionManager: PlaybackSessionManager
 ) : ViewModel() {
 
     private val providerId: String = decodeArg(savedStateHandle["providerId"])
     private val mediaUrl: String = decodeArg(savedStateHandle["url"])
 
+    private val serverSettings: StateFlow<ServerSearchSettings> = settingsRepository.serverSearchSettings
+        .stateIn(viewModelScope, SharingStarted.Eagerly, ServerSearchSettings())
+
     private val _uiState = MutableStateFlow(DetailsUiState())
     val uiState: StateFlow<DetailsUiState> = _uiState.asStateFlow()
+
+    private var resolutionJob: Job? = null
+    private var lastOnlyOriginProvider: Boolean = false
+    private var autoPlayedInCurrentSearch: Boolean = false
 
     init {
         load()
@@ -134,57 +160,200 @@ class DetailsViewModel @Inject constructor(
         }
     }
 
-    fun resolveForPlay(episode: Episode? = null) {
+    fun resolveForPlay(
+        episode: Episode? = null,
+        forceOriginOnly: Boolean? = null,
+        forceShowSheet: Boolean = false
+    ) {
         val details = _uiState.value.details ?: return
         val targetEpisode = episode ?: details.episodes.firstOrNull()
+        val settings = serverSettings.value
+
+        if (settings.askWhereToPlay && forceOriginOnly == null && !forceShowSheet) {
+            _uiState.update {
+                it.copy(
+                    isAskWhereToPlayOpen = true,
+                    pendingPlayEpisode = targetEpisode
+                )
+            }
+            return
+        }
+
+        val onlyOrigin = forceOriginOnly ?: false
+        lastOnlyOriginProvider = onlyOrigin
+        autoPlayedInCurrentSearch = false
+
         val dataUrl = targetEpisode?.dataUrl
             ?: details.playDataUrl
             ?: details.url
 
-        viewModelScope.launch {
+        val searchTarget = ServerSearchTarget(
+            originProviderId = details.providerId,
+            originDataUrl = dataUrl,
+            title = details.title,
+            mediaType = details.type,
+            year = details.year,
+            season = targetEpisode?.season,
+            episode = targetEpisode?.episodeNumber,
+            rawMediaUrl = details.url
+        )
+
+        val openSheetImmediately = forceShowSheet ||
+            settings.alwaysShowServerList ||
+            settings.playbackStartMode == PlaybackStartMode.WAIT_FOR_MORE
+
+        val waitForAutoPlay = !forceShowSheet &&
+            !settings.alwaysShowServerList &&
+            settings.playbackStartMode == PlaybackStartMode.FIRST_FOUND
+
+        resolutionJob?.cancel()
+        resolutionJob = viewModelScope.launch {
             _uiState.update {
                 it.copy(
+                    isAskWhereToPlayOpen = false,
+                    pendingPlayEpisode = null,
                     isResolvingLinks = true,
                     resolvingEpisode = targetEpisode,
                     resolvedLinks = null,
-                    linkError = null
+                    linkError = null,
+                    isSourceSheetOpen = openSheetImmediately,
+                    serverSearchProgress = emptyList(),
+                    selectedServerFilterProviderId = null,
+                    completedServerCount = 0,
+                    totalServerCount = 0,
+                    isWaitingForAutoPlay = waitForAutoPlay
                 )
             }
-            catalogRepository.resolveLinks(details.providerId, dataUrl)
-                .onSuccess { links ->
+
+            catalogRepository.resolveLinksMultiServer(
+                target = searchTarget,
+                settings = settings,
+                onlyOriginProvider = onlyOrigin
+            )
+                .catch { err ->
                     _uiState.update {
                         it.copy(
                             isResolvingLinks = false,
-                            resolvedLinks = links,
-                            linkError = if (links.streams.isEmpty()) "No playable streams found" else null
+                            isWaitingForAutoPlay = false,
+                            linkError = err.message ?: "Failed to resolve streams"
                         )
                     }
                 }
-                .onFailure { err ->
-                    _uiState.update {
-                        it.copy(
-                            isResolvingLinks = false,
-                            linkError = err.message ?: "Failed to resolve streams"
+                .collect { update ->
+                    val links = ResolvedLinks(
+                        streams = update.allStreams,
+                        subtitles = update.allSubtitles
+                    )
+                    val shouldAutoPlayNow = !autoPlayedInCurrentSearch &&
+                        _uiState.value.isWaitingForAutoPlay &&
+                        update.allStreams.isNotEmpty()
+
+                    val noStreamsAtEnd = update.isComplete && update.allStreams.isEmpty()
+                    val errorMsg = if (noStreamsAtEnd) {
+                        buildNoStreamsErrorMessage(update.providers)
+                    } else null
+
+                    _uiState.update { state ->
+                        val activeFilter = state.selectedServerFilterProviderId
+                        val keepFilter = activeFilter != null && update.providers.any { it.providerId == activeFilter }
+                        state.copy(
+                            isResolvingLinks = !update.isComplete,
+                            resolvedLinks = if (update.allStreams.isNotEmpty() || update.allSubtitles.isNotEmpty()) links else null,
+                            serverSearchProgress = update.providers,
+                            selectedServerFilterProviderId = if (keepFilter) activeFilter else null,
+                            completedServerCount = update.completedCount,
+                            totalServerCount = update.totalCount,
+                            linkError = errorMsg,
+                            isWaitingForAutoPlay = if (shouldAutoPlayNow || update.isComplete) false else state.isWaitingForAutoPlay,
+                            isSourceSheetOpen = when {
+                                shouldAutoPlayNow -> false
+                                noStreamsAtEnd && state.isWaitingForAutoPlay -> true
+                                else -> state.isSourceSheetOpen
+                            }
                         )
+                    }
+
+                    if (shouldAutoPlayNow) {
+                        autoPlayedInCurrentSearch = true
+                        val firstSource = update.allStreams.first()
+                        val stateNow = _uiState.value
+                        val resumeMs = if (targetEpisode == null || targetEpisode.id == stateNow.libraryEntry?.lastEpisodeId) {
+                            stateNow.libraryEntry?.lastPositionMs ?: 0L
+                        } else 0L
+                        playbackSessionManager.startSession(
+                            PlaybackSession(
+                                details = details,
+                                selectedEpisode = targetEpisode,
+                                selectedSource = firstSource,
+                                links = links,
+                                resumePositionMs = resumeMs
+                            )
+                        )
+                        _uiState.update { it.copy(autoPlayEvent = it.autoPlayEvent + 1) }
+                    } else if (autoPlayedInCurrentSearch && update.allStreams.isNotEmpty()) {
+                        // Stream newly discovered servers into active Player session for instant fallback / source switching.
+                        playbackSessionManager.updateSession { current ->
+                            if (current.details.id == details.id && current.selectedEpisode?.id == targetEpisode?.id) {
+                                current.copy(links = links)
+                            } else {
+                                current
+                            }
+                        }
                     }
                 }
         }
     }
 
+    fun confirmAskWhereToPlay(onlyOriginProvider: Boolean) {
+        val ep = _uiState.value.pendingPlayEpisode
+        _uiState.update { it.copy(isAskWhereToPlayOpen = false, pendingPlayEpisode = null) }
+        resolveForPlay(episode = ep, forceOriginOnly = onlyOriginProvider, forceShowSheet = false)
+    }
+
+    fun dismissAskWhereToPlay() {
+        _uiState.update { it.copy(isAskWhereToPlayOpen = false, pendingPlayEpisode = null) }
+    }
+
+    fun refreshStreams() {
+        val currentEp = _uiState.value.resolvingEpisode
+        resolveForPlay(
+            episode = currentEp,
+            forceOriginOnly = lastOnlyOriginProvider,
+            forceShowSheet = true
+        )
+    }
+
+    fun selectServerFilter(providerId: String?) {
+        _uiState.update { it.copy(selectedServerFilterProviderId = providerId) }
+    }
+
     fun dismissSourcePicker() {
-        _uiState.update { it.copy(resolvedLinks = null, linkError = null) }
+        if (!autoPlayedInCurrentSearch) {
+            resolutionJob?.cancel()
+            resolutionJob = null
+        }
+        _uiState.update {
+            it.copy(
+                isSourceSheetOpen = false,
+                isResolvingLinks = false,
+                isWaitingForAutoPlay = false,
+                resolvedLinks = null,
+                linkError = null
+            )
+        }
     }
 
     fun startPlayback(source: StreamSource) {
         val state = _uiState.value
         val details = state.details ?: return
-        val links = state.resolvedLinks ?: return
+        val links = state.resolvedLinks ?: ResolvedLinks(streams = listOf(source))
         val episode = state.resolvingEpisode
         val resumeMs = if (episode == null || episode.id == state.libraryEntry?.lastEpisodeId) {
             state.libraryEntry?.lastPositionMs ?: 0L
         } else {
             0L
         }
+        autoPlayedInCurrentSearch = true
 
         playbackSessionManager.startSession(
             PlaybackSession(
@@ -195,7 +364,26 @@ class DetailsViewModel @Inject constructor(
                 resumePositionMs = resumeMs
             )
         )
-        dismissSourcePicker()
+        _uiState.update { it.copy(isSourceSheetOpen = false) }
+    }
+
+    override fun onCleared() {
+        resolutionJob?.cancel()
+        super.onCleared()
+    }
+
+    private fun buildNoStreamsErrorMessage(providers: List<ProviderServerProgress>): String {
+        if (providers.isEmpty()) {
+            return "No enabled stream providers matched your server search settings."
+        }
+        val errors = providers.mapNotNull { p ->
+            p.errorMessage?.takeIf { it.isNotBlank() }?.let { "${p.providerName}: $it" }
+        }
+        return if (errors.isNotEmpty()) {
+            "No playable streams found across ${providers.size} server(s). ${errors.take(2).joinToString(" • ")}"
+        } else {
+            "No playable streams found across ${providers.size} server(s)."
+        }
     }
 
     private fun decodeArg(raw: String?): String =

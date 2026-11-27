@@ -26,16 +26,22 @@ internal object NuvioPolyfill {
             debug: function() {}
           };
 
+          var __nextTimerId = 1;
+          var __activeTimers = {};
           global.setTimeout = function(fn, ms) {
+            var id = __nextTimerId++;
+            __activeTimers[id] = true;
             var args = Array.prototype.slice.call(arguments, 2);
             Promise.resolve().then(function() {
               return __nuvioSleepAsync(ms || 0);
             }).then(function() {
+              if (!__activeTimers[id]) return;
+              delete __activeTimers[id];
               if (typeof fn === 'function') fn.apply(null, args);
             });
-            return 1;
+            return id;
           };
-          global.clearTimeout = function() {};
+          global.clearTimeout = function(id) { delete __activeTimers[id]; };
           global.setInterval = function() { return 1; };
           global.clearInterval = function() {};
 
@@ -280,7 +286,7 @@ internal object NuvioPolyfill {
                   raw = basePath.replace(/\/[^\/]*$/, '/') + raw;
                 }
               }
-              var m = raw.match(/^([a-zA-Z][a-zA-Z0-9+.-]*:)\/\/([^\/?#:]+(?::\d+)?)(\/[^?#]*)?(\?[^#]*)?(#.*)?$/);
+              var m = raw.match(/^([a-zA-Z][a-zA-Z0-9+.-]*:)\/\/(?:[^@\/?#]+@)?([^\/?#:]+(?::\d+)?)(\/[^?#]*)?(\?[^#]*)?(#.*)?$/);
               if (!m) throw new Error('Invalid URL: ' + raw);
               this.protocol = m[1];
               this.host = m[2];
@@ -301,24 +307,31 @@ internal object NuvioPolyfill {
               });
             };
             global.URL.prototype.toString = function() { return this.href; };
+            global.URL.prototype.toJSON = function() { return this.href; };
           }
 
           global.fetch = async function(url, opts) {
+            if (url && typeof url === 'object' && typeof url.url === 'string') {
+              opts = Object.assign({}, url, opts || {});
+              url = url.url;
+            }
             opts = opts || {};
             var mergedHeaders = {};
             var custom = global.__kestrelCustomHeaders || {};
             for (var ck in custom) {
-              if (Object.prototype.hasOwnProperty.call(custom, ck)) {
-                mergedHeaders[ck] = custom[ck];
+              if (Object.prototype.hasOwnProperty.call(custom, ck) && custom[ck] !== undefined && custom[ck] !== null) {
+                mergedHeaders[ck] = String(custom[ck]);
               }
             }
             if (opts.headers) {
               if (typeof opts.headers.forEach === 'function') {
-                opts.headers.forEach(function(v, k) { mergedHeaders[k] = v; });
+                opts.headers.forEach(function(v, k) {
+                  if (v !== undefined && v !== null) mergedHeaders[k] = String(v);
+                });
               } else {
                 for (var k in opts.headers) {
-                  if (Object.prototype.hasOwnProperty.call(opts.headers, k)) {
-                    mergedHeaders[k] = opts.headers[k];
+                  if (Object.prototype.hasOwnProperty.call(opts.headers, k) && opts.headers[k] !== undefined && opts.headers[k] !== null) {
+                    mergedHeaders[k] = String(opts.headers[k]);
                   }
                 }
               }
@@ -338,30 +351,38 @@ internal object NuvioPolyfill {
             var res = JSON.parse(raw);
             if (res.error) throw new Error(res.error);
             var bodyText = res.body || '';
-            return {
-              ok: res.status >= 200 && res.status < 300,
-              status: res.status,
-              statusText: res.statusText || '',
-              url: res.url || payload.url,
-              redirected: Boolean(res.redirected),
-              headers: {
-                get: function(name) {
-                  var lower = String(name).toLowerCase();
-                  var h = res.headers || {};
-                  for (var hk in h) {
-                    if (hk.toLowerCase() === lower) return h[hk];
+            var rawHeaders = res.headers || {};
+            function makeResponse() {
+              return {
+                ok: res.status >= 200 && res.status < 300,
+                status: res.status,
+                statusText: res.statusText || '',
+                url: res.url || payload.url,
+                redirected: Boolean(res.redirected),
+                headers: {
+                  get: function(name) {
+                    var lower = String(name).toLowerCase();
+                    for (var hk in rawHeaders) {
+                      if (hk.toLowerCase() === lower) return rawHeaders[hk];
+                    }
+                    return null;
+                  },
+                  has: function(name) { return this.get(name) !== null; },
+                  entries: function() {
+                    return Object.keys(rawHeaders).map(function(k) { return [k, rawHeaders[k]]; });
+                  },
+                  forEach: function(cb) {
+                    Object.keys(rawHeaders).forEach(function(k) { cb(rawHeaders[k], k); });
                   }
-                  return null;
                 },
-                has: function(name) { return this.get(name) !== null; },
-                entries: function() {
-                  var h = res.headers || {};
-                  return Object.keys(h).map(function(k) { return [k, h[k]]; });
-                }
-              },
-              text: async function() { return bodyText; },
-              json: async function() { return JSON.parse(bodyText); }
-            };
+                text: async function() { return bodyText; },
+                json: async function() { return JSON.parse(bodyText); },
+                arrayBuffer: async function() { return new Uint8Array(utf8StrToBytes(bodyText)).buffer; },
+                bytes: async function() { return new Uint8Array(utf8StrToBytes(bodyText)); },
+                clone: function() { return makeResponse(); }
+              };
+            }
+            return makeResponse();
           };
 
           // --- Native-backed CryptoJS polyfill ---
@@ -400,6 +421,40 @@ internal object NuvioPolyfill {
               Latin1: {
                 parse: function(str) { return makeWordArray(bytesToHex(latin1StrToBytes(str))); },
                 stringify: function(wa) { return bytesToLatin1Str(hexToBytes(wa && wa._hex ? wa._hex : '')); }
+              },
+              Base64url: {
+                parse: function(b64u) {
+                  var b64 = String(b64u || '').replace(/-/g, '+').replace(/_/g, '/');
+                  return makeWordArray(bytesToHex(latin1StrToBytes(global.atob(b64))));
+                },
+                stringify: function(wa) {
+                  return global.btoa(bytesToLatin1Str(hexToBytes(wa && wa._hex ? wa._hex : ''))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+                }
+              }
+            },
+            lib: {
+              WordArray: {
+                create: function(words, sigBytes) {
+                  if (typeof words === 'string') return makeWordArray(bytesToHex(utf8StrToBytes(words)));
+                  if (Array.isArray(words) || words instanceof Uint8Array) {
+                    var bytes = [];
+                    if (words instanceof Uint8Array) {
+                      for (var i = 0; i < words.length; i++) bytes.push(words[i]);
+                    } else {
+                      var total = typeof sigBytes === 'number' ? sigBytes : words.length * 4;
+                      for (var b = 0; b < total; b++) {
+                        var w = words[b >>> 2] || 0;
+                        bytes.push((w >>> (24 - (b % 4) * 8)) & 0xff);
+                      }
+                    }
+                    return makeWordArray(bytesToHex(bytes));
+                  }
+                  return makeWordArray('');
+                },
+                random: function(nBytes) {
+                  var res = JSON.parse(__nuvioCall(JSON.stringify({ op: 'cryptoRandom', size: Number(nBytes || 16) })) || '{}');
+                  return makeWordArray(res.hex || '');
+                }
               }
             },
             mode: { CBC: 'CBC', ECB: 'ECB', CTR: 'CTR', CFB: 'CFB', OFB: 'OFB' },
@@ -677,7 +732,9 @@ internal object NuvioPolyfill {
                 },
                 toArray: function() {
                   return arr.map(function(n) { return wrapNodes([n], sel); });
-                }
+                },
+                remove: function() { return sel; },
+                empty: function() { return sel; }
               };
 
               function traverse(kind, selector) {
@@ -749,29 +806,199 @@ internal object NuvioPolyfill {
               return createCheerioInstance(html);
             }
           };
+          global.cheerio.default = global.cheerio;
 
-          var axiosShim = {
-            get: function(url, config) {
-              config = config || {};
-              return global.fetch(url, { method: 'GET', headers: config.headers || {} }).then(function(r) {
+          function buildAxiosInstance(defaults) {
+            defaults = defaults || {};
+            function appendParams(targetUrl, params) {
+              if (!params || typeof params !== 'object') return targetUrl;
+              var usp = (params instanceof global.URLSearchParams) ? params : new global.URLSearchParams();
+              if (!(params instanceof global.URLSearchParams)) {
+                Object.keys(params).forEach(function(k) {
+                  var v = params[k];
+                  if (v !== undefined && v !== null) usp.append(k, String(v));
+                });
+              }
+              var qs = usp.toString();
+              if (!qs) return targetUrl;
+              return targetUrl + (targetUrl.indexOf('?') >= 0 ? '&' : '?') + qs;
+            }
+            function resolveUrl(baseURL, u) {
+              var raw = String(u || '');
+              if (baseURL && !/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(raw)) {
+                return String(baseURL).replace(/\/+$/, '') + '/' + raw.replace(/^\/+/, '');
+              }
+              return raw;
+            }
+            function request(configOrUrl, maybeConfig) {
+              var cfg = typeof configOrUrl === 'string'
+                ? Object.assign({}, maybeConfig || {}, { url: configOrUrl })
+                : Object.assign({}, configOrUrl || {});
+              var baseURL = cfg.baseURL !== undefined ? cfg.baseURL : defaults.baseURL;
+              var fullUrl = appendParams(resolveUrl(baseURL, cfg.url || ''), cfg.params);
+              var method = String(cfg.method || 'GET').toUpperCase();
+              var headers = Object.assign({}, defaults.headers || {}, cfg.headers || {});
+              var body = cfg.data !== undefined ? cfg.data : cfg.body;
+              var bodyStr = null;
+              if (body !== undefined && body !== null && method !== 'GET' && method !== 'HEAD') {
+                if (typeof body === 'string') {
+                  bodyStr = body;
+                } else if (body instanceof global.URLSearchParams) {
+                  bodyStr = body.toString();
+                  if (!headers['Content-Type'] && !headers['content-type']) {
+                    headers['Content-Type'] = 'application/x-www-form-urlencoded';
+                  }
+                } else {
+                  bodyStr = JSON.stringify(body);
+                  if (!headers['Content-Type'] && !headers['content-type']) {
+                    headers['Content-Type'] = 'application/json';
+                  }
+                }
+              }
+              var redirectMode = (cfg.maxRedirects === 0 || cfg.redirect === 'manual') ? 'manual' : 'follow';
+              return global.fetch(fullUrl, {
+                method: method,
+                headers: headers,
+                body: bodyStr,
+                redirect: redirectMode
+              }).then(function(r) {
                 return r.text().then(function(t) {
                   var data = t;
-                  try { data = JSON.parse(t); } catch (e) {}
-                  return { data: data, status: r.status, statusText: r.statusText, headers: r.headers };
+                  if (cfg.responseType !== 'text') {
+                    try { data = JSON.parse(t); } catch (e) {}
+                  }
+                  var headersMap = {};
+                  r.headers.entries().forEach(function(pair) {
+                    headersMap[String(pair[0]).toLowerCase()] = pair[1];
+                  });
+                  var axResp = {
+                    data: data,
+                    status: r.status,
+                    statusText: r.statusText,
+                    headers: headersMap,
+                    config: cfg,
+                    request: { responseURL: r.url }
+                  };
+                  var validate = cfg.validateStatus || function(s) { return s >= 200 && s < 300; };
+                  if (!validate(r.status)) {
+                    var err = new Error('Request failed with status code ' + r.status);
+                    err.isAxiosError = true;
+                    err.response = axResp;
+                    err.status = r.status;
+                    throw err;
+                  }
+                  return axResp;
                 });
               });
+            }
+            var fn = function(configOrUrl, maybeConfig) { return request(configOrUrl, maybeConfig); };
+            fn.request = request;
+            fn.defaults = defaults;
+            fn.get = function(url, config) { return request(Object.assign({}, config || {}, { url: url, method: 'GET' })); };
+            fn.delete = function(url, config) { return request(Object.assign({}, config || {}, { url: url, method: 'DELETE' })); };
+            fn.head = function(url, config) { return request(Object.assign({}, config || {}, { url: url, method: 'HEAD' })); };
+            fn.post = function(url, data, config) { return request(Object.assign({}, config || {}, { url: url, method: 'POST', data: data })); };
+            fn.put = function(url, data, config) { return request(Object.assign({}, config || {}, { url: url, method: 'PUT', data: data })); };
+            fn.patch = function(url, data, config) { return request(Object.assign({}, config || {}, { url: url, method: 'PATCH', data: data })); };
+            fn.create = function(newDefaults) { return buildAxiosInstance(Object.assign({}, defaults, newDefaults || {})); };
+            fn.isAxiosError = function(e) { return Boolean(e && e.isAxiosError); };
+            fn.default = fn;
+            return fn;
+          }
+          var axiosShim = buildAxiosInstance({});
+
+          function encodeCryptoOut(hexStr, encoding) {
+            var wa = makeWordArray(hexStr);
+            if (!encoding) return global.Buffer.from(hexStr, 'hex');
+            var enc = String(encoding).toLowerCase();
+            if (enc === 'hex') return hexStr;
+            if (enc === 'base64') return CryptoJSImpl.enc.Base64.stringify(wa);
+            if (enc === 'base64url') return CryptoJSImpl.enc.Base64url.stringify(wa);
+            if (enc === 'latin1' || enc === 'binary') return CryptoJSImpl.enc.Latin1.stringify(wa);
+            return CryptoJSImpl.enc.Utf8.stringify(wa);
+          }
+
+          function inputToHex(data, inputEnc) {
+            if (data instanceof Uint8Array) return bytesToHex(data);
+            var enc = String(inputEnc || 'utf8').toLowerCase();
+            var str = String(data || '');
+            if (enc === 'hex') return str;
+            if (enc === 'base64' || enc === 'base64url') return global.Buffer.from(str, enc).toString('hex');
+            if (enc === 'latin1' || enc === 'binary') return bytesToHex(latin1StrToBytes(str));
+            return bytesToHex(utf8StrToBytes(str));
+          }
+
+          var nodeCryptoShim = {
+            randomBytes: function(size) {
+              var res = JSON.parse(__nuvioCall(JSON.stringify({ op: 'cryptoRandom', size: Number(size || 16) })) || '{}');
+              return global.Buffer.from(res.hex || '', 'hex');
             },
-            post: function(url, body, config) {
-              config = config || {};
-              var headers = config.headers || {};
-              var payload = typeof body === 'string' ? body : JSON.stringify(body || {});
-              return global.fetch(url, { method: 'POST', headers: headers, body: payload }).then(function(r) {
-                return r.text().then(function(t) {
-                  var data = t;
-                  try { data = JSON.parse(t); } catch (e) {}
-                  return { data: data, status: r.status, statusText: r.statusText, headers: r.headers };
-                });
-              });
+            createHash: function(algo) {
+              var a = String(algo || 'sha256').toLowerCase();
+              var mapped = a === 'md5' ? 'MD5' : a === 'sha1' ? 'SHA-1' : a === 'sha512' ? 'SHA-512' : 'SHA-256';
+              var chunksHex = '';
+              return {
+                update: function(data, enc) { chunksHex += inputToHex(data, enc); return this; },
+                digest: function(outEnc) {
+                  var res = JSON.parse(__nuvioCall(JSON.stringify({ op: 'cryptoDigest', algo: mapped, hex: chunksHex })) || '{}');
+                  return encodeCryptoOut(res.hex || '', outEnc);
+                }
+              };
+            },
+            createHmac: function(algo, key) {
+              var a = String(algo || 'sha256').toLowerCase();
+              var mapped = a === 'md5' ? 'HmacMD5' : a === 'sha1' ? 'HmacSHA1' : a === 'sha512' ? 'HmacSHA512' : 'HmacSHA256';
+              var keyHex = inputToHex(key, 'utf8');
+              var chunksHex = '';
+              return {
+                update: function(data, enc) { chunksHex += inputToHex(data, enc); return this; },
+                digest: function(outEnc) {
+                  var res = JSON.parse(__nuvioCall(JSON.stringify({ op: 'cryptoHmac', algo: mapped, dataHex: chunksHex, keyHex: keyHex })) || '{}');
+                  return encodeCryptoOut(res.hex || '', outEnc);
+                }
+              };
+            },
+            createCipheriv: function(algo, key, iv) {
+              var mode = String(algo || 'aes-256-cbc').toUpperCase().indexOf('ECB') >= 0 ? 'ECB' :
+                         String(algo || '').toUpperCase().indexOf('CTR') >= 0 ? 'CTR' : 'CBC';
+              var keyHex = inputToHex(key, 'utf8');
+              var ivHex = iv ? inputToHex(iv, 'utf8') : null;
+              var chunksHex = '';
+              return {
+                setAutoPadding: function() { return this; },
+                update: function(data, inEnc, outEnc) {
+                  chunksHex += inputToHex(data, inEnc);
+                  return outEnc ? '' : global.Buffer.alloc(0);
+                },
+                final: function(outEnc) {
+                  var res = JSON.parse(__nuvioCall(JSON.stringify({
+                    op: 'cryptoAes', action: 'encrypt', inputHex: chunksHex,
+                    keyHex: keyHex, ivHex: ivHex, cipherMode: mode, padding: 'Pkcs7'
+                  })) || '{}');
+                  return encodeCryptoOut(res.hex || '', outEnc);
+                }
+              };
+            },
+            createDecipheriv: function(algo, key, iv) {
+              var mode = String(algo || 'aes-256-cbc').toUpperCase().indexOf('ECB') >= 0 ? 'ECB' :
+                         String(algo || '').toUpperCase().indexOf('CTR') >= 0 ? 'CTR' : 'CBC';
+              var keyHex = inputToHex(key, 'utf8');
+              var ivHex = iv ? inputToHex(iv, 'utf8') : null;
+              var chunksHex = '';
+              return {
+                setAutoPadding: function() { return this; },
+                update: function(data, inEnc, outEnc) {
+                  chunksHex += inputToHex(data, inEnc);
+                  return outEnc ? '' : global.Buffer.alloc(0);
+                },
+                final: function(outEnc) {
+                  var res = JSON.parse(__nuvioCall(JSON.stringify({
+                    op: 'cryptoAes', action: 'decrypt', inputHex: chunksHex,
+                    keyHex: keyHex, ivHex: ivHex, cipherMode: mode, padding: 'Pkcs7'
+                  })) || '{}');
+                  return encodeCryptoOut(res.hex || '', outEnc);
+                }
+              };
             }
           };
 
@@ -780,8 +1007,9 @@ internal object NuvioPolyfill {
             if (name.indexOf('cheerio') >= 0) return global.cheerio;
             if (name === 'node-fetch' || name === 'cross-fetch' || name === 'undici') return global.fetch;
             if (name === 'crypto-js' || name.indexOf('crypto-js/') >= 0) return global.CryptoJS;
+            if (name === 'crypto' || name === 'node:crypto') return nodeCryptoShim;
             if (name === 'axios') return axiosShim;
-            if (name === 'querystring') {
+            if (name === 'querystring' || name === 'node:querystring') {
               return {
                 stringify: function(obj) { return new global.URLSearchParams(obj).toString(); },
                 parse: function(str) {
@@ -792,7 +1020,7 @@ internal object NuvioPolyfill {
                 }
               };
             }
-            if (name === 'url') {
+            if (name === 'url' || name === 'node:url') {
               return {
                 URL: global.URL,
                 URLSearchParams: global.URLSearchParams,

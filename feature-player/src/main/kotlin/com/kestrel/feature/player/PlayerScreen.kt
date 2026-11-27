@@ -163,6 +163,9 @@ fun PlayerScreen(
     var disableExternalSubtitles by remember(session.selectedSource.id, session.selectedEpisode?.id) {
         mutableStateOf(false)
     }
+    var hasReachedReadyForSource by remember(session.selectedSource.id, session.selectedEpisode?.id) {
+        mutableStateOf(false)
+    }
     var resizeModeIndex by remember { mutableIntStateOf(0) }
     val resizeModes = remember {
         listOf(
@@ -267,6 +270,7 @@ fun PlayerScreen(
             override fun onPlaybackStateChanged(playbackState: Int) {
                 isBuffering = playbackState == Player.STATE_BUFFERING
                 if (playbackState == Player.STATE_READY) {
+                    hasReachedReadyForSource = true
                     playerError = null
                 }
             }
@@ -282,6 +286,9 @@ fun PlayerScreen(
                 if (hasExternalSubs) {
                     // Recover automatically if a third-party subtitle URL failed to parse/load.
                     disableExternalSubtitles = true
+                } else if (!hasReachedReadyForSource && viewModel.tryNextStreamSource(0L) != null) {
+                    playerError = null
+                    isBuffering = true
                 } else {
                     isBuffering = false
                     playerError = error.localizedMessage ?: error.errorCodeName
@@ -380,14 +387,27 @@ fun PlayerScreen(
                         overflow = TextOverflow.Ellipsis
                     )
                     Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                        KestrelPrimaryButton(
-                            text = "Retry",
-                            onClick = { retryCounter++ }
-                        )
                         if (session.links.streams.size > 1) {
+                            KestrelPrimaryButton(
+                                text = "Next Server",
+                                onClick = {
+                                    val switched = viewModel.tryNextStreamSource(exoPlayer.currentPosition)
+                                    if (switched != null) {
+                                        playerError = null
+                                        isBuffering = true
+                                    } else {
+                                        sheetMode = PlayerSheetMode.QUALITY
+                                    }
+                                }
+                            )
                             KestrelOutlinedButton(
-                                text = "Switch Source",
+                                text = "Sources",
                                 onClick = { sheetMode = PlayerSheetMode.QUALITY }
+                            )
+                        } else {
+                            KestrelPrimaryButton(
+                                text = "Retry",
+                                onClick = { retryCounter++ }
                             )
                         }
                     }
@@ -683,14 +703,29 @@ fun PlayerScreen(
                                     horizontalArrangement = Arrangement.SpaceBetween,
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
-                                    Text(
-                                        text = src.extractorName,
-                                        color = colors.textPrimary,
-                                        modifier = Modifier.weight(1f),
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis
-                                    )
-                                    SourceBadge(label = src.qualityLabel)
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = src.extractorName,
+                                            color = colors.textPrimary,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                        Text(
+                                            text = src.providerName,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = colors.textSecondary,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                        SourceBadge(
+                                            label = src.qualityLabel,
+                                            accent = colors.accentAmber,
+                                            container = colors.accentAmberDim
+                                        )
+                                        SourceBadge(label = src.format.name)
+                                    }
                                 }
                             }
                         }

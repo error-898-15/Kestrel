@@ -49,6 +49,7 @@ import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -76,8 +77,10 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil3.compose.AsyncImage
 import com.kestrel.core.designsystem.CertificationBadge
 import com.kestrel.core.designsystem.EmptyStateView
+import com.kestrel.core.designsystem.GlassChip
 import com.kestrel.core.designsystem.GlassCircleButton
 import com.kestrel.core.designsystem.ImdbRatingBadge
+import com.kestrel.core.designsystem.KestrelPrimaryButton
 import com.kestrel.core.designsystem.KestrelBackdrop
 import com.kestrel.core.designsystem.KestrelBackground
 import com.kestrel.core.designsystem.KestrelCard
@@ -93,6 +96,7 @@ import com.kestrel.domain.model.ActorCredit
 import com.kestrel.domain.model.Episode
 import com.kestrel.domain.model.MediaDetails
 import com.kestrel.domain.model.MediaSummary
+import com.kestrel.domain.model.ProviderServerProgress
 import com.kestrel.domain.model.SeasonInfo
 import com.kestrel.domain.model.StreamSource
 import com.kestrel.domain.model.TrailerInfo
@@ -122,6 +126,12 @@ fun DetailsScreen(
     var showMorePlot by remember { mutableStateOf(false) }
     var usePosterEpisodeCards by remember { mutableStateOf(true) }
     var showMoreSheet by remember { mutableStateOf(false) }
+
+    LaunchedEffect(state.autoPlayEvent) {
+        if (state.autoPlayEvent > 0) {
+            onPlayStarted()
+        }
+    }
 
     KestrelBackground(
         modifier = modifier.fillMaxSize(),
@@ -550,19 +560,92 @@ fun DetailsScreen(
             }
         }
 
-        val resolved = state.resolvedLinks
-        if (resolved != null && resolved.streams.isNotEmpty()) {
+        if (state.isSourceSheetOpen) {
             ModalBottomSheet(
                 onDismissRequest = viewModel::dismissSourcePicker,
                 containerColor = Color(0xEB10141F)
             ) {
                 SourcePickerSheet(
-                    streams = resolved.streams,
+                    title = state.details?.title ?: "Select Stream Source",
+                    episode = state.resolvingEpisode,
+                    streams = state.resolvedLinks?.streams.orEmpty(),
+                    providers = state.serverSearchProgress,
+                    selectedProviderId = state.selectedServerFilterProviderId,
+                    isResolving = state.isResolvingLinks,
+                    completedCount = state.completedServerCount,
+                    totalCount = state.totalServerCount,
+                    linkError = state.linkError,
+                    onSelectFilter = viewModel::selectServerFilter,
+                    onRefresh = viewModel::refreshStreams,
                     onSelect = { source ->
                         viewModel.startPlayback(source)
                         onPlayStarted()
                     }
                 )
+            }
+        }
+
+        if (state.isAskWhereToPlayOpen && state.details != null) {
+            val d = state.details!!
+            ModalBottomSheet(
+                onDismissRequest = viewModel::dismissAskWhereToPlay,
+                containerColor = Color(0xEB10141F)
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 20.dp)
+                        .padding(bottom = 28.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Text(
+                        text = "Where to search servers",
+                        style = MaterialTheme.typography.titleLarge,
+                        color = colors.textPrimary
+                    )
+                    Text(
+                        text = "Choose whether to search all enabled extensions or only ${d.providerName}.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = colors.textSecondary
+                    )
+                    KestrelCard(
+                        onClick = { viewModel.confirmAskWhereToPlay(onlyOriginProvider = false) },
+                        modifier = Modifier.fillMaxWidth(),
+                        highlighted = true,
+                        contentPadding = PaddingValues(16.dp)
+                    ) {
+                        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Text(
+                                text = "All Enabled Servers",
+                                style = MaterialTheme.typography.titleMedium,
+                                color = colors.textPrimary
+                            )
+                            Text(
+                                text = "Search across Nuvio, Stremio & CloudStream per your Servers settings",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = colors.textSecondary
+                            )
+                        }
+                    }
+                    KestrelCard(
+                        onClick = { viewModel.confirmAskWhereToPlay(onlyOriginProvider = true) },
+                        modifier = Modifier.fillMaxWidth(),
+                        contentPadding = PaddingValues(16.dp)
+                    ) {
+                        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Text(
+                                text = "Only ${d.providerName}",
+                                style = MaterialTheme.typography.titleMedium,
+                                color = colors.textPrimary
+                            )
+                            Text(
+                                text = "Resolve streams strictly from the origin extension",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = colors.textSecondary
+                            )
+                        }
+                    }
+                }
             }
         }
 
@@ -603,7 +686,12 @@ fun DetailsScreen(
                     KestrelCard(
                         onClick = {
                             showMoreSheet = false
-                            viewModel.resolveForPlay(null)
+                            val ep = d.episodes.firstOrNull { it.id == state.libraryEntry?.lastEpisodeId }
+                                ?: d.episodes.firstOrNull()
+                            viewModel.resolveForPlay(
+                                episode = ep,
+                                forceShowSheet = true
+                            )
                         },
                         modifier = Modifier.fillMaxWidth(),
                         contentPadding = PaddingValues(14.dp)
@@ -1277,10 +1365,41 @@ private fun ShowDetailsTable(
 
 @Composable
 private fun SourcePickerSheet(
+    title: String,
+    episode: Episode?,
     streams: List<StreamSource>,
+    providers: List<ProviderServerProgress>,
+    selectedProviderId: String?,
+    isResolving: Boolean,
+    completedCount: Int,
+    totalCount: Int,
+    linkError: String?,
+    onSelectFilter: (String?) -> Unit,
+    onRefresh: () -> Unit,
     onSelect: (StreamSource) -> Unit
 ) {
     val colors = KestrelTheme.colors
+    val visibleStreams = remember(streams, selectedProviderId) {
+        if (selectedProviderId == null) streams
+        else streams.filter { it.providerId == selectedProviderId }
+    }
+    val filterProviders = remember(providers) {
+        providers.filter { it.isFetching || it.streams.isNotEmpty() }
+    }
+    val subtitleText = buildString {
+        if (episode != null) {
+            if (episode.season != null && episode.episodeNumber != null) {
+                append("S${episode.season}E${episode.episodeNumber} • ")
+            }
+            append(episode.name)
+            append(" • ")
+        }
+        append("${streams.size} server(s)")
+        if (totalCount > 0) {
+            append(" • $completedCount/$totalCount checked")
+        }
+    }
+
     LazyColumn(
         modifier = Modifier
             .fillMaxWidth()
@@ -1288,14 +1407,123 @@ private fun SourcePickerSheet(
         contentPadding = PaddingValues(bottom = 28.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
-        item {
-            Text(
-                text = "Select Stream Source (${streams.size})",
-                style = MaterialTheme.typography.titleLarge,
-                color = colors.textPrimary
-            )
+        item(key = "sheet_header") {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text(
+                        text = title,
+                        style = MaterialTheme.typography.titleLarge,
+                        color = colors.textPrimary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Text(
+                        text = subtitleText,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = colors.textSecondary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+                GlassCircleButton(
+                    icon = Icons.Outlined.Refresh,
+                    contentDescription = "Refresh servers",
+                    onClick = onRefresh,
+                    diameter = 38.dp
+                )
+            }
         }
-        items(streams, key = { it.id }) { source ->
+
+        if (filterProviders.isNotEmpty()) {
+            item(key = "provider_filters") {
+                LazyRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    item(key = "filter_all") {
+                        GlassChip(
+                            text = "All (${streams.size})",
+                            selected = selectedProviderId == null,
+                            onClick = { onSelectFilter(null) }
+                        )
+                    }
+                    items(filterProviders, key = { it.providerId }) { prov ->
+                        val suffix = if (prov.isFetching) "…" else "${prov.streams.size}"
+                        GlassChip(
+                            text = "${prov.providerName} ($suffix)",
+                            selected = selectedProviderId == prov.providerId,
+                            onClick = { onSelectFilter(prov.providerId) }
+                        )
+                    }
+                }
+            }
+        }
+
+        if (isResolving) {
+            item(key = "resolving_banner") {
+                KestrelCard(
+                    modifier = Modifier.fillMaxWidth(),
+                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 12.dp)
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(18.dp),
+                            strokeWidth = 2.dp,
+                            color = colors.accentAmber
+                        )
+                        Text(
+                            text = if (totalCount > 0) {
+                                "Checking more extensions ($completedCount/$totalCount)..."
+                            } else {
+                                "Searching servers..."
+                            },
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = colors.textSecondary
+                        )
+                    }
+                }
+            }
+        }
+
+        if (visibleStreams.isEmpty() && !isResolving) {
+            item(key = "empty_streams") {
+                KestrelCard(
+                    modifier = Modifier.fillMaxWidth(),
+                    contentPadding = PaddingValues(16.dp)
+                ) {
+                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Outlined.ErrorOutline,
+                                contentDescription = null,
+                                tint = colors.statusError
+                            )
+                            Text(
+                                text = linkError ?: "No playable streams found",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = colors.statusError
+                            )
+                        }
+                        KestrelPrimaryButton(
+                            text = "Retry Server Search",
+                            onClick = onRefresh
+                        )
+                    }
+                }
+            }
+        }
+
+        items(visibleStreams, key = { it.id }) { source ->
             KestrelCard(
                 onClick = { onSelect(source) },
                 modifier = Modifier.fillMaxWidth(),
@@ -1317,7 +1545,9 @@ private fun SourcePickerSheet(
                         Text(
                             text = source.providerName,
                             style = MaterialTheme.typography.bodyMedium,
-                            color = colors.textSecondary
+                            color = colors.textSecondary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
                         )
                     }
                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -1327,6 +1557,36 @@ private fun SourcePickerSheet(
                             container = colors.accentAmberDim
                         )
                         SourceBadge(label = source.format.name)
+                    }
+                }
+            }
+        }
+
+        val fetchingProviders = providers.filter { it.isFetching }
+        if (fetchingProviders.isNotEmpty() && visibleStreams.isNotEmpty()) {
+            item(key = "fetching_footer") {
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    fetchingProviders.take(4).forEach { prov ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 4.dp, vertical = 2.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text(
+                                text = prov.providerName,
+                                style = MaterialTheme.typography.labelLarge,
+                                color = colors.textSecondary,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Text(
+                                text = "Fetching...",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = colors.accentTeal
+                            )
+                        }
                     }
                 }
             }

@@ -157,7 +157,10 @@ class StremioAdapter(
         }
 
     override suspend fun getLinks(data: String): Result<ResolvedLinks> =
-        sandbox.execute(pluginId, timeoutMs = 25_000L) {
+        getLinks(data = data, timeoutMs = 25_000L)
+
+    override suspend fun getLinks(data: String, timeoutMs: Long): Result<ResolvedLinks> =
+        sandbox.execute(pluginId, timeoutMs = timeoutMs.coerceAtLeast(5_000L)) {
             val (type, id) = parseMetaToken(data)
             val response = client.fetchStreams(baseUrl, type, id, customHeaders())
             val streams = mutableListOf<StreamSource>()

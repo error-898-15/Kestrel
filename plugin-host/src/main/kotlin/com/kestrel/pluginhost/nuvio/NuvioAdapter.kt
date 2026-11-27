@@ -295,15 +295,19 @@ class NuvioAdapter(
         val id = parts.getOrNull(1).orEmpty().ifBlank { url }
         val hintTmdb = parts.getOrNull(2)?.takeIf { it.isNotBlank() }
 
+        val tmdbApiKey = buildProfile().customTmdbApiKey
         val meta = catalogClient.fetchMeta(type, id)
         if (meta != null) {
             val resolvedTmdb = meta.moviedbId
                 ?: hintTmdb
-                ?: if (id.startsWith("tt", ignoreCase = true)) {
-                    catalogClient.resolveArmIds("imdb", id).first
-                } else {
-                    null
-                }
+                ?: catalogClient.resolveExternalIds(
+                    title = meta.name,
+                    year = meta.releaseInfo?.take(4)?.toIntOrNull(),
+                    mediaType = mapCinemetaType(meta.type),
+                    rawMediaUrl = url,
+                    originDataUrl = meta.id,
+                    tmdbApiKey = tmdbApiKey
+                ).tmdbId
             return buildDetailsFromMeta(meta = meta, rawUrl = url, tmdbOrFallback = resolvedTmdb ?: meta.id)
         }
 
@@ -311,7 +315,13 @@ class NuvioAdapter(
         val cleanId = id.removePrefix("tmdb:").removePrefix("tmdb_")
         val resolvedTmdb = hintTmdb ?: when {
             cleanId.all(Char::isDigit) -> cleanId
-            id.startsWith("tt", ignoreCase = true) -> catalogClient.resolveArmIds("imdb", id).first
+            id.startsWith("tt", ignoreCase = true) -> catalogClient.resolveExternalIds(
+                title = "",
+                mediaType = mapCinemetaType(type),
+                rawMediaUrl = url,
+                originDataUrl = id,
+                tmdbApiKey = tmdbApiKey
+            ).tmdbId
             else -> null
         } ?: cleanId
         val mediaKind = if (type.equals("movie", ignoreCase = true)) "movie" else "tv"
@@ -370,7 +380,10 @@ class NuvioAdapter(
     }
 
     override suspend fun getLinks(data: String): Result<ResolvedLinks> =
-        sandbox.execute(pluginId, timeoutMs = 30_000L) {
+        getLinks(data = data, timeoutMs = 30_000L)
+
+    override suspend fun getLinks(data: String, timeoutMs: Long): Result<ResolvedLinks> =
+        sandbox.execute(pluginId, timeoutMs = timeoutMs.coerceAtLeast(5_000L)) {
             val filePath = plugin.localFilePath ?: error("Nuvio scraper file is not installed")
             val scriptCode = File(filePath).readText()
             val target = parseTarget(data)
@@ -382,7 +395,8 @@ class NuvioAdapter(
                 tmdbId = target.tmdbId,
                 mediaType = target.mediaType,
                 season = target.season,
-                episode = target.episode
+                episode = target.episode,
+                timeoutMs = (timeoutMs - 1_500L).coerceAtLeast(4_000L)
             )
             if (output.has("error") && !output.has("streams")) {
                 error(output.optString("error"))
@@ -395,9 +409,17 @@ class NuvioAdapter(
             if (streamsArr != null) {
                 for (i in 0 until streamsArr.length()) {
                     val obj = streamsArr.optJSONObject(i) ?: continue
-                    val streamUrl = listOf("url", "proxy_url", "file", "link")
-                        .firstNotNullOfOrNull { key -> obj.optString(key).takeIf { it.isNotBlank() } }
+                    val streamUrl = listOf("url", "streamUrl", "stream", "proxy_url", "file", "link", "src", "videoUrl")
+                        .firstNotNullOfOrNull { key ->
+                            if (!obj.isNull(key)) obj.optString(key).trim().takeIf { it.isNotBlank() } else null
+                        }
                         ?: continue
+
+                    if (!streamUrl.startsWith("http://", ignoreCase = true) &&
+                        !streamUrl.startsWith("https://", ignoreCase = true)
+                    ) {
+                        continue
+                    }
 
                     val mergedHeaders = LinkedHashMap<String, String>()
                     obj.optJSONObject("headers")?.toStringMap()?.let { mergedHeaders.putAll(it) }
@@ -406,68 +428,114 @@ class NuvioAdapter(
                     hints?.optJSONObject("proxyHeaders")?.optJSONObject("request")?.toStringMap()?.let {
                         mergedHeaders.putAll(it)
                     }
-
-                    val qualityLabel = obj.optString("quality")
-                        .ifBlank { obj.optString("title") }
-                        .ifBlank { obj.optString("name") }
-                        .ifBlank { "Auto" }
-
-                    val qualityScore = when {
-                        qualityLabel.contains("4K", ignoreCase = true) ||
-                            qualityLabel.contains("2160", ignoreCase = true) -> 2160
-                        else -> Regex("(\\d{3,4})p", RegexOption.IGNORE_CASE)
-                            .find(qualityLabel)?.groupValues?.get(1)?.toIntOrNull() ?: 0
-                    }
-
-                    val lowerUrl = streamUrl.lowercase()
-                    val format = when {
-                        ".m3u8" in lowerUrl || obj.optString("type").equals("hls", ignoreCase = true) -> StreamFormat.HLS
-                        ".mpd" in lowerUrl || obj.optString("type").equals("dash", ignoreCase = true) -> StreamFormat.DASH
-                        ".mp4" in lowerUrl || ".mkv" in lowerUrl -> StreamFormat.MP4
-                        else -> StreamFormat.OTHER
-                    }
-
-                    val itemSubs = obj.optJSONArray("subtitles")
-                    if (itemSubs != null) {
-                        for (s in 0 until itemSubs.length()) {
-                            val subObj = itemSubs.optJSONObject(s) ?: continue
-                            val subUrl = subObj.optString("url").ifBlank { subObj.optString("file") }
-                            if (subUrl.isNotBlank()) {
-                                val lang = subObj.optString("lang")
-                                    .ifBlank { subObj.optString("language") }
-                                    .ifBlank { "und" }
-                                subtitles.add(
-                                    SubtitleTrack(
-                                        url = subUrl,
-                                        language = lang,
-                                        label = subObj.optString("label").ifBlank { lang }
-                                    )
-                                )
+                    listOf("referer", "Referer", "referrer").forEach { rk ->
+                        if (!obj.isNull(rk)) {
+                            val rv = obj.optString(rk).trim()
+                            if (rv.isNotBlank() && mergedHeaders.keys.none { it.equals("referer", ignoreCase = true) }) {
+                                mergedHeaders["Referer"] = rv
                             }
                         }
                     }
+                    if (!obj.isNull("origin")) {
+                        val ov = obj.optString("origin").trim()
+                        if (ov.isNotBlank() && mergedHeaders.keys.none { it.equals("origin", ignoreCase = true) }) {
+                            mergedHeaders["Origin"] = ov
+                        }
+                    }
+                    listOf("userAgent", "user-agent", "User-Agent").forEach { uk ->
+                        if (!obj.isNull(uk)) {
+                            val uv = obj.optString(uk).trim()
+                            if (uv.isNotBlank() && mergedHeaders.keys.none { it.equals("user-agent", ignoreCase = true) }) {
+                                mergedHeaders["User-Agent"] = uv
+                            }
+                        }
+                    }
+
+                    val rawQuality = listOf("quality", "resolution", "label", "title", "name")
+                        .firstNotNullOfOrNull { k ->
+                            if (!obj.isNull(k)) obj.optString(k).trim().takeIf { it.isNotBlank() } else null
+                        }.orEmpty()
+
+                    val combinedSearchText = listOfNotNull(
+                        rawQuality,
+                        obj.optString("title").takeIf { !obj.isNull("title") },
+                        obj.optString("name").takeIf { !obj.isNull("name") },
+                        obj.optString("description").takeIf { !obj.isNull("description") }
+                    ).joinToString(" ")
+
+                    val qualityScore = when {
+                        combinedSearchText.contains("4K", ignoreCase = true) ||
+                            combinedSearchText.contains("2160", ignoreCase = true) -> 2160
+                        else -> Regex("(\\d{3,4})p", RegexOption.IGNORE_CASE)
+                            .find(combinedSearchText)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+                    }
+                    val qualityLabel = when {
+                        !obj.isNull("quality") && obj.optString("quality").isNotBlank() -> obj.optString("quality").trim()
+                        qualityScore >= 2160 -> "2160p"
+                        qualityScore > 0 -> "${qualityScore}p"
+                        else -> "Auto"
+                    }
+
+                    val lowerUrl = streamUrl.lowercase()
+                    val declaredType = listOf("type", "format")
+                        .firstNotNullOfOrNull { k -> if (!obj.isNull(k)) obj.optString(k).lowercase() else null }
+                        .orEmpty()
+                    val format = when {
+                        ".m3u8" in lowerUrl || "m3u8" in declaredType || declaredType == "hls" -> StreamFormat.HLS
+                        ".mpd" in lowerUrl || "mpd" in declaredType || declaredType == "dash" -> StreamFormat.DASH
+                        ".mp4" in lowerUrl || ".mkv" in lowerUrl || ".webm" in lowerUrl || declaredType == "mp4" -> StreamFormat.MP4
+                        else -> StreamFormat.OTHER
+                    }
+
+                    val itemSubsList = mutableListOf<SubtitleTrack>()
+                    listOf("subtitles", "captions", "tracks").forEach { subKey ->
+                        val itemSubs = obj.optJSONArray(subKey)
+                        if (itemSubs != null) {
+                            for (s in 0 until itemSubs.length()) {
+                                val subObj = itemSubs.optJSONObject(s) ?: continue
+                                val subUrl = listOf("url", "file", "src")
+                                    .firstNotNullOfOrNull { k ->
+                                        if (!subObj.isNull(k)) subObj.optString(k).trim().takeIf { it.isNotBlank() } else null
+                                    } ?: continue
+                                val lang = listOf("lang", "language", "srclang")
+                                    .firstNotNullOfOrNull { k ->
+                                        if (!subObj.isNull(k)) subObj.optString(k).trim().takeIf { it.isNotBlank() } else null
+                                    } ?: "und"
+                                val label = if (!subObj.isNull("label")) subObj.optString("label").ifBlank { lang } else lang
+                                val track = SubtitleTrack(url = subUrl, language = lang, label = label)
+                                itemSubsList.add(track)
+                                subtitles.add(track)
+                            }
+                        }
+                    }
+
+                    val rawTitle = if (!obj.isNull("title")) obj.optString("title").trim() else ""
+                    val rawName = if (!obj.isNull("name")) obj.optString("name").trim() else ""
+                    val rawServer = if (!obj.isNull("server")) obj.optString("server").trim() else ""
+                    val extractorLabel = listOf(rawTitle, rawName, rawServer)
+                        .firstOrNull { it.isNotBlank() && !it.equals(name, ignoreCase = true) }
+                        ?: rawName.ifBlank { rawServer }.ifBlank { name }
 
                     streams.add(
                         StreamSource(
                             id = stableId("$providerId:$streamUrl:$i"),
                             providerId = providerId,
                             providerName = name,
-                            extractorName = obj.optString("name")
-                                .ifBlank { obj.optString("server") }
-                                .ifBlank { name },
+                            extractorName = extractorLabel,
                             url = streamUrl,
                             qualityLabel = qualityLabel,
                             qualityScore = qualityScore,
                             format = format,
                             headers = mergedHeaders,
-                            referer = mergedHeaders["Referer"] ?: mergedHeaders["referer"]
+                            referer = mergedHeaders["Referer"] ?: mergedHeaders["referer"],
+                            subtitles = itemSubsList
                         )
                     )
                 }
             }
 
             ResolvedLinks(
-                streams = streams.sortedByDescending { it.qualityScore },
+                streams = streams.distinctBy { it.url }.sortedByDescending { it.qualityScore },
                 subtitles = subtitles.distinctBy { it.url }
             )
         }
@@ -617,8 +685,10 @@ class NuvioAdapter(
     private fun JSONObject.toStringMap(): Map<String, String> {
         val out = mutableMapOf<String, String>()
         keys().forEach { k ->
-            val v = optString(k)
-            if (v.isNotBlank()) out[k] = v
+            if (!isNull(k)) {
+                val v = optString(k).trim()
+                if (v.isNotBlank()) out[k] = v
+            }
         }
         return out
     }

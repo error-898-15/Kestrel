@@ -26,4 +26,6 @@ interface SourceProvider {
     suspend fun search(query: String, page: Int = 1): Result<List<MediaSummary>>
     suspend fun load(url: String): Result<MediaDetails>
     suspend fun getLinks(data: String): Result<ResolvedLinks>
+
+    suspend fun getLinks(data: String, timeoutMs: Long): Result<ResolvedLinks> = getLinks(data)
 }

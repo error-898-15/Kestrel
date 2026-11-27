@@ -7,12 +7,14 @@ import com.kestrel.data.local.KestrelDatabase
 import com.kestrel.data.local.LibraryDao
 import com.kestrel.data.local.PluginDao
 import com.kestrel.data.local.RepoDao
+import com.kestrel.data.preferences.AppPreferences
 import com.kestrel.data.repository.CatalogRepositoryImpl
 import com.kestrel.data.repository.ExtensionRepositoryImpl
 import com.kestrel.data.repository.LibraryRepositoryImpl
 import com.kestrel.domain.repository.CatalogRepository
 import com.kestrel.domain.repository.ExtensionRepository
 import com.kestrel.domain.repository.LibraryRepository
+import com.kestrel.domain.repository.SettingsRepository
 import dagger.Binds
 import dagger.Module
 import dagger.Provides
@@ -35,6 +37,10 @@ abstract class DataBindModule {
     @Binds
     @Singleton
     abstract fun bindLibraryRepository(impl: LibraryRepositoryImpl): LibraryRepository
+
+    @Binds
+    @Singleton
+    abstract fun bindSettingsRepository(impl: AppPreferences): SettingsRepository
 }
 
 @Module
@@ -44,7 +50,7 @@ object DataProvideModule {
     @Provides
     @Singleton
     fun provideDatabase(@ApplicationContext context: Context): KestrelDatabase =
-        Room.databaseBuilder(context, KestrelDatabase::class.java, "kestrel.db")
+        Room.databaseBuilder(context, KestrelDatabase.class.java, "kestrel.db")
             .fallbackToDestructiveMigration()
             .build()
 

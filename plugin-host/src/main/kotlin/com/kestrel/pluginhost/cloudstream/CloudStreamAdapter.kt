@@ -118,7 +118,10 @@ class CloudStreamAdapter(
         }
 
     override suspend fun getLinks(data: String): Result<ResolvedLinks> =
-        sandbox.execute(pluginId = pluginId, timeoutMs = 35_000L) {
+        getLinks(data = data, timeoutMs = 35_000L)
+
+    override suspend fun getLinks(data: String, timeoutMs: Long): Result<ResolvedLinks> =
+        sandbox.execute(pluginId = pluginId, timeoutMs = timeoutMs.coerceAtLeast(5_000L)) {
             val collectedStreams = Collections.synchronizedList(mutableListOf<StreamSource>())
             val collectedSubtitles = Collections.synchronizedList(mutableListOf<SubtitleTrack>())
             api.loadLinks(

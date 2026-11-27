@@ -4,7 +4,10 @@ package com.kestrel.domain.repository
 import com.kestrel.domain.model.CatalogRow
 import com.kestrel.domain.model.MediaDetails
 import com.kestrel.domain.model.MediaSummary
+import com.kestrel.domain.model.MultiServerResolutionUpdate
 import com.kestrel.domain.model.ResolvedLinks
+import com.kestrel.domain.model.ServerSearchSettings
+import com.kestrel.domain.model.ServerSearchTarget
 import com.kestrel.domain.provider.SourceProvider
 import kotlinx.coroutines.flow.Flow
 
@@ -45,4 +48,10 @@ interface CatalogRepository {
 
     suspend fun loadDetails(providerId: String, url: String): Result<MediaDetails>
     suspend fun resolveLinks(providerId: String, dataUrl: String): Result<ResolvedLinks>
+
+    fun resolveLinksMultiServer(
+        target: ServerSearchTarget,
+        settings: ServerSearchSettings,
+        onlyOriginProvider: Boolean = false
+    ): Flow<MultiServerResolutionUpdate>
 }

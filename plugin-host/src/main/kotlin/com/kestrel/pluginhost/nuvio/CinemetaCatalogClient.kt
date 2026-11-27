@@ -19,6 +19,7 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import org.jsoup.Jsoup
 import java.net.URLEncoder
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
@@ -66,6 +67,11 @@ data class CinemetaMetaDetail(
     val genres: List<String>,
     val cast: List<String>,
     val videos: List<CinemetaVideoItem>
+)
+
+data class ResolvedExternalIds(
+    val tmdbId: String? = null,
+    val imdbId: String? = null
 )
 
 enum class NuvioNiche {
@@ -136,7 +142,8 @@ class CinemetaCatalogClient @Inject constructor(
     private val providerCatalogCache = ConcurrentHashMap<String, CachedCatalogs>()
     private val endpointCache = ConcurrentHashMap<String, CachedEndpoint>()
     private val metaCache = ConcurrentHashMap<String, CinemetaMetaDetail>()
-    private val armTmdbCache = ConcurrentHashMap<String, Pair<String?, String?>>() // key -> (tmdbId, imdbId)
+    private val armTmdbCache = ConcurrentHashMap<String, Pair<String?, String?>>()
+    private val externalIdCache = ConcurrentHashMap<String, ResolvedExternalIds>() // key -> (tmdbId, imdbId)
 
     @Volatile
     private var cachedDefaultCatalogs: CachedCatalogs? = null
@@ -324,9 +331,18 @@ class CinemetaCatalogClient @Inject constructor(
         }
 
         val resolvedId = metaObj.str("id") ?: id
+        val resolvedTitle = metaObj.str("name") ?: id
+        val resolvedYear = (metaObj.str("releaseInfo") ?: metaObj.primitiveStr("year"))?.take(4)?.toIntOrNull()
+        val resolvedTypeStr = metaObj.str("type") ?: type
         var moviedbId = metaObj.primitiveStr("moviedb_id")
         if (moviedbId.isNullOrBlank() && resolvedId.startsWith("tt", ignoreCase = true)) {
-            moviedbId = resolveArmIds("imdb", resolvedId).first
+            moviedbId = resolveTmdbIdForImdb(
+                imdbId = resolvedId,
+                title = resolvedTitle,
+                year = resolvedYear,
+                isMovie = resolvedTypeStr.equals("movie", ignoreCase = true),
+                tmdbApiKey = null
+            )
         }
 
         val detail = CinemetaMetaDetail(
@@ -517,6 +533,371 @@ class CinemetaCatalogClient @Inject constructor(
         armTmdbCache[key] = pair
         return pair
     }
+
+    /**
+     * Resolves numeric TMDB ID and IMDb ID (`tt...`) for any movie, series, or anime
+     * regardless of which provider family (CloudStream, Nuvio, Stremio) opened the title.
+     */
+    suspend fun resolveExternalIds(
+        title: String,
+        year: Int? = null,
+        mediaType: MediaType = MediaType.MOVIE,
+        rawMediaUrl: String? = null,
+        originDataUrl: String? = null,
+        tmdbApiKey: String? = null
+    ): ResolvedExternalIds {
+        val isMovie = mediaType == MediaType.MOVIE
+        val hints = listOfNotNull(originDataUrl, rawMediaUrl)
+
+        var imdbId: String? = hints.firstNotNullOfOrNull { s ->
+            Regex("(tt\\d{5,12})", RegexOption.IGNORE_CASE).find(s)?.groupValues?.get(1)
+        }
+        var tmdbId: String? = null
+
+        for (s in hints) {
+            when {
+                s.startsWith("tmdb:", ignoreCase = true) -> {
+                    val seg = s.removePrefix("tmdb:").substringBefore(":").trim()
+                    if (seg.all(Char::isDigit) && seg.isNotEmpty()) tmdbId = seg
+                }
+                s.startsWith("tmdbmeta:", ignoreCase = true) -> {
+                    val seg = s.split(":").getOrNull(2)?.trim()
+                    if (!seg.isNullOrBlank() && seg.all(Char::isDigit)) tmdbId = seg
+                }
+                s.startsWith("cinemeta:", ignoreCase = true) -> {
+                    val parts = s.split(":")
+                    val seg = parts.getOrNull(2)?.trim()
+                    if (!seg.isNullOrBlank() && seg.all(Char::isDigit)) tmdbId = seg
+                }
+                s.startsWith("anilist:", ignoreCase = true) -> {
+                    val parts = s.split(":")
+                    val aniId = parts.getOrNull(1)?.trim().orEmpty()
+                    val hint = parts.getOrNull(2)?.trim()
+                    if (!hint.isNullOrBlank() && hint.all(Char::isDigit)) tmdbId = hint
+                    if ((tmdbId == null || imdbId == null) && aniId.isNotBlank()) {
+                        val (armT, armI) = resolveArmIds("anilist", aniId)
+                        if (tmdbId == null) tmdbId = armT
+                        if (imdbId == null) imdbId = armI
+                    }
+                }
+                s.startsWith("kitsu:", ignoreCase = true) -> {
+                    val parts = s.split(":")
+                    val kId = parts.getOrNull(1)?.removePrefix("kitsu:")?.trim().orEmpty()
+                    val hint = parts.getOrNull(2)?.trim()
+                    if (!hint.isNullOrBlank() && hint.all(Char::isDigit)) tmdbId = hint
+                    if ((tmdbId == null || imdbId == null) && kId.isNotBlank()) {
+                        val (armT, armI) = resolveArmIds("kitsu", kId)
+                        if (tmdbId == null) tmdbId = armT
+                        if (imdbId == null) imdbId = armI
+                    }
+                }
+            }
+            if (tmdbId != null && imdbId != null) break
+        }
+
+        val cleanTitle = cleanSearchTitle(title)
+        val cacheKey = listOf(
+            imdbId.orEmpty(),
+            tmdbId.orEmpty(),
+            cleanTitle.lowercase(Locale.US),
+            year?.toString().orEmpty(),
+            mediaType.name
+        ).joinToString("|")
+        externalIdCache[cacheKey]?.let { cached ->
+            if (!cached.tmdbId.isNullOrBlank() && !cached.imdbId.isNullOrBlank()) return cached
+        }
+
+        // 1. If we don't have an IMDb ID yet, search Cinemeta & IMDb suggestion API
+        if (imdbId == null && cleanTitle.isNotBlank()) {
+            val cmMatch = findBestCinemetaMatch(cleanTitle, year, isMovie)
+            if (cmMatch != null) {
+                imdbId = cmMatch.id.takeIf { it.startsWith("tt", ignoreCase = true) }
+                if (tmdbId == null) {
+                    tmdbId = cmMatch.moviedbId?.takeIf { it.all(Char::isDigit) }
+                }
+            }
+            if (imdbId == null) {
+                imdbId = searchImdbSuggestionId(cleanTitle, year, isMovie)
+            }
+        }
+
+        // 2. If we have an IMDb ID (or title) and still need numeric TMDB ID
+        if (tmdbId == null && imdbId != null) {
+            tmdbId = resolveTmdbIdForImdb(
+                imdbId = imdbId,
+                title = cleanTitle,
+                year = year,
+                isMovie = isMovie,
+                tmdbApiKey = tmdbApiKey
+            )
+        }
+
+        // 3. Fallback: direct TMDB search by title (+ year) without requiring an IMDb ID
+        if (tmdbId == null && cleanTitle.isNotBlank()) {
+            tmdbId = if (!tmdbApiKey.isNullOrBlank()) {
+                searchTmdbApiByTitle(cleanTitle, year, isMovie, tmdbApiKey)
+            } else {
+                null
+            } ?: searchTmdbWebByTitle(cleanTitle, year, isMovie)
+        }
+
+        // 4. If we have TMDB ID and still need IMDb ID (so Stremio addons work too)
+        if (imdbId == null && tmdbId != null) {
+            imdbId = resolveImdbIdForTmdb(
+                tmdbId = tmdbId,
+                title = cleanTitle,
+                year = year,
+                isMovie = isMovie,
+                tmdbApiKey = tmdbApiKey
+            )
+        }
+
+        val resolved = ResolvedExternalIds(tmdbId = tmdbId, imdbId = imdbId)
+        if (tmdbId != null || imdbId != null) {
+            externalIdCache[cacheKey] = resolved
+        }
+        return resolved
+    }
+
+    private suspend fun resolveTmdbIdForImdb(
+        imdbId: String,
+        title: String,
+        year: Int?,
+        isMovie: Boolean,
+        tmdbApiKey: String?
+    ): String? {
+        if (!tmdbApiKey.isNullOrBlank()) {
+            val apiHit = findTmdbIdByImdbApi(imdbId, isMovie, tmdbApiKey)
+            if (!apiHit.isNullOrBlank()) return apiHit
+        }
+
+        // Check Cinemeta meta directly (often carries moviedb_id)
+        val cmType = if (isMovie) "movie" else "series"
+        val cmRaw = runCatching { get("$CINEMETA_BASE_URL/meta/$cmType/${encode(imdbId)}.json") }.getOrNull()
+        if (!cmRaw.isNullOrBlank()) {
+            val metaObj = runCatching {
+                json.parseToJsonElement(cmRaw).jsonObject["meta"] as? JsonObject
+            }.getOrNull()
+            val cmTmdb = metaObj?.primitiveStr("moviedb_id")?.takeIf { it.all(Char::isDigit) }
+            if (!cmTmdb.isNullOrBlank()) return cmTmdb
+        }
+
+        // Wikidata SPARQL lookup: P345 (IMDb) -> P4947 (TMDB movie) / P4983 (TMDB TV)
+        val wikidataHit = queryWikidataTmdbByImdb(imdbId, isMovie)
+        if (!wikidataHit.isNullOrBlank()) return wikidataHit
+
+        // Anime fallback (ARM)
+        val armHit = resolveArmIds("imdb", imdbId).first
+        if (!armHit.isNullOrBlank()) return armHit
+
+        // Public TMDB web search fallback (works without API key for all movies & TV shows)
+        if (title.isNotBlank()) {
+            return searchTmdbWebByTitle(title, year, isMovie)
+        }
+        return null
+    }
+
+    private suspend fun resolveImdbIdForTmdb(
+        tmdbId: String,
+        title: String,
+        year: Int?,
+        isMovie: Boolean,
+        tmdbApiKey: String?
+    ): String? {
+        if (!tmdbApiKey.isNullOrBlank()) {
+            val kind = if (isMovie) "movie" else "tv"
+            val url = "https://api.themoviedb.org/3/$kind/${encode(tmdbId)}/external_ids?api_key=${encode(tmdbApiKey)}"
+            val raw = runCatching { get(url) }.getOrNull()
+            if (!raw.isNullOrBlank()) {
+                val imdb = runCatching {
+                    json.parseToJsonElement(raw).jsonObject.str("imdb_id")
+                }.getOrNull()
+                if (!imdb.isNullOrBlank() && imdb.startsWith("tt", ignoreCase = true)) return imdb
+            }
+        }
+        val wikidataImdb = queryWikidataImdbByTmdb(tmdbId, isMovie)
+        if (!wikidataImdb.isNullOrBlank()) return wikidataImdb
+        if (title.isNotBlank()) {
+            val cm = findBestCinemetaMatch(title, year, isMovie)
+            if (cm != null && cm.id.startsWith("tt", ignoreCase = true)) return cm.id
+            return searchImdbSuggestionId(title, year, isMovie)
+        }
+        return null
+    }
+
+    private suspend fun findTmdbIdByImdbApi(imdbId: String, isMovie: Boolean, apiKey: String): String? {
+        val url = "https://api.themoviedb.org/3/find/${encode(imdbId)}?api_key=${encode(apiKey)}&external_source=imdb_id"
+        val raw = runCatching { get(url) }.getOrNull() ?: return null
+        val root = runCatching { json.parseToJsonElement(raw).jsonObject }.getOrNull() ?: return null
+        val primaryKey = if (isMovie) "movie_results" else "tv_results"
+        val fallbackKey = if (isMovie) "tv_results" else "movie_results"
+        val firstObj = (root[primaryKey] as? JsonArray)?.firstOrNull() as? JsonObject
+            ?: (root[fallbackKey] as? JsonArray)?.firstOrNull() as? JsonObject
+            ?: return null
+        return firstObj.primitiveStr("id")?.takeIf { it.all(Char::isDigit) }
+    }
+
+    private suspend fun searchTmdbApiByTitle(title: String, year: Int?, isMovie: Boolean, apiKey: String): String? {
+        val kind = if (isMovie) "movie" else "tv"
+        val yearParam = if (year != null) {
+            if (isMovie) "&year=$year" else "&first_air_date_year=$year"
+        } else ""
+        val url = "https://api.themoviedb.org/3/search/$kind?api_key=${encode(apiKey)}&query=${encode(title)}$yearParam"
+        val raw = runCatching { get(url) }.getOrNull() ?: return null
+        val arr = runCatching { json.parseToJsonElement(raw).jsonObject["results"] as? JsonArray }.getOrNull()
+            ?: return null
+        val first = arr.firstOrNull() as? JsonObject ?: return null
+        return first.primitiveStr("id")?.takeIf { it.all(Char::isDigit) }
+    }
+
+    private suspend fun searchTmdbWebByTitle(title: String, year: Int?, isMovie: Boolean): String? =
+        withContext(Dispatchers.IO) {
+            val kind = if (isMovie) "movie" else "tv"
+            val q = if (year != null) "$title $year" else title
+            val urls = listOf(
+                "https://www.themoviedb.org/search/$kind?query=${URLEncoder.encode(title, "UTF-8")}",
+                "https://www.themoviedb.org/search/$kind?query=${URLEncoder.encode(q, "UTF-8")}"
+            ).distinct()
+            val normTarget = normalizeTitle(title)
+            for (url in urls) {
+                val html = runCatching { getHtml(url) }.getOrNull() ?: continue
+                val doc = runCatching { Jsoup.parse(html) }.getOrNull() ?: continue
+                val cards = doc.select("div.card.v4, div.card")
+                var bestId: String? = null
+                var bestScore = -1
+                for (card in cards) {
+                    val link = card.selectFirst("a.result[href], a[href^=/$kind/]") ?: continue
+                    val href = link.attr("href")
+                    val idMatch = Regex("^/$kind/(\\d+)").find(href) ?: continue
+                    val candidateId = idMatch.groupValues[1]
+                    val candidateTitle = card.selectFirst("h2")?.text()?.trim()
+                        ?: link.text().trim()
+                    val releaseText = card.selectFirst("span.release_date")?.text()?.trim().orEmpty()
+                    val candidateYear = Regex("(\\d{4})").find(releaseText)?.groupValues?.get(1)?.toIntOrNull()
+                    val normCand = normalizeTitle(candidateTitle)
+                    var score = 0
+                    if (normCand == normTarget) score += 100
+                    else if (normCand.contains(normTarget) || normTarget.contains(normCand)) score += 50
+                    if (year != null && candidateYear != null) {
+                        val diff = kotlin.math.abs(year - candidateYear)
+                        if (diff == 0) score += 40 else if (diff == 1) score += 20
+                    }
+                    if (score > bestScore) {
+                        bestScore = score
+                        bestId = candidateId
+                    }
+                }
+                if (bestId != null) return@withContext bestId
+                // Fallback to first matching link anywhere in search results
+                val anyLink = doc.selectFirst("a[href^=/$kind/]")?.attr("href")
+                val anyId = anyLink?.let { Regex("^/$kind/(\\d+)").find(it)?.groupValues?.get(1) }
+                if (anyId != null) return@withContext anyId
+            }
+            null
+        }
+
+    private suspend fun queryWikidataTmdbByImdb(imdbId: String, isMovie: Boolean): String? {
+        val sparql = "SELECT ?m ?t WHERE { ?i wdt:P345 \"$imdbId\" . OPTIONAL { ?i wdt:P4947 ?m . } OPTIONAL { ?i wdt:P4983 ?t . } } LIMIT 1"
+        val url = "https://query.wikidata.org/sparql?format=json&query=${URLEncoder.encode(sparql, "UTF-8")}"
+        val raw = runCatching { get(url) }.getOrNull() ?: return null
+        val bindings = runCatching {
+            json.parseToJsonElement(raw).jsonObject["results"]?.jsonObject?.get("bindings") as? JsonArray
+        }.getOrNull() ?: return null
+        val row = bindings.firstOrNull() as? JsonObject ?: return null
+        val movieVal = (row["m"] as? JsonObject)?.str("value")?.takeIf { it.all(Char::isDigit) }
+        val tvVal = (row["t"] as? JsonObject)?.str("value")?.takeIf { it.all(Char::isDigit) }
+        return if (isMovie) (movieVal ?: tvVal) else (tvVal ?: movieVal)
+    }
+
+    private suspend fun queryWikidataImdbByTmdb(tmdbId: String, isMovie: Boolean): String? {
+        val prop = if (isMovie) "P4947" else "P4983"
+        val sparql = "SELECT ?imdb WHERE { ?i wdt:$prop \"$tmdbId\" ; wdt:P345 ?imdb . } LIMIT 1"
+        val url = "https://query.wikidata.org/sparql?format=json&query=${URLEncoder.encode(sparql, "UTF-8")}"
+        val raw = runCatching { get(url) }.getOrNull() ?: return null
+        val bindings = runCatching {
+            json.parseToJsonElement(raw).jsonObject["results"]?.jsonObject?.get("bindings") as? JsonArray
+        }.getOrNull() ?: return null
+        val row = bindings.firstOrNull() as? JsonObject ?: return null
+        return (row["imdb"] as? JsonObject)?.str("value")?.takeIf { it.startsWith("tt", ignoreCase = true) }
+    }
+
+    private suspend fun findBestCinemetaMatch(title: String, year: Int?, isMovie: Boolean): CinemetaCatalogItem? {
+        val results = runCatching { search(title) }.getOrDefault(emptyList())
+        if (results.isEmpty()) return null
+        val normTarget = normalizeTitle(title)
+        val expectedType = if (isMovie) "movie" else "series"
+        return results.maxByOrNull { item ->
+            var score = 0
+            val normItem = normalizeTitle(item.name)
+            if (normItem == normTarget) score += 100
+            else if (normItem.contains(normTarget) || normTarget.contains(normItem)) score += 50
+            if (item.type.equals(expectedType, ignoreCase = true)) score += 30
+            val itemYear = item.releaseInfo?.take(4)?.toIntOrNull()
+            if (year != null && itemYear != null) {
+                val diff = kotlin.math.abs(year - itemYear)
+                if (diff == 0) score += 40 else if (diff == 1) score += 15
+            }
+            score
+        }
+    }
+
+    private suspend fun searchImdbSuggestionId(title: String, year: Int?, isMovie: Boolean): String? {
+        val slug = title.lowercase(Locale.US).replace(Regex("[^a-z0-9]+"), "_").trim('_')
+        val firstChar = slug.firstOrNull()?.takeIf { it.isLetterOrDigit() } ?: 'x'
+        val url = "https://v3.sg.media-imdb.com/suggestion/$firstChar/${URLEncoder.encode(slug, "UTF-8")}.json"
+        val raw = runCatching { get(url) }.getOrNull() ?: return null
+        val arr = runCatching { json.parseToJsonElement(raw).jsonObject["d"] as? JsonArray }.getOrNull()
+            ?: return null
+        val normTarget = normalizeTitle(title)
+        var bestId: String? = null
+        var bestScore = -1
+        for (el in arr) {
+            val o = el as? JsonObject ?: continue
+            val id = o.str("id")?.takeIf { it.startsWith("tt", ignoreCase = true) } ?: continue
+            val label = o.str("l").orEmpty()
+            val qid = o.str("qid").orEmpty().lowercase(Locale.US)
+            val y = o.intVal("y")
+            var score = 0
+            val normLabel = normalizeTitle(label)
+            if (normLabel == normTarget) score += 100
+            else if (normLabel.contains(normTarget) || normTarget.contains(normLabel)) score += 50
+            if (isMovie && qid == "movie") score += 25
+            if (!isMovie && (qid == "tvseries" || qid == "tvminiseries")) score += 25
+            if (year != null && y != null) {
+                val diff = kotlin.math.abs(year - y)
+                if (diff == 0) score += 40 else if (diff == 1) score += 15
+            }
+            if (score > bestScore) {
+                bestScore = score
+                bestId = id
+            }
+        }
+        return bestId
+    }
+
+    private suspend fun getHtml(url: String): String = withContext(Dispatchers.IO) {
+        val request = Request.Builder()
+            .url(url)
+            .header("User-Agent", USER_AGENT)
+            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+            .header("Accept-Language", "en-US,en;q=0.9")
+            .get()
+            .build()
+        okHttpClient.newCall(request).execute().use { resp ->
+            if (!resp.isSuccessful) error("HTTP ${resp.code} from $url")
+            resp.body?.string().orEmpty()
+        }
+    }
+
+    private fun cleanSearchTitle(raw: String): String = raw
+        .replace(Regex("\\(\\d{4}\\)"), " ")
+        .replace(Regex("\\[[^\\]]*\\]"), " ")
+        .replace(Regex("\\s+"), " ")
+        .trim()
+
+    private fun normalizeTitle(raw: String): String = raw
+        .lowercase(Locale.US)
+        .replace(Regex("[^a-z0-9]"), "")
 
     private fun selectPoolForNiche(
         niche: NuvioNiche,

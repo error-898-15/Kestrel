@@ -7,10 +7,14 @@ import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.floatPreferencesKey
+import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import com.kestrel.domain.model.ServerSearchSettings
+import com.kestrel.domain.repository.SettingsRepository
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
+import kotlinx.serialization.json.Json
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -18,19 +22,32 @@ private val Context.kestrelDataStore: DataStore<Preferences> by preferencesDataS
 
 @Singleton
 class AppPreferences @Inject constructor(
-    @ApplicationContext private val context: Context
-) {
+    @ApplicationContext private val context: Context,
+    private val json: Json
+) : SettingsRepository {
     private object Keys {
         val DISCLAIMER_ACCEPTED = booleanPreferencesKey("disclaimer_accepted")
         val DEFAULT_SPEED = floatPreferencesKey("default_playback_speed")
+        val SERVER_SEARCH_SETTINGS = stringPreferencesKey("server_search_settings_json")
     }
 
     val disclaimerAccepted: Flow<Boolean> = context.kestrelDataStore.data.map { prefs ->
         prefs[Keys.DISCLAIMER_ACCEPTED] ?: false
     }
 
-    val defaultPlaybackSpeed: Flow<Float> = context.kestrelDataStore.data.map { prefs ->
+    override val defaultPlaybackSpeed: Flow<Float> = context.kestrelDataStore.data.map { prefs ->
         prefs[Keys.DEFAULT_SPEED] ?: 1.0f
+    }
+
+    override val serverSearchSettings: Flow<ServerSearchSettings> = context.kestrelDataStore.data.map { prefs ->
+        val raw = prefs[Keys.SERVER_SEARCH_SETTINGS]
+        if (raw.isNullOrBlank()) {
+            ServerSearchSettings()
+        } else {
+            runCatching {
+                json.decodeFromString(ServerSearchSettings.serializer(), raw)
+            }.getOrDefault(ServerSearchSettings())
+        }
     }
 
     suspend fun acceptDisclaimer() {
@@ -39,15 +56,30 @@ class AppPreferences @Inject constructor(
         }
     }
 
-    suspend fun resetDisclaimer() {
+    override suspend fun resetDisclaimer() {
         context.kestrelDataStore.edit { prefs ->
             prefs[Keys.DISCLAIMER_ACCEPTED] = false
         }
     }
 
-    suspend fun setDefaultPlaybackSpeed(speed: Float) {
+    override suspend fun setDefaultPlaybackSpeed(speed: Float) {
         context.kestrelDataStore.edit { prefs ->
             prefs[Keys.DEFAULT_SPEED] = speed.coerceIn(0.5f, 2.0f)
+        }
+    }
+
+    override suspend fun updateServerSearchSettings(
+        transform: (ServerSearchSettings) -> ServerSearchSettings
+    ) {
+        context.kestrelDataStore.edit { prefs ->
+            val current = prefs[Keys.SERVER_SEARCH_SETTINGS]
+                ?.takeIf { it.isNotBlank() }
+                ?.let { raw ->
+                    runCatching { json.decodeFromString(ServerSearchSettings.serializer(), raw) }.getOrNull()
+                }
+                ?: ServerSearchSettings()
+            val updated = transform(current)
+            prefs[Keys.SERVER_SEARCH_SETTINGS] = json.encodeToString(ServerSearchSettings.serializer(), updated)
         }
     }
 }

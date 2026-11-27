@@ -68,6 +68,7 @@ dependencies {
     implementation(project(":feature-player"))
     implementation(project(":feature-extensions"))
     implementation(project(":feature-library"))
+    implementation(project(":feature-settings"))
 
     coreLibraryDesugaring(libs.desugar.jdk.libs)
 
