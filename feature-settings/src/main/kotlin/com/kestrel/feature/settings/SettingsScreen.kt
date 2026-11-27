@@ -55,13 +55,15 @@ import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material.icons.outlined.Dns
 import androidx.compose.material.icons.outlined.Download
-import androidx.compose.material.icons.outlined.Explore
 import androidx.compose.material.icons.outlined.Extension
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.KeyboardArrowDown
 import androidx.compose.material.icons.outlined.KeyboardArrowUp
 import androidx.compose.material.icons.outlined.Language
-import androidx.compose.material.icons.outlined.PlayArrow
+import androidx.compose.material.icons.outlined.Lock
+import androidx.compose.material.icons.outlined.PlayCircle
+import androidx.compose.material.icons.outlined.ScreenRotation
+import androidx.compose.material.icons.outlined.SwipeVertical
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material.icons.outlined.Settings
@@ -125,6 +127,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil3.compose.AsyncImage
 import com.kestrel.core.designsystem.kestrelNavClearance
 import com.kestrel.domain.model.PlaybackStartMode
+import com.kestrel.domain.model.PlayerOrientationMode
 import com.kestrel.domain.model.PluginInstallState
 import com.kestrel.domain.model.PluginMetadata
 import com.kestrel.domain.model.ProviderSettingField
@@ -138,10 +141,10 @@ import kotlin.math.roundToInt
 
 enum class SettingsDestination {
     HUB,
-    CONTENT_DISCOVERY,
     ADDONS,
     PLUGINS,
-    SERVERS
+    SERVERS,
+    PLAYER
 }
 
 private data class SettingsSearchEntry(
@@ -232,13 +235,12 @@ fun SettingsScreen(
                     )
                 }
 
-                SettingsDestination.CONTENT_DISCOVERY -> {
-                    ContentAndDiscoveryPage(
+                SettingsDestination.PLAYER -> {
+                    PlayerSettingsPage(
                         state = state,
                         onBack = navigateBack,
-                        onOpenAddons = { navigateTo(SettingsDestination.ADDONS) },
-                        onOpenPlugins = { navigateTo(SettingsDestination.PLUGINS) },
-                        onOpenServers = { navigateTo(SettingsDestination.SERVERS) }
+                        onSelectOrientationMode = viewModel::setPlayerOrientationMode,
+                        onSelectPlaybackSpeed = viewModel::setDefaultPlaybackSpeed
                     )
                 }
 
@@ -356,53 +358,60 @@ private fun SettingsHubPage(
     val searchableItems = remember {
         listOf(
             SettingsSearchEntry(
-                title = "Content & Discovery",
-                breadcrumb = "Manage addons, plugin repos, and discovery sources",
-                keywords = "content discovery sources addons plugins",
-                icon = Icons.Outlined.Explore,
-                destination = SettingsDestination.CONTENT_DISCOVERY
-            ),
-            SettingsSearchEntry(
                 title = "Addons",
-                breadcrumb = "Content & Discovery • Stremio addons",
+                breadcrumb = "Sources • Stremio addons",
                 keywords = "stremio addons manifest install catalog",
                 icon = Icons.Outlined.Extension,
                 destination = SettingsDestination.ADDONS
             ),
             SettingsSearchEntry(
                 title = "Plugins",
-                breadcrumb = "Content & Discovery • Nuvio & CloudStream repositories",
+                breadcrumb = "Sources • Nuvio & CloudStream repositories",
                 keywords = "plugins nuvio cloudstream cs3 scraper repositories providers install",
                 icon = Icons.Outlined.Extension,
                 destination = SettingsDestination.PLUGINS
             ),
             SettingsSearchEntry(
-                title = "Playback & Servers",
-                breadcrumb = "Playback • Stream selection, server search, speed",
-                keywords = "playback speed servers stream selection auto play",
-                icon = Icons.Outlined.PlayArrow,
+                title = "Servers",
+                breadcrumb = "Sources • Multi-server search, timeouts, stream start",
+                keywords = "servers stream selection multi server search auto play",
+                icon = Icons.Outlined.Dns,
                 destination = SettingsDestination.SERVERS
             ),
             SettingsSearchEntry(
                 title = "Allowed Plugins & Addons",
-                breadcrumb = "Playback • Stream selection",
+                breadcrumb = "Servers • Multi-server search",
                 keywords = "allowed plugins addons nuvio stremio cloudstream server search",
                 icon = Icons.Outlined.Dns,
                 destination = SettingsDestination.SERVERS
             ),
             SettingsSearchEntry(
                 title = "Server Search Time & Timeout",
-                breadcrumb = "Playback • Stream selection",
+                breadcrumb = "Servers • Timeouts",
                 keywords = "timeout time wait seconds slow extensions",
                 icon = Icons.Outlined.Timer,
                 destination = SettingsDestination.SERVERS
             ),
             SettingsSearchEntry(
+                title = "Player",
+                breadcrumb = "Player • Landscape orientation, speed & gestures",
+                keywords = "player landscape portrait auto orientation drawer speed gestures",
+                icon = Icons.Outlined.PlayCircle,
+                destination = SettingsDestination.PLAYER
+            ),
+            SettingsSearchEntry(
+                title = "Player Orientation",
+                breadcrumb = "Player • Landscape vs Adaptive (Auto)",
+                keywords = "landscape orientation rotate full screen portrait drawer",
+                icon = Icons.Outlined.ScreenRotation,
+                destination = SettingsDestination.PLAYER
+            ),
+            SettingsSearchEntry(
                 title = "Default Playback Speed",
-                breadcrumb = "Playback • Player defaults",
+                breadcrumb = "Player • Playback defaults",
                 keywords = "speed 1x 1.5x 2x playback",
                 icon = Icons.Outlined.Speed,
-                destination = SettingsDestination.SERVERS
+                destination = SettingsDestination.PLAYER
             )
         )
     }
@@ -491,26 +500,6 @@ private fun SettingsHubPage(
                 }
             }
         } else {
-            item(key = "group_discovery_playback") {
-                OledGroupCard {
-                    SettingsMenuRow(
-                        icon = Icons.Outlined.Explore,
-                        title = "Content & Discovery",
-                        subtitle = "Manage addons, plugin repos, and discovery sources.",
-                        onClick = { onNavigate(SettingsDestination.CONTENT_DISCOVERY) }
-                    )
-                    HorizontalDivider(
-                        color = DividerLine,
-                        modifier = Modifier.padding(start = 68.dp, end = 16.dp)
-                    )
-                    SettingsMenuRow(
-                        icon = Icons.Outlined.PlayArrow,
-                        title = "Playback & Servers",
-                        subtitle = "Server search, stream selection, timeouts, and speed.",
-                        onClick = { onNavigate(SettingsDestination.SERVERS) }
-                    )
-                }
-            }
 
             item(key = "group_sources_shortcuts") {
                 OledGroupCard {
@@ -566,6 +555,27 @@ private fun SettingsHubPage(
                 }
             }
 
+            item(key = "group_player") {
+                OledGroupCard {
+                    val orientLabel = if (state.playerOrientationMode == PlayerOrientationMode.LANDSCAPE) {
+                        "Landscape"
+                    } else {
+                        "Adaptive (Auto)"
+                    }
+                    val speedLabel = if (state.defaultPlaybackSpeed == 1.0f) {
+                        "1x"
+                    } else {
+                        "${state.defaultPlaybackSpeed}x"
+                    }
+                    SettingsMenuRow(
+                        icon = Icons.Outlined.PlayCircle,
+                        title = "Player",
+                        subtitle = "$orientLabel • $speedLabel default speed • Orientation & gestures",
+                        onClick = { onNavigate(SettingsDestination.PLAYER) }
+                    )
+                }
+            }
+
             item(key = "group_general_about") {
                 OledGroupCard {
                     SettingsMenuRow(
@@ -592,50 +602,112 @@ private fun SettingsHubPage(
 }
 
 @Composable
-private fun ContentAndDiscoveryPage(
+private fun PlayerSettingsPage(
     state: SettingsUiState,
     onBack: () -> Unit,
-    onOpenAddons: () -> Unit,
-    onOpenPlugins: () -> Unit,
-    onOpenServers: () -> Unit
+    onSelectOrientationMode: (PlayerOrientationMode) -> Unit,
+    onSelectPlaybackSpeed: (Float) -> Unit
 ) {
     val navClearance = kestrelNavClearance()
+    val speedOptions = remember { listOf(0.75f, 1.0f, 1.25f, 1.5f, 2.0f) }
+
     LazyColumn(
         modifier = Modifier
             .fillMaxSize()
             .statusBarsPadding(),
-        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = navClearance + 20.dp),
+        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = navClearance + 24.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
-        item(key = "cd_header") {
+        item(key = "player_header") {
             OledSubPageHeader(
-                title = "Content &\nDiscovery",
+                title = "Player",
                 onBack = onBack
             )
         }
 
-        item(key = "cd_sources_label") {
-            SectionEyebrow("SOURCES")
+        item(key = "player_orientation_label") {
+            SectionEyebrow("ORIENTATION & LAYOUT")
         }
 
-        item(key = "cd_sources_card") {
+        item(key = "player_orientation_card") {
             OledGroupCard {
-                TextOnlyMenuRow(
-                    title = "Addons",
-                    subtitle = "Install, remove, refresh, and configure your Stremio content and stream addons (${state.stremioAddons.size} installed).",
-                    onClick = onOpenAddons
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(14.dp)
+                ) {
+                    OledRadioRow(
+                        title = "Landscape (Cinema)",
+                        subtitle = "Locks the player in landscape with a side-panel drawer for Sources, Quality, Audio, Subtitles & Speed",
+                        selected = state.playerOrientationMode == PlayerOrientationMode.LANDSCAPE,
+                        onClick = { onSelectOrientationMode(PlayerOrientationMode.LANDSCAPE) }
+                    )
+                    HorizontalDivider(color = DividerLine)
+                    OledRadioRow(
+                        title = "Current / Adaptive (Auto)",
+                        subtitle = "Follows device rotation with portrait layout and bottom sheets",
+                        selected = state.playerOrientationMode == PlayerOrientationMode.AUTO,
+                        onClick = { onSelectOrientationMode(PlayerOrientationMode.AUTO) }
+                    )
+                }
+            }
+        }
+
+        item(key = "player_speed_label") {
+            SectionEyebrow("DEFAULT PLAYBACK SPEED")
+        }
+
+        item(key = "player_speed_card") {
+            OledGroupCard {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Text(
+                        text = "Starting speed for new streams",
+                        style = MaterialTheme.typography.titleMedium,
+                        color = InkPrimary
+                    )
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        items(speedOptions) { spd ->
+                            val label = if (spd == 1.0f) "1x" else "${spd}x"
+                            OledFilterChip(
+                                text = label,
+                                selected = state.defaultPlaybackSpeed == spd,
+                                onClick = { onSelectPlaybackSpeed(spd) }
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        item(key = "player_gestures_label") {
+            SectionEyebrow("CONTROLS & GESTURES")
+        }
+
+        item(key = "player_gestures_card") {
+            OledGroupCard {
+                SettingsMenuRow(
+                    icon = Icons.Outlined.SwipeVertical,
+                    title = "Edge Brightness & Volume",
+                    subtitle = "Swipe vertically on the left side for brightness or right side for volume.",
+                    showChevron = false,
+                    onClick = {}
                 )
-                HorizontalDivider(color = DividerLine, modifier = Modifier.padding(horizontal = 16.dp))
-                TextOnlyMenuRow(
-                    title = "Plugins",
-                    subtitle = "Install JavaScript & CloudStream scraper repositories and manage providers (${state.allNonStremioPlugins.size} available).",
-                    onClick = onOpenPlugins
+                HorizontalDivider(
+                    color = DividerLine,
+                    modifier = Modifier.padding(start = 68.dp, end = 16.dp)
                 )
-                HorizontalDivider(color = DividerLine, modifier = Modifier.padding(horizontal = 16.dp))
-                TextOnlyMenuRow(
-                    title = "Stream selection & Servers",
-                    subtitle = "Choose which Nuvio, Stremio, and CloudStream providers run during playback lookup.",
-                    onClick = onOpenServers
+                SettingsMenuRow(
+                    icon = Icons.Outlined.Lock,
+                    title = "Lock, Aspect Ratio & PiP",
+                    subtitle = "Lock on-screen controls, switch Fit / Fill / Zoom, or enter Picture-in-Picture.",
+                    showChevron = false,
+                    onClick = {}
                 )
             }
         }

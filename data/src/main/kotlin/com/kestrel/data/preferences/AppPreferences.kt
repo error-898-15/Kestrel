@@ -9,6 +9,7 @@ import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import com.kestrel.domain.model.PlayerOrientationMode
 import com.kestrel.domain.model.ServerSearchSettings
 import com.kestrel.domain.repository.SettingsRepository
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -28,6 +29,7 @@ class AppPreferences @Inject constructor(
     private object Keys {
         val DISCLAIMER_ACCEPTED = booleanPreferencesKey("disclaimer_accepted")
         val DEFAULT_SPEED = floatPreferencesKey("default_playback_speed")
+        val PLAYER_ORIENTATION_MODE = stringPreferencesKey("player_orientation_mode")
         val SERVER_SEARCH_SETTINGS = stringPreferencesKey("server_search_settings_json")
     }
 
@@ -37,6 +39,16 @@ class AppPreferences @Inject constructor(
 
     override val defaultPlaybackSpeed: Flow<Float> = context.kestrelDataStore.data.map { prefs ->
         prefs[Keys.DEFAULT_SPEED] ?: 1.0f
+    }
+
+    override val playerOrientationMode: Flow<PlayerOrientationMode> = context.kestrelDataStore.data.map { prefs ->
+        val raw = prefs[Keys.PLAYER_ORIENTATION_MODE]
+        if (raw.isNullOrBlank()) {
+            PlayerOrientationMode.LANDSCAPE
+        } else {
+            runCatching { PlayerOrientationMode.valueOf(raw) }
+                .getOrDefault(PlayerOrientationMode.LANDSCAPE)
+        }
     }
 
     override val serverSearchSettings: Flow<ServerSearchSettings> = context.kestrelDataStore.data.map { prefs ->
@@ -65,6 +77,12 @@ class AppPreferences @Inject constructor(
     override suspend fun setDefaultPlaybackSpeed(speed: Float) {
         context.kestrelDataStore.edit { prefs ->
             prefs[Keys.DEFAULT_SPEED] = speed.coerceIn(0.5f, 2.0f)
+        }
+    }
+
+    override suspend fun setPlayerOrientationMode(mode: PlayerOrientationMode) {
+        context.kestrelDataStore.edit { prefs ->
+            prefs[Keys.PLAYER_ORIENTATION_MODE] = mode.name
         }
     }
 

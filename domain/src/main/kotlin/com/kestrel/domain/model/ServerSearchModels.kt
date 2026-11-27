@@ -10,6 +10,12 @@ enum class PlaybackStartMode {
 }
 
 @Serializable
+enum class PlayerOrientationMode {
+    LANDSCAPE,
+    AUTO
+}
+
+@Serializable
 data class ServerSearchSettings(
     val searchAllInstalled: Boolean = false,
     val searchEveryNuvio: Boolean = true,

@@ -4,6 +4,7 @@ package com.kestrel.feature.settings
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.kestrel.domain.model.PlaybackStartMode
+import com.kestrel.domain.model.PlayerOrientationMode
 import com.kestrel.domain.model.PluginInstallState
 import com.kestrel.domain.model.PluginMetadata
 import com.kestrel.domain.model.ProviderSettingsUiTarget
@@ -61,6 +62,7 @@ data class SettingsActionState(
 data class SettingsUiState(
     val settings: ServerSearchSettings = ServerSearchSettings(),
     val defaultPlaybackSpeed: Float = 1.0f,
+    val playerOrientationMode: PlayerOrientationMode = PlayerOrientationMode.LANDSCAPE,
     val nuvioExtensions: List<InstalledServerExtension> = emptyList(),
     val stremioExtensions: List<InstalledServerExtension> = emptyList(),
     val cloudStreamExtensions: List<InstalledServerExtension> = emptyList(),
@@ -94,12 +96,17 @@ class SettingsViewModel @Inject constructor(
             catalogRepository.syncEnabledPlugins(force = false)
         }
         viewModelScope.launch {
+            val playbackPrefsFlow = combine(
+                settingsRepository.defaultPlaybackSpeed,
+                settingsRepository.playerOrientationMode,
+                ::Pair
+            )
             val serverSliceFlow = combine(
                 settingsRepository.serverSearchSettings,
-                settingsRepository.defaultPlaybackSpeed,
+                playbackPrefsFlow,
                 catalogRepository.activeProviders
-            ) { serverSettings, playbackSpeed, activeProviders ->
-                Triple(serverSettings, playbackSpeed, activeProviders)
+            ) { serverSettings, playbackPrefs, activeProviders ->
+                Triple(serverSettings, playbackPrefs, activeProviders)
             }
 
             val repoSliceFlow = combine(
@@ -114,7 +121,8 @@ class SettingsViewModel @Inject constructor(
                 serverSliceFlow,
                 repoSliceFlow,
                 actionState
-            ) { (serverSettings, playbackSpeed, activeProviders), (repos, allPlugins, configurableIds), actions ->
+            ) { (serverSettings, playbackPrefs, activeProviders), (repos, allPlugins, configurableIds), actions ->
+                val (playbackSpeed, playerOrientationMode) = playbackPrefs
                 val byPluginId = LinkedHashMap<String, InstalledServerExtension>()
 
                 activeProviders.forEach { provider ->
@@ -181,6 +189,7 @@ class SettingsViewModel @Inject constructor(
                 SettingsUiState(
                     settings = serverSettings,
                     defaultPlaybackSpeed = playbackSpeed,
+                    playerOrientationMode = playerOrientationMode,
                     nuvioExtensions = sortedActive.filter { it.repoType == RepoType.NUVIO },
                     stremioExtensions = sortedActive.filter { it.repoType == RepoType.STREMIO },
                     cloudStreamExtensions = sortedActive.filter { it.repoType == RepoType.CLOUDSTREAM },
@@ -628,6 +637,12 @@ class SettingsViewModel @Inject constructor(
     fun setDefaultPlaybackSpeed(speed: Float) {
         viewModelScope.launch {
             settingsRepository.setDefaultPlaybackSpeed(speed)
+        }
+    }
+
+    fun setPlayerOrientationMode(mode: PlayerOrientationMode) {
+        viewModelScope.launch {
+            settingsRepository.setPlayerOrientationMode(mode)
         }
     }
 

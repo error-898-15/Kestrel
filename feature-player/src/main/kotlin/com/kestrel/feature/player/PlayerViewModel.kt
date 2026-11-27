@@ -5,6 +5,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.kestrel.domain.model.Episode
 import com.kestrel.domain.model.LibraryEntry
+import com.kestrel.domain.model.PlayerOrientationMode
 import com.kestrel.domain.model.ResolvedLinks
 import com.kestrel.domain.model.ServerSearchTarget
 import com.kestrel.domain.model.StreamSource
@@ -30,12 +31,15 @@ data class TrackOption(
     val label: String,
     val groupIndex: Int,
     val trackIndex: Int,
-    val isSelected: Boolean
+    val isSelected: Boolean,
+    val subLabel: String? = null,
+    val channelTag: String? = null
 )
 
 data class PlayerUiState(
     val session: PlaybackSession? = null,
     val playbackSpeed: Float = 1.0f,
+    val orientationMode: PlayerOrientationMode = PlayerOrientationMode.LANDSCAPE,
     val isResolvingNextEpisode: Boolean = false,
     val errorMessage: String? = null
 )
@@ -73,6 +77,11 @@ class PlayerViewModel @Inject constructor(
                 if (!userOverrodeSpeed) {
                     _uiState.update { it.copy(playbackSpeed = speed.coerceIn(0.5f, 2.5f)) }
                 }
+            }
+        }
+        viewModelScope.launch {
+            settingsRepository.playerOrientationMode.collect { mode ->
+                _uiState.update { it.copy(orientationMode = mode) }
             }
         }
     }
@@ -117,7 +126,6 @@ class PlayerViewModel @Inject constructor(
                 it.name
             }
         }
-
         viewModelScope.launch {
             libraryRepository.saveProgress(
                 LibraryEntry(

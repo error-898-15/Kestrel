@@ -83,6 +83,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.lerp
 import androidx.compose.ui.unit.sp
 import kotlin.math.abs
 import kotlin.math.max
@@ -145,7 +146,17 @@ fun Modifier.glassPanel(
 ): Modifier {
     var origin by remember { mutableStateOf(Offset.Zero) }
     val blurLayer = rememberGraphicsLayer()
+    val clipPathObj = remember { Path() }
+    val density = LocalDensity.current
     val canBlur = state != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+    val cachedBlurEffect = remember(canBlur, blurRadius, density) {
+        if (canBlur) {
+            val blurPx = with(density) { blurRadius.toPx() }
+            if (blurPx > 0f) BlurEffect(blurPx, blurPx, TileMode.Clamp) else null
+        } else {
+            null
+        }
+    }
     val positioned = if (canBlur) {
         Modifier.onGloballyPositioned { origin = it.positionInRoot() }
     } else {
@@ -160,23 +171,22 @@ fun Modifier.glassPanel(
             val r = min(cornerRadius.toPx(), min(w, h) / 2f)
             val radius = CornerRadius(r, r)
 
-            if (canBlur && state != null) {
+            if (canBlur && state != null && cachedBlurEffect != null) {
                 val shift = state.sourceOrigin - origin
-                val blurPx = blurRadius.toPx()
-                blurLayer.renderEffect = BlurEffect(blurPx, blurPx, TileMode.Clamp)
+                if (blurLayer.renderEffect !== cachedBlurEffect) {
+                    blurLayer.renderEffect = cachedBlurEffect
+                }
                 blurLayer.record(this, layoutDirection, IntSize(w.toInt(), h.toInt())) {
                     translate(shift.x, shift.y) {
                         drawLayer(state.layer)
                     }
                 }
-                val clip = Path().apply {
-                    addRoundRect(RoundRect(0f, 0f, w, h, radius))
-                }
-                clipPath(clip) {
+                clipPathObj.reset()
+                clipPathObj.addRoundRect(RoundRect(0f, 0f, w, h, radius))
+                clipPath(clipPathObj) {
                     drawLayer(blurLayer)
                 }
             }
-
             drawRoundRect(color = tint, cornerRadius = radius)
 
             if (depth) {
@@ -586,7 +596,7 @@ fun GlassTabs(
 }
 
 // ---------------------------------------------------------------------------------------------
-// Floating liquid-glass bottom navigation with a sliding, stretching, draggable highlight
+// Floating liquid-glass bottom navigation with scroll-collapse & smooth crimson capsule
 // ---------------------------------------------------------------------------------------------
 
 @Immutable
@@ -602,7 +612,8 @@ fun GlassNavBar(
     selectedIndex: Int,
     onSelect: (Int) -> Unit,
     modifier: Modifier = Modifier,
-    state: GlassState? = null
+    collapsed: Boolean = false,
+    @Suppress("UNUSED_PARAMETER") state: GlassState? = null
 ) {
     val count = items.size
     if (count == 0) return
@@ -612,107 +623,188 @@ fun GlassNavBar(
 
     val crimsonAccent = Color(0xFFE53935)
     val inactiveTint = Color(0xFFA0A0AA)
-    val barTint = Color(0xEC141113)
+    val barTint = Color(0xF2141114)
     val indicatorFill = Color(0xFF3A1619)
+
+    val collapseFraction by animateFloatAsState(
+        targetValue = if (collapsed) 1f else 0f,
+        animationSpec = spring(dampingRatio = 0.84f, stiffness = 380f),
+        label = "glassNavCollapse"
+    )
 
     var dragPos by remember { mutableStateOf<Float?>(null) }
     val target = dragPos ?: selectedIndex.toFloat()
     val position by animateFloatAsState(
         targetValue = target,
-        animationSpec = spring(dampingRatio = 0.70f, stiffness = 360f),
+        animationSpec = spring(dampingRatio = 0.78f, stiffness = 420f),
         label = "glassNavPosition"
     )
 
     BoxWithConstraints(
-        modifier = modifier
-            .fillMaxWidth()
-            .height(NavBarHeight)
-            .glassPanel(
-                cornerRadius = NavBarHeight / 2,
-                state = state,
-                blurRadius = 24.dp,
-                tint = barTint,
-                rimColor = Color.White,
-                rimAlpha = 0.22f
-            )
+        modifier = modifier.fillMaxWidth(),
+        contentAlignment = Alignment.BottomCenter
     ) {
-        val itemWidth = (maxWidth - inset * 2) / count
-        val itemWidthPx = with(density) { itemWidth.toPx() }
-        val insetPx = with(density) { inset.toPx() }
-        val indicatorHeight = NavBarHeight - inset * 2
+        val expandedWidth = maxWidth
+        val compactWidth = min(expandedWidth.value, (count * 54f) + inset.value * 2f).dp
+        val barWidth = lerp(expandedWidth, compactWidth, collapseFraction)
+        val barHeight = lerp(NavBarHeight, 50.dp, collapseFraction)
+        val labelAlpha = (1f - collapseFraction * 2.1f).coerceIn(0f, 1f)
+        val iconShiftPx = with(density) { (-7.5f * (1f - collapseFraction)).dp.toPx() }
+        val labelShiftPx = with(density) { 12.dp.toPx() }
 
-        // Sliding crimson capsule highlight with stretch + lens pop while traveling between tabs.
         Box(
             modifier = Modifier
-                .offset { IntOffset((insetPx + position * itemWidthPx).roundToInt(), insetPx.roundToInt()) }
-                .size(width = itemWidth, height = indicatorHeight)
-                .graphicsLayer {
-                    val stretch = min(abs(position - target), 1f)
-                    val lens = if (dragPos != null) 1.08f else 1f
-                    scaleX = (1f + 0.22f * stretch) * lens
-                    scaleY = (1f - 0.06f * stretch) * lens
-                }
-                .glassPanel(
-                    cornerRadius = indicatorHeight / 2,
-                    tint = indicatorFill.copy(alpha = if (dragPos != null) 0.94f else 0.88f),
-                    rimColor = crimsonAccent,
-                    rimAlpha = 0.45f,
-                    state = null
-                )
-        )
+                .width(barWidth)
+                .height(barHeight)
+                .clip(RoundedCornerShape(50))
+                .drawBehind {
+                    val w = size.width
+                    val h = size.height
+                    if (w <= 0f || h <= 0f) return@drawBehind
+                    val r = h / 2f
+                    val radius = CornerRadius(r, r)
 
-        Row(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(horizontal = inset)
-                .pointerInput(count, itemWidthPx) {
-                    detectHorizontalDragGestures(
-                        onDragStart = { offset ->
-                            dragPos = (offset.x / itemWidthPx - 0.5f).coerceIn(0f, maxIndex)
-                        },
-                        onDragEnd = {
-                            val finalPos = dragPos
-                            dragPos = null
-                            if (finalPos != null) {
-                                onSelect(finalPos.roundToInt().coerceIn(0, count - 1))
-                            }
-                        },
-                        onDragCancel = { dragPos = null },
-                        onHorizontalDrag = { change, dragAmount ->
-                            change.consume()
-                            val current = dragPos ?: selectedIndex.toFloat()
-                            dragPos = (current + dragAmount / itemWidthPx).coerceIn(0f, maxIndex)
-                        }
+                    drawRoundRect(color = barTint, cornerRadius = radius)
+                    drawRoundRect(
+                        brush = Brush.verticalGradient(
+                            colors = listOf(
+                                Color.White.copy(alpha = 0.09f),
+                                Color.Transparent,
+                                Color.Black.copy(alpha = 0.20f)
+                            ),
+                            startY = 0f,
+                            endY = h
+                        ),
+                        cornerRadius = radius
+                    )
+                    val stroke = 1.dp.toPx()
+                    drawRoundRect(
+                        brush = Brush.linearGradient(
+                            colors = listOf(
+                                Color.White.copy(alpha = 0.24f),
+                                Color.White.copy(alpha = 0.06f),
+                                Color.White.copy(alpha = 0.06f),
+                                Color.White.copy(alpha = 0.16f)
+                            ),
+                            start = Offset.Zero,
+                            end = Offset(w, h)
+                        ),
+                        topLeft = Offset(stroke / 2f, stroke / 2f),
+                        size = Size(w - stroke, h - stroke),
+                        cornerRadius = CornerRadius(max(r - stroke / 2f, 0f)),
+                        style = Stroke(width = stroke)
                     )
                 }
         ) {
-            items.forEachIndexed { index, item ->
-                val interaction = remember { MutableInteractionSource() }
-                val closeness = (1f - min(abs(position - index), 1f)).coerceIn(0f, 1f)
-                val tintColor = lerp(inactiveTint, crimsonAccent, closeness)
-                val iconScale by animateFloatAsState(
-                    targetValue = if (index == selectedIndex && dragPos == null) 1.10f else 1.0f,
-                    animationSpec = spring(dampingRatio = 0.58f, stiffness = 420f),
-                    label = "tabIconScale"
-                )
-                Box(
-                    modifier = Modifier
-                        .weight(1f)
-                        .fillMaxHeight()
-                        .clickable(interactionSource = interaction, indication = null) { onSelect(index) },
-                    contentAlignment = Alignment.Center
-                ) {
-                    Column(
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.spacedBy(2.dp)
+            val itemWidth = (barWidth - inset * 2) / count
+            val itemWidthPx = with(density) { itemWidth.toPx() }
+            val insetPx = with(density) { inset.toPx() }
+            val indicatorHeight = barHeight - inset * 2
+
+            // GPU-only sliding crimson capsule highlight (no layout/blur invalidations).
+            Box(
+                modifier = Modifier
+                    .size(width = itemWidth, height = indicatorHeight)
+                    .graphicsLayer {
+                        val stretch = min(abs(position - target), 1f)
+                        val lens = if (dragPos != null) 1.06f else 1f
+                        translationX = insetPx + position * itemWidthPx
+                        translationY = insetPx
+                        scaleX = (1f + 0.18f * stretch) * lens
+                        scaleY = (1f - 0.05f * stretch) * lens
+                    }
+                    .drawBehind {
+                        val w = size.width
+                        val h = size.height
+                        if (w <= 0f || h <= 0f) return@drawBehind
+                        val r = h / 2f
+                        val radius = CornerRadius(r, r)
+                        val fillAlpha = if (dragPos != null) 0.96f else 0.90f
+                        drawRoundRect(
+                            color = indicatorFill.copy(alpha = fillAlpha),
+                            cornerRadius = radius
+                        )
+                        drawRoundRect(
+                            brush = Brush.verticalGradient(
+                                colors = listOf(
+                                    Color.White.copy(alpha = 0.12f),
+                                    Color.Transparent
+                                ),
+                                startY = 0f,
+                                endY = h * 0.65f
+                            ),
+                            cornerRadius = radius
+                        )
+                        val stroke = 1.dp.toPx()
+                        drawRoundRect(
+                            brush = Brush.linearGradient(
+                                colors = listOf(
+                                    crimsonAccent.copy(alpha = 0.50f),
+                                    crimsonAccent.copy(alpha = 0.12f),
+                                    crimsonAccent.copy(alpha = 0.35f)
+                                ),
+                                start = Offset.Zero,
+                                end = Offset(w, h)
+                            ),
+                            topLeft = Offset(stroke / 2f, stroke / 2f),
+                            size = Size(w - stroke, h - stroke),
+                            cornerRadius = CornerRadius(max(r - stroke / 2f, 0f)),
+                            style = Stroke(width = stroke)
+                        )
+                    }
+            )
+
+            Row(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(horizontal = inset)
+                    .pointerInput(count, itemWidthPx) {
+                        detectHorizontalDragGestures(
+                            onDragStart = { offset ->
+                                dragPos = (offset.x / itemWidthPx - 0.5f).coerceIn(0f, maxIndex)
+                            },
+                            onDragEnd = {
+                                val finalPos = dragPos
+                                dragPos = null
+                                if (finalPos != null) {
+                                    onSelect(finalPos.roundToInt().coerceIn(0, count - 1))
+                                }
+                            },
+                            onDragCancel = { dragPos = null },
+                            onHorizontalDrag = { change, dragAmount ->
+                                change.consume()
+                                val current = dragPos ?: selectedIndex.toFloat()
+                                dragPos = (current + dragAmount / itemWidthPx).coerceIn(0f, maxIndex)
+                            }
+                        )
+                    }
+            ) {
+                items.forEachIndexed { index, item ->
+                    val interaction = remember { MutableInteractionSource() }
+                    val closeness = (1f - min(abs(position - index), 1f)).coerceIn(0f, 1f)
+                    val tintColor = lerp(inactiveTint, crimsonAccent, closeness)
+                    val iconScale by animateFloatAsState(
+                        targetValue = if (index == selectedIndex && dragPos == null) 1.08f else 1.0f,
+                        animationSpec = spring(dampingRatio = 0.65f, stiffness = 420f),
+                        label = "tabIconScale"
+                    )
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxHeight()
+                            .clickable(interactionSource = interaction, indication = null) {
+                                onSelect(index)
+                            },
+                        contentAlignment = Alignment.Center
                     ) {
                         Icon(
                             imageVector = if (closeness > 0.5f) item.selectedIcon else item.icon,
                             contentDescription = item.label,
                             tint = tintColor,
                             modifier = Modifier
-                                .size(23.dp)
+                                .size(22.dp)
                                 .graphicsLayer {
+                                    translationY = iconShiftPx
                                     scaleX = iconScale
                                     scaleY = iconScale
                                 }
@@ -722,7 +814,15 @@ fun GlassNavBar(
                             fontSize = 11.sp,
                             fontWeight = if (closeness > 0.5f) FontWeight.SemiBold else FontWeight.Medium,
                             color = tintColor,
-                            maxLines = 1
+                            maxLines = 1,
+                            softWrap = false,
+                            modifier = Modifier.graphicsLayer {
+                                alpha = labelAlpha
+                                translationY = labelShiftPx
+                                val s = 0.85f + 0.15f * labelAlpha
+                                scaleX = s
+                                scaleY = s
+                            }
                         )
                     }
                 }

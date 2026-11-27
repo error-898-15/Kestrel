@@ -15,14 +15,20 @@ import androidx.compose.material.icons.outlined.Explore
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.unit.dp
 import androidx.navigation.NavDestination.Companion.hierarchy
 import androidx.navigation.NavGraph.Companion.findStartDestination
@@ -34,8 +40,6 @@ import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import com.kestrel.core.designsystem.GlassNavBar
 import com.kestrel.core.designsystem.GlassNavItem
-import com.kestrel.core.designsystem.glassSource
-import com.kestrel.core.designsystem.rememberGlassState
 import com.kestrel.feature.details.DetailsScreen
 import com.kestrel.feature.home.HomeScreen
 import com.kestrel.feature.library.LibraryScreen
@@ -96,7 +100,6 @@ private fun detailsRoute(providerId: String, url: String): String {
 @Composable
 fun KestrelAppShell() {
     val navController = rememberNavController()
-    val shellGlass = rememberGlassState()
     val backStackEntry by navController.currentBackStackEntryAsState()
     val currentDestination = backStackEntry?.destination
     val selectedIndex = TopLevelRoutes.indexOfFirst { route ->
@@ -115,8 +118,43 @@ fun KestrelAppShell() {
 
     var pendingSettingsDestination by remember { mutableStateOf<SettingsDestination?>(null) }
     var settingsNavNonce by remember { mutableIntStateOf(0) }
+    var navBarCollapsed by remember { mutableStateOf(false) }
+    var scrollAccumulator by remember { mutableFloatStateOf(0f) }
+
+    LaunchedEffect(selectedIndex, showBottomBar) {
+        navBarCollapsed = false
+        scrollAccumulator = 0f
+    }
+
+    val navBarScrollConnection = remember {
+        object : NestedScrollConnection {
+            override fun onPostScroll(
+                consumed: Offset,
+                available: Offset,
+                source: NestedScrollSource
+            ): Offset {
+                val dy = consumed.y
+                if (dy != 0f) {
+                    if ((dy < 0f && scrollAccumulator > 0f) || (dy > 0f && scrollAccumulator < 0f)) {
+                        scrollAccumulator = 0f
+                    }
+                    scrollAccumulator += dy
+                    if (scrollAccumulator < -36f && !navBarCollapsed) {
+                        navBarCollapsed = true
+                        scrollAccumulator = 0f
+                    } else if (scrollAccumulator > 22f && navBarCollapsed) {
+                        navBarCollapsed = false
+                        scrollAccumulator = 0f
+                    }
+                }
+                return Offset.Zero
+            }
+        }
+    }
 
     val navigateToTopTab: (String) -> Unit = { route ->
+        navBarCollapsed = false
+        scrollAccumulator = 0f
         navController.navigate(route) {
             popUpTo(navController.graph.findStartDestination().id) {
                 saveState = true
@@ -127,18 +165,20 @@ fun KestrelAppShell() {
     }
 
     val openSourcesInSettings: () -> Unit = {
-        pendingSettingsDestination = SettingsDestination.CONTENT_DISCOVERY
+        pendingSettingsDestination = SettingsDestination.PLUGINS
         settingsNavNonce++
         navigateToTopTab(KestrelRoute.Settings.route)
     }
 
-    Box(modifier = Modifier.fillMaxSize()) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .nestedScroll(navBarScrollConnection)
+    ) {
         NavHost(
             navController = navController,
             startDestination = KestrelRoute.Home.route,
-            modifier = Modifier
-                .fillMaxSize()
-                .glassSource(shellGlass)
+            modifier = Modifier.fillMaxSize()
         ) {
             composable(KestrelRoute.Home.route) {
                 HomeScreen(
@@ -195,13 +235,14 @@ fun KestrelAppShell() {
                 items = navItems,
                 selectedIndex = selectedIndex,
                 onSelect = { index ->
+                    navBarCollapsed = false
                     val dest = TopLevelRoutes[index]
                     if (dest == KestrelRoute.Settings) {
                         pendingSettingsDestination = null
                     }
                     navigateToTopTab(dest.route)
                 },
-                state = shellGlass,
+                collapsed = navBarCollapsed,
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .navigationBarsPadding()
