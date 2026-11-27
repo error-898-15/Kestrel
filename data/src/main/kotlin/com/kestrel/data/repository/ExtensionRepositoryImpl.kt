@@ -33,6 +33,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
+import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -221,7 +222,6 @@ class ExtensionRepositoryImpl @Inject constructor(
                                 plugin.installState == PluginInstallState.NOT_INSTALLED ||
                                 plugin.installState == PluginInstallState.ERROR)
                     }
-
                 val semaphore = Semaphore(3)
                 val results = coroutineScope {
                     candidates.map { plugin ->
@@ -347,7 +347,6 @@ class ExtensionRepositoryImpl @Inject constructor(
             val normalizedInput = stremioClient.normalizeManifestUrl(
                 manifestUrl.ifBlank { existing.downloadUrl }
             )
-
             val candidateUrl = if (normalizedInput == existingNormalized && configValues.isNotEmpty()) {
                 val encodedUrl = stremioClient.buildConfigEncodedManifestUrl(normalizedInput, configValues)
                 if (encodedUrl != normalizedInput) {
@@ -387,7 +386,6 @@ class ExtensionRepositoryImpl @Inject constructor(
             }
 
             pluginDao.upsert(updatedPlugin.toEntity(json))
-
             if (updatedPlugin.isEnabled) {
                 runtimeLoader.unloadPlugin(updatedPlugin.id)
                 runtimeLoader.loadPlugin(updatedPlugin).getOrThrow()
@@ -453,10 +451,14 @@ class ExtensionRepositoryImpl @Inject constructor(
             }
 
             is ParsedRepoPayload.SkyStreamMega -> {
+                val visited = ConcurrentHashMap.newKeySet<String>().apply {
+                    add(parsed.repo.resolvedUrl)
+                    add(parsed.repo.url)
+                }
                 fetchSkyStreamMegaPlugins(
                     targetRepoId = targetRepoId,
                     childRepoUrls = parsed.childRepoUrls,
-                    visited = mutableSetOf(parsed.repo.resolvedUrl)
+                    visited = visited
                 )
             }
 
@@ -526,6 +528,9 @@ class ExtensionRepositoryImpl @Inject constructor(
                     if (!visited.add(childUrl)) return@withPermit emptyList()
                     runCatching {
                         val (resolvedChildUrl, childBody) = urlResolver.fetchText(childUrl)
+                        if (resolvedChildUrl != childUrl && !visited.add(resolvedChildUrl)) {
+                            return@withPermit emptyList()
+                        }
                         when (val childParsed = jsonParser.parseRepositoryManifest(childUrl, resolvedChildUrl, childBody)) {
                             is ParsedRepoPayload.SkyStreamMega ->
                                 fetchSkyStreamMegaPlugins(targetRepoId, childParsed.childRepoUrls, visited)

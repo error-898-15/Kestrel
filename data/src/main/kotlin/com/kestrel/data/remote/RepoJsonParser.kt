@@ -111,13 +111,17 @@ class RepoJsonParser @Inject constructor(
     fun detectType(rawJson: String, resolvedUrl: String = ""): RepoType {
         val root = json.parseToJsonElement(rawJson)
         if (root is JsonArray) {
-            val firstObj = root.firstOrNull() as? JsonObject
+            val objects = root.mapNotNull { it as? JsonObject }
+            val firstObj = objects.firstOrNull()
             if (firstObj != null) {
                 if ("display_name" in firstObj && "value" in firstObj) {
                     return RepoType.VEGA
                 }
-                val itemUrl = firstObj.stringField("url").orEmpty()
-                if ("packageName" in firstObj || itemUrl.endsWith(".sky", ignoreCase = true)) {
+                if (objects.any { obj ->
+                        val itemUrl = obj.stringField("url").orEmpty()
+                        "packageName" in obj || itemUrl.endsWith(".sky", ignoreCase = true)
+                    }
+                ) {
                     return RepoType.SKYSTREAM
                 }
                 if (("filename" in firstObj || "file" in firstObj || "script" in firstObj || "supportedTypes" in firstObj) &&
@@ -139,8 +143,8 @@ class RepoJsonParser @Inject constructor(
             "plugins" in obj && obj["plugins"] is JsonArray -> RepoType.HIKARI
             // Nuvio manifests (check before manifestVersion because some Nuvio manifests include manifestVersion)
             "scrapers" in obj || "providers" in obj -> RepoType.NUVIO
-            // SkyStream repo.json (uses packageName + pluginLists)
-            "pluginLists" in obj && "packageName" in obj -> RepoType.SKYSTREAM
+            // SkyStream repo.json (uses packageName or id + pluginLists)
+            "pluginLists" in obj && ("packageName" in obj || "id" in obj) -> RepoType.SKYSTREAM
             // CloudStream repo.json (note: SkyStream repos without packageName are auto-upgraded when pluginLists contain .sky)
             "pluginLists" in obj || "manifestVersion" in obj -> RepoType.CLOUDSTREAM
             // Stremio addon manifest
@@ -639,9 +643,11 @@ class RepoJsonParser @Inject constructor(
 
     fun isSkyStreamPluginsList(rawJson: String): Boolean {
         val root = runCatching { json.parseToJsonElement(rawJson) }.getOrNull() as? JsonArray ?: return false
-        val first = root.firstOrNull() as? JsonObject ?: return false
-        val url = first.stringField("url").orEmpty()
-        return "packageName" in first || url.endsWith(".sky", ignoreCase = true)
+        return root.any { el ->
+            val obj = el as? JsonObject ?: return@any false
+            val url = obj.stringField("url").orEmpty()
+            "packageName" in obj || url.endsWith(".sky", ignoreCase = true)
+        }
     }
 
     fun parseSkyStreamPluginsList(
@@ -703,13 +709,13 @@ class RepoJsonParser @Inject constructor(
         supportedApiVersion: Int
     ): List<PluginMetadata> {
         val array = json.parseToJsonElement(rawJson).jsonArray
-        return array.mapNotNull { el ->
-            val obj = el as? JsonObject ?: return@mapNotNull null
+        return array.mapIndexedNotNull { index, el ->
+            val obj = el as? JsonObject ?: return@mapIndexedNotNull null
             val url = obj.stringField("url").orEmpty()
             val name = obj.stringField("name").orEmpty()
             val internalName = obj.stringField("internalName").orEmpty()
             if (url.isBlank() || (internalName.isBlank() && name.isBlank())) {
-                return@mapNotNull null
+                return@mapIndexedNotNull null
             }
             val internal = internalName.ifBlank { name }
             val display = name.ifBlank { internal }
@@ -728,8 +734,8 @@ class RepoJsonParser @Inject constructor(
             val tvTypes = obj.stringListField("tvTypes")
             val fileSize = (obj["fileSize"] as? JsonPrimitive)?.longOrNull
             val repositoryUrl = obj.stringField("repositoryUrl")?.takeIf { it.isNotBlank() }
-
             val supported = apiVersion in 0..supportedApiVersion
+
             PluginMetadata(
                 id = stableId("$repoId:$internal"),
                 repoId = repoId,

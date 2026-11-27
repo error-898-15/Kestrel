@@ -28,6 +28,7 @@ import org.jsoup.select.Elements
 import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.IdentityHashMap
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import javax.crypto.Cipher
@@ -76,7 +77,6 @@ class NuvioJsEngine @Inject constructor(
               }
             })();
         """.trimIndent()
-
         return runScript(
             pluginId = pluginId,
             scraperId = scraperId,
@@ -129,7 +129,6 @@ class NuvioJsEngine @Inject constructor(
               }
             })();
         """.trimIndent()
-
         return runScript(
             pluginId = pluginId,
             scraperId = scraperId,
@@ -166,7 +165,6 @@ class NuvioJsEngine @Inject constructor(
               }
             })();
         """.trimIndent()
-
         return runScript(
             pluginId = pluginId,
             scraperId = scraperId,
@@ -201,7 +199,6 @@ class NuvioJsEngine @Inject constructor(
               }
             })();
         """.trimIndent()
-
         return runScript(
             pluginId = pluginId,
             scraperId = scraperId,
@@ -326,7 +323,8 @@ class NuvioJsEngine @Inject constructor(
         scriptCode: String,
         callScript: String,
         timeoutMs: Long = 20_000L,
-        extraAsyncBindings: Map<String, suspend (Array<Any?>) -> String> = emptyMap()
+        extraAsyncBindings: Map<String, suspend (Array<Any?>) -> String> = emptyMap(),
+        extraSyncBindings: Map<String, (Array<Any?>) -> Any?> = emptyMap()
     ): JSONObject {
         val resultDeferred = CompletableDeferred<String>()
         val capturedJson = AtomicReference<String?>(null)
@@ -341,6 +339,9 @@ class NuvioJsEngine @Inject constructor(
 
         val raw = withTimeoutOrNull(timeoutMs) {
             quickJs(Dispatchers.Default) {
+                // Match SkyStream's 2MB stack ceiling so large esbuild bundles (e.g. All-in-one) do not overflow.
+                maxStackSize = 2L * 1024L * 1024L
+
                 defineBinding(
                     "__nuvioCall",
                     object : FunctionBinding<String?> {
@@ -378,6 +379,15 @@ class NuvioJsEngine @Inject constructor(
                     }
                 )
 
+                extraSyncBindings.forEach { (bindingName, handler) ->
+                    defineBinding(
+                        bindingName,
+                        object : FunctionBinding<Any?> {
+                            override fun invoke(args: Array<Any?>): Any? = handler(args)
+                        }
+                    )
+                }
+
                 extraAsyncBindings.forEach { (bindingName, handler) ->
                     defineBinding(
                         bindingName,
@@ -388,11 +398,13 @@ class NuvioJsEngine @Inject constructor(
                     )
                 }
 
-                evaluate<Any?>(NuvioPolyfill.build(), "nuvio-polyfill.js")
-                evaluate<Any?>(settingsInjection, "nuvio-settings.js")
+                // End every eval with `;undefined;` so QuickJS never attempts to JSON-stringify circular
+                // completion values such as `Object.assign(globalThis, PluginModule)` -> `globalThis`.
+                evaluate<Unit>(NuvioPolyfill.build() + "\n;undefined;", "nuvio-polyfill.js")
+                evaluate<Unit>(settingsInjection + "\n;undefined;", "nuvio-settings.js")
                 if (setupScript.isNotBlank()) {
                     val setupError = runCatching {
-                        evaluate<Any?>(setupScript, "$scraperId-setup.js")
+                        evaluate<Unit>(setupScript + "\n;undefined;", "$scraperId-setup.js")
                     }.exceptionOrNull()
                     if (setupError != null) {
                         return@quickJs JSONObject()
@@ -402,7 +414,7 @@ class NuvioJsEngine @Inject constructor(
                 }
                 if (scriptCode.isNotBlank()) {
                     val scriptError = runCatching {
-                        evaluate<Any?>(scriptCode, "$scraperId.js")
+                        evaluate<Unit>(scriptCode + "\n;undefined;", "$scraperId.js")
                     }.exceptionOrNull()
                     if (scriptError != null) {
                         return@quickJs JSONObject()
@@ -411,7 +423,7 @@ class NuvioJsEngine @Inject constructor(
                     }
                 }
                 val invokeError = runCatching {
-                    evaluate<Any?>(callScript, "nuvio-invoke.js")
+                    evaluate<Unit>(callScript + "\n;undefined;", "nuvio-invoke.js")
                 }.exceptionOrNull()
                 if (invokeError != null && capturedJson.get() == null) {
                     return@quickJs JSONObject()
@@ -446,23 +458,6 @@ class NuvioJsEngine @Inject constructor(
                 "log" -> {
                     Log.d("NuvioJS", "[$scraperId] ${req.optString("message")}")
                     "{}"
-                }
-                "btoa" -> {
-                    val rawStr = req.optString("value")
-                    val bytes = ByteArray(rawStr.length) { i -> (rawStr[i].code and 0xFF).toByte() }
-                    val encoded = Base64.encodeToString(bytes, Base64.NO_WRAP)
-                    JSONObject().put("value", encoded).toString()
-                }
-                "atob" -> {
-                    val cleanB64 = req.optString("value")
-                        .replace("-", "+")
-                        .replace("_", "/")
-                        .replace(Regex("\\s+"), "")
-                    val decoded = String(
-                        Base64.decode(cleanB64, Base64.DEFAULT),
-                        Charsets.ISO_8859_1
-                    )
-                    JSONObject().put("value", decoded).toString()
                 }
                 "cryptoRandom" -> {
                     val size = req.optInt("size", 16).coerceIn(1, 1024)
@@ -529,13 +524,11 @@ class NuvioJsEngine @Inject constructor(
         val passphrase = optNullableString(req, "passphrase")
         val keyHex = optNullableString(req, "keyHex")
         val ivHex = optNullableString(req, "ivHex")
-
         val transformation = aesTransformation(mode, padding)
 
         if (action == "encrypt") {
             val plain = hexToBytes(req.optString("inputHex"))
             val cipher = Cipher.getInstance(transformation)
-
             if (passphrase != null) {
                 val salt = ByteArray(8)
                 SecureRandom().nextBytes(salt)
@@ -583,7 +576,6 @@ class NuvioJsEngine @Inject constructor(
             if (rawCipherBytes.isEmpty()) {
                 return JSONObject().put("hex", "").toString()
             }
-
             val cipher = Cipher.getInstance(transformation)
             val plainBytes: ByteArray = if (passphrase != null) {
                 val magic = "Salted__".toByteArray(Charsets.US_ASCII)
@@ -748,7 +740,6 @@ class NuvioJsEngine @Inject constructor(
                 }
                 return serializeElements(combined)
             }
-
             val doc = docs[docId] ?: if (!legacyHtml.isNullOrEmpty()) {
                 Jsoup.parse(legacyHtml)
             } else {
@@ -907,22 +898,32 @@ class NuvioJsEngine @Inject constructor(
                 )
             }
 
-            val redirectMode = payload.optString("redirect", "follow").lowercase()
-            val callClient = if (redirectMode == "manual" || redirectMode == "error") {
-                okHttpClient.newBuilder()
-                    .followRedirects(false)
-                    .followSslRedirects(false)
-                    .build()
+            val requestedTimeoutMs = payload.optLong("timeoutMs", payload.optLong("timeout", 0L))
+            val readTimeoutMs = if (requestedTimeoutMs > 0L) {
+                requestedTimeoutMs.coerceIn(2_000L, 60_000L)
             } else {
-                okHttpClient
+                18_000L
             }
+            val redirectMode = payload.optString("redirect", "follow").lowercase()
+            val callClient = okHttpClient.newBuilder()
+                .connectTimeout(12_000L.coerceAtMost(readTimeoutMs), TimeUnit.MILLISECONDS)
+                .readTimeout(readTimeoutMs, TimeUnit.MILLISECONDS)
+                .writeTimeout(15_000L, TimeUnit.MILLISECONDS)
+                .callTimeout(readTimeoutMs + 5_000L, TimeUnit.MILLISECONDS)
+                .apply {
+                    if (redirectMode == "manual" || redirectMode == "error") {
+                        followRedirects(false)
+                        followSslRedirects(false)
+                    }
+                }
+                .build()
 
             callClient.newCall(builder.build()).execute().use { resp ->
                 val respHeaders = JSONObject()
                 resp.headers.names().forEach { hName ->
                     val values = resp.headers.values(hName)
                     if (values.isNotEmpty()) {
-                        respHeaders.put(hName, values.joinToString("; "))
+                        respHeaders.put(hName, values.joinToString(", "))
                     }
                 }
                 val bodyText = resp.body?.string().orEmpty().take(MAX_BODY_CHARS)

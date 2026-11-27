@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package com.kestrel.pluginhost.skystream
 
+import android.util.Base64
 import com.kestrel.domain.model.ActorCredit
 import com.kestrel.domain.model.CatalogRow
 import com.kestrel.domain.model.Episode
@@ -53,18 +54,27 @@ class SkyStreamAdapter(
         return engine.readArchive(file)
     }
 
+    private fun throwIfFailed(out: JSONObject, fallbackMessage: String) {
+        if (out.has("success") && !out.optBoolean("success", true)) {
+            val msg = out.optString("message").ifBlank { out.optString("error") }
+            error(msg.ifBlank { fallbackMessage })
+        }
+        val engineError = out.optString("error").trim()
+        if (engineError.isNotBlank() && !out.has("data")) {
+            error(engineError)
+        }
+    }
+
     override suspend fun getCatalog(page: Int): Result<List<CatalogRow>> =
-        sandbox.execute(pluginId = pluginId, timeoutMs = 35_000L) {
+        sandbox.execute(pluginId = pluginId, timeoutMs = 45_000L) {
             if (page > 1) return@execute emptyList()
             val out = engine.getHome(
                 pluginId = pluginId,
                 packageName = plugin.internalName,
-                payload = readPayload()
+                payload = readPayload(),
+                timeoutMs = 40_000L
             )
-            if (out.has("success") && !out.optBoolean("success", true)) {
-                val msg = out.optString("message").ifBlank { out.optString("error") }
-                if (msg.isNotBlank()) error(msg)
-            }
+            throwIfFailed(out, "$name failed to load catalog")
             val data = out.opt("data") ?: return@execute emptyList()
             val rows = mutableListOf<CatalogRow>()
             when (data) {
@@ -130,7 +140,7 @@ class SkyStreamAdapter(
         }
 
     override suspend fun search(query: String, page: Int): Result<List<MediaSummary>> =
-        sandbox.execute(pluginId = pluginId, timeoutMs = 28_000L) {
+        sandbox.execute(pluginId = pluginId, timeoutMs = 35_000L) {
             if (page > 1) return@execute emptyList()
             val trimmed = query.trim()
             if (trimmed.isBlank()) return@execute emptyList()
@@ -138,27 +148,23 @@ class SkyStreamAdapter(
                 pluginId = pluginId,
                 packageName = plugin.internalName,
                 payload = readPayload(),
-                query = trimmed
+                query = trimmed,
+                timeoutMs = 30_000L
             )
-            if (out.has("success") && !out.optBoolean("success", true)) {
-                val msg = out.optString("message").ifBlank { out.optString("error") }
-                if (msg.isNotBlank()) error(msg)
-            }
+            throwIfFailed(out, "$name search failed")
             parseItemList(out.optJSONArray("data"))
         }
 
     override suspend fun load(url: String): Result<MediaDetails> =
-        sandbox.execute(pluginId = pluginId, timeoutMs = 35_000L) {
+        sandbox.execute(pluginId = pluginId, timeoutMs = 36_000L) {
             val out = engine.load(
                 pluginId = pluginId,
                 packageName = plugin.internalName,
                 payload = readPayload(),
-                url = url
+                url = url,
+                timeoutMs = 32_000L
             )
-            if (out.has("success") && !out.optBoolean("success", true)) {
-                val msg = out.optString("message").ifBlank { out.optString("error") }
-                error(msg.ifBlank { "$name failed to load details for $url" })
-            }
+            throwIfFailed(out, "$name failed to load details for $url")
             val data = out.optJSONObject("data")
                 ?: error(out.optString("message").ifBlank { "$name returned no details for $url" })
 
@@ -172,7 +178,7 @@ class SkyStreamAdapter(
             val plot = optNullableString(data, "description")
                 ?: optNullableString(data, "plot")
                 ?: optNullableString(data, "synopsis")
-            val year = data.optInt("year").takeIf { it > 1900 }
+            val year = parseYear(data)
             val rating = data.optDouble("score").takeIf { !it.isNaN() && it > 0.0 }
                 ?: data.optDouble("rating").takeIf { !it.isNaN() && it > 0.0 }
 
@@ -228,7 +234,17 @@ class SkyStreamAdapter(
             val episodes = buildList {
                 for (i in 0 until epArr.length()) {
                     val o = epArr.optJSONObject(i) ?: continue
-                    val epUrl = o.optString("url").ifBlank { o.optString("dataUrl") }.ifBlank { o.optString("data") }
+                    val inlineStreams = o.optJSONArray("streams")
+                    val rawEpUrl = o.optString("url")
+                        .ifBlank { o.optString("dataUrl") }
+                        .ifBlank { o.optString("data") }
+                        .ifBlank { o.optString("link") }
+                        .trim()
+                    val epUrl = when {
+                        rawEpUrl.isNotBlank() -> rawEpUrl
+                        inlineStreams != null && inlineStreams.length() > 0 -> encodeInlineStreamsToken(inlineStreams)
+                        else -> ""
+                    }
                     if (epUrl.isBlank()) continue
                     val season = o.optInt("season").takeIf { it > 0 } ?: 1
                     val epNum = o.optInt("episode").takeIf { it > 0 }
@@ -264,9 +280,12 @@ class SkyStreamAdapter(
                 else -> MediaType.MOVIE
             }
 
+            val topInlineStreams = data.optJSONArray("streams")?.takeIf { it.length() > 0 }
             val playDataUrl = when {
-                episodes.size == 1 && mediaType == MediaType.MOVIE -> episodes.first().dataUrl
+                episodes.size == 1 && (mediaType == MediaType.MOVIE || mediaType == MediaType.ANIME) ->
+                    episodes.first().dataUrl
                 episodes.isNotEmpty() -> null
+                topInlineStreams != null -> encodeInlineStreamsToken(topInlineStreams)
                 else -> optNullableString(data, "data")
                     ?: optNullableString(data, "playData")
                     ?: resolvedUrl
@@ -298,34 +317,42 @@ class SkyStreamAdapter(
         getLinks(data = data, timeoutMs = 45_000L)
 
     override suspend fun getLinks(data: String, timeoutMs: Long): Result<ResolvedLinks> =
-        sandbox.execute(pluginId = pluginId, timeoutMs = timeoutMs.coerceAtLeast(8_000L)) {
-            val out = engine.loadStreams(
-                pluginId = pluginId,
-                packageName = plugin.internalName,
-                payload = readPayload(),
-                url = data,
-                timeoutMs = timeoutMs
-            )
-            if (out.has("success") && !out.optBoolean("success", true)) {
-                val msg = out.optString("message").ifBlank { out.optString("error") }
-                if (msg.isNotBlank()) error(msg)
+        sandbox.execute(pluginId = pluginId, timeoutMs = timeoutMs.coerceAtLeast(10_000L)) {
+            val arr: JSONArray = if (data.startsWith(INLINE_STREAMS_PREFIX)) {
+                val b64 = data.removePrefix(INLINE_STREAMS_PREFIX)
+                val decoded = String(Base64.decode(b64, Base64.URL_SAFE or Base64.NO_WRAP), Charsets.UTF_8)
+                JSONArray(decoded)
+            } else {
+                val innerTimeout = (timeoutMs - 2_000L).coerceAtLeast(8_000L)
+                val out = engine.loadStreams(
+                    pluginId = pluginId,
+                    packageName = plugin.internalName,
+                    payload = readPayload(),
+                    url = data,
+                    timeoutMs = innerTimeout
+                )
+                throwIfFailed(out, "$name failed to resolve streams")
+                out.optJSONArray("data") ?: JSONArray()
             }
-            val arr = out.optJSONArray("data") ?: JSONArray()
+
             val streams = mutableListOf<StreamSource>()
             val allSubtitles = mutableListOf<SubtitleTrack>()
 
             for (i in 0 until arr.length()) {
                 val o = arr.optJSONObject(i) ?: continue
-                val streamUrl = o.optString("url").trim()
-                if (streamUrl.isBlank()) continue
+                val rawStreamUrl = o.optString("url").trim()
+                if (rawStreamUrl.isBlank()) continue
                 val headers = parseHeaders(o.optJSONObject("headers"))
-                val subs = parseSubtitles(o.optJSONArray("subtitles"))
+                val streamUrl = engine.resolveMagicUrl(rawStreamUrl, headers)
+                val subs = parseSubtitles(o.optJSONArray("subtitles"), headers)
                 allSubtitles.addAll(subs)
 
                 val sourceName = o.optString("name")
                     .ifBlank { o.optString("source") }
                     .ifBlank { name }
-                val isM3u8 = o.optBoolean("isM3U8", false) || o.optBoolean("isM3u8", false)
+                val isM3u8 = o.optBoolean("isM3U8", false) ||
+                    o.optBoolean("isM3u8", false) ||
+                    rawStreamUrl.startsWith("magic_m3u8:")
                 val typeStr = o.optString("type").lowercase()
                 val format = when {
                     isM3u8 || "m3u8" in typeStr || "hls" in typeStr -> StreamFormat.HLS
@@ -388,11 +415,23 @@ class SkyStreamAdapter(
                         url = itemUrl,
                         type = mediaType,
                         posterUrl = poster,
-                        year = o.optInt("year").takeIf { it > 1900 }
+                        year = parseYear(o)
                     )
                 )
             }
         }
+    }
+
+    private fun parseYear(obj: JSONObject): Int? {
+        val intVal = obj.optInt("year", 0)
+        if (intVal > 1900) return intVal
+        val strVal = optNullableString(obj, "year")?.let { Regex("\\d{4}").find(it)?.value?.toIntOrNull() }
+        return strVal?.takeIf { it > 1900 }
+    }
+
+    private fun encodeInlineStreamsToken(arr: JSONArray): String {
+        val b64 = Base64.encodeToString(arr.toString().toByteArray(Charsets.UTF_8), Base64.URL_SAFE or Base64.NO_WRAP)
+        return "$INLINE_STREAMS_PREFIX$b64"
     }
 
     private fun parseHeaders(obj: JSONObject?): Map<String, String> {
@@ -407,16 +446,19 @@ class SkyStreamAdapter(
         return map
     }
 
-    private fun parseSubtitles(arr: JSONArray?): List<SubtitleTrack> {
+    private fun parseSubtitles(arr: JSONArray?, fallbackHeaders: Map<String, String>): List<SubtitleTrack> {
         if (arr == null) return emptyList()
         return buildList {
             for (i in 0 until arr.length()) {
                 val o = arr.optJSONObject(i) ?: continue
-                val url = o.optString("url").trim()
-                if (url.isBlank()) continue
+                val rawUrl = o.optString("url").trim()
+                if (rawUrl.isBlank()) continue
+                val subHeaders = parseHeaders(o.optJSONObject("headers"))
+                val effectiveHeaders = subHeaders.ifEmpty { fallbackHeaders }
+                val resolvedSubUrl = engine.resolveMagicUrl(rawUrl, effectiveHeaders)
                 val lang = o.optString("lang").ifBlank { o.optString("language") }.ifBlank { "en" }
                 val label = o.optString("label").ifBlank { lang }
-                add(SubtitleTrack(url = url, language = lang, label = label))
+                add(SubtitleTrack(url = resolvedSubUrl, language = lang, label = label, headers = effectiveHeaders))
             }
         }
     }
@@ -450,5 +492,9 @@ class SkyStreamAdapter(
     private fun stableId(input: String): String {
         val digest = MessageDigest.getInstance("SHA-256").digest(input.toByteArray(Charsets.UTF_8))
         return digest.take(8).joinToString("") { "%02x".format(it) }
+    }
+
+    companion object {
+        private const val INLINE_STREAMS_PREFIX = "kestrel-sky-streams:"
     }
 }
