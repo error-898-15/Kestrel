@@ -116,8 +116,8 @@ class AniyomiExtensionLoader @Inject constructor(
             val clazz = classLoader.loadClass(className)
             val instance = clazz.getDeclaredConstructor().apply { isAccessible = true }.newInstance()
             when (instance) {
-                is SourceFactory -> loadedSources += instance.createSources()
-                is Source -> loadedSources += instance
+                is SourceFactory -> { loadedSources.addAll(instance.createSources()) }
+                is Source -> { loadedSources.add(instance) }
                 else -> {
                     val fromCreate = runCatching {
                         @Suppress("UNCHECKED_CAST")
@@ -128,9 +128,9 @@ class AniyomiExtensionLoader @Inject constructor(
                         clazz.getMethod("getSources").invoke(instance) as? List<Any>
                     }.getOrNull()
                     when {
-                        !fromCreate.isNullOrEmpty() -> loadedSources += fromCreate
-                        !fromLegacy.isNullOrEmpty() -> loadedSources += fromLegacy
-                        else -> loadedSources += instance
+                        !fromCreate.isNullOrEmpty() -> { loadedSources.addAll(fromCreate) }
+                        !fromLegacy.isNullOrEmpty() -> { loadedSources.addAll(fromLegacy) }
+                        else -> { loadedSources.add(instance) }
                     }
                 }
             }
