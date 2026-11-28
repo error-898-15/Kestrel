@@ -2,6 +2,7 @@
 package com.kestrel.data.repository
 
 import android.content.Context
+import android.net.Uri
 import com.kestrel.core.di.IoDispatcher
 import com.kestrel.data.local.MangaExtensionDao
 import com.kestrel.data.local.MangaLibraryDao
@@ -12,14 +13,19 @@ import com.kestrel.data.local.toEntity
 import com.kestrel.data.preferences.AppPreferences
 import com.kestrel.data.remote.AniyomiRepoParser
 import com.kestrel.data.remote.RepoUrlResolver
+import com.kestrel.domain.model.DownloadedChapterManifest
+import com.kestrel.domain.model.MangaBrowseMode
+import com.kestrel.domain.model.MangaCatalogPage
 import com.kestrel.domain.model.MangaChapter
 import com.kestrel.domain.model.MangaDetails
 import com.kestrel.domain.model.MangaExtensionInstallState
 import com.kestrel.domain.model.MangaExtensionMetadata
 import com.kestrel.domain.model.MangaExtensionTestResult
 import com.kestrel.domain.model.MangaPage
+import com.kestrel.domain.model.MangaProgressInfo
 import com.kestrel.domain.model.MangaReaderSettings
 import com.kestrel.domain.model.MangaRepoConfig
+import com.kestrel.domain.model.MangaSectionRow
 import com.kestrel.domain.model.MangaSourceDescriptor
 import com.kestrel.domain.model.MangaSummary
 import com.kestrel.domain.provider.MangaSourceProvider
@@ -43,6 +49,8 @@ import kotlinx.serialization.json.Json
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
+import java.security.MessageDigest
+import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -62,6 +70,8 @@ class MangaRepositoryImpl @Inject constructor(
 ) : MangaRepository {
 
     private val seedMutex = Mutex()
+    private val loadMutex = Mutex()
+    private val summaryCache = ConcurrentHashMap<String, MangaSummary>()
 
     override val repositories: Flow<List<MangaRepoConfig>> =
         mangaRepoDao.observeAll().map { list -> list.map { it.toDomain() } }
@@ -71,6 +81,31 @@ class MangaRepositoryImpl @Inject constructor(
 
     override val readerSettings: Flow<MangaReaderSettings> =
         appPreferences.mangaReaderSettings
+
+    override val libraryEntries: Flow<List<MangaProgressInfo>> =
+        mangaLibraryDao.observeAll().map { list ->
+            list.map { entity ->
+                val readIds = runCatching {
+                    json.decodeFromString<List<String>>(entity.readChapterIdsJson)
+                }.getOrDefault(emptyList()).toSet()
+                MangaProgressInfo(
+                    mangaId = entity.mangaId,
+                    extensionId = entity.extensionId,
+                    sourceId = entity.sourceId,
+                    sourceName = entity.sourceName,
+                    title = entity.title,
+                    url = entity.url,
+                    coverUrl = entity.coverUrl,
+                    isFavorite = entity.isFavorite,
+                    lastChapterId = entity.lastChapterId,
+                    lastChapterName = entity.lastChapterName,
+                    lastPageRead = entity.lastPageRead,
+                    totalPages = entity.totalPages,
+                    readChapterIds = readIds,
+                    updatedAtEpochMs = entity.updatedAtEpochMs
+                )
+            }
+        }
 
     override suspend fun ensureDefaultMangaRepositoriesSeeded() = withContext(ioDispatcher) {
         seedMutex.withLock {
@@ -99,6 +134,10 @@ class MangaRepositoryImpl @Inject constructor(
             }
             Unit
         }
+    }
+
+    override suspend fun ensureInstalledExtensionsLoaded() {
+        ensureInstalledExtensionsLoadedInternal()
     }
 
     override suspend fun restoreDefaultMangaRepositories(): Result<Int> = withContext(ioDispatcher) {
@@ -221,8 +260,12 @@ class MangaRepositoryImpl @Inject constructor(
                     installState = MangaExtensionInstallState.INSTALLED,
                     lastError = null
                 )
-                val providers = extensionLoader.loadExtension(baseInstalled).getOrThrow()
-                val syncedSources = providersToDescriptors(providers, baseInstalled.sources)
+                val loaded = extensionLoader.loadExtension(baseInstalled).getOrThrow()
+                val syncedSources = if (loaded.descriptors.isNotEmpty()) {
+                    loaded.descriptors
+                } else {
+                    providersToDescriptors(loaded.mangaProviders, baseInstalled.sources)
+                }
                 val installed = baseInstalled.copy(sources = syncedSources)
                 mangaExtensionDao.upsert(installed.toEntity(json))
                 installed
@@ -308,54 +351,198 @@ class MangaRepositoryImpl @Inject constructor(
             }
         }
 
-    override suspend fun browsePopular(sourceId: String?, page: Int): Result<List<MangaSummary>> {
-        val loadError = ensureInstalledExtensionsLoaded()
+    override suspend fun browsePopular(sourceId: String?, page: Int): Result<MangaCatalogPage> =
+        browseMode(sourceId, page, MangaBrowseMode.POPULAR)
+
+    override suspend fun browseLatest(sourceId: String?, page: Int): Result<MangaCatalogPage> =
+        browseMode(sourceId, page, MangaBrowseMode.LATEST)
+
+    private suspend fun browseMode(
+        sourceId: String?,
+        page: Int,
+        mode: MangaBrowseMode
+    ): Result<MangaCatalogPage> {
+        val loadError = ensureInstalledExtensionsLoadedInternal()
         val providers = extensionLoader.getAllProviders().distinctBy { it.sourceId }
         if (providers.isEmpty()) {
-            return loadError ?: Result.success(emptyList())
+            return loadError ?: Result.success(MangaCatalogPage(emptyList(), false))
         }
         if (sourceId != null) {
             val target = providers.firstOrNull { it.sourceId == sourceId }
                 ?: providers.firstOrNull { it.extensionId == sourceId }
                 ?: return Result.failure(IllegalStateException("Selected manga provider is not loaded"))
-            return target.getPopular(page)
+            val res = when (mode) {
+                MangaBrowseMode.POPULAR -> target.getPopular(page)
+                MangaBrowseMode.LATEST -> target.getLatest(page)
+            }
+            res.onSuccess { cacheSummaries(it.items) }
+            return res
         }
+        val semaphore = Semaphore(4)
         val results = coroutineScope {
-            providers.take(6).map { provider ->
-                async { provider.getPopular(page) }
+            providers.map { provider ->
+                async {
+                    semaphore.withPermit {
+                        when (mode) {
+                            MangaBrowseMode.POPULAR -> provider.getPopular(page)
+                            MangaBrowseMode.LATEST -> provider.getLatest(page)
+                        }
+                    }
+                }
             }.awaitAll()
         }
         val combined = interleaveSuccessful(results)
-        if (combined.isNotEmpty()) return Result.success(combined)
+        cacheSummaries(combined)
+        val hasNext = results.any { it.getOrNull()?.hasNextPage == true }
+        if (combined.isNotEmpty()) return Result.success(MangaCatalogPage(combined, hasNext))
         val firstFailure = results.firstNotNullOfOrNull { it.exceptionOrNull() }
-        return if (firstFailure != null) Result.failure(firstFailure) else Result.success(emptyList())
+        return if (firstFailure != null) Result.failure(firstFailure)
+        else Result.success(MangaCatalogPage(emptyList(), false))
     }
 
-    override suspend fun searchManga(query: String, sourceId: String?, page: Int): Result<List<MangaSummary>> {
-        val loadError = ensureInstalledExtensionsLoaded()
+    override suspend fun searchManga(query: String, sourceId: String?, page: Int): Result<MangaCatalogPage> {
+        val loadError = ensureInstalledExtensionsLoadedInternal()
         val allProviders = extensionLoader.getAllProviders().distinctBy { it.sourceId }
         if (allProviders.isEmpty()) {
-            return loadError ?: Result.success(emptyList())
+            return loadError ?: Result.success(MangaCatalogPage(emptyList(), false))
         }
         if (sourceId != null) {
             val target = allProviders.firstOrNull { it.sourceId == sourceId }
                 ?: allProviders.firstOrNull { it.extensionId == sourceId }
                 ?: return Result.failure(IllegalStateException("Selected manga provider is not loaded"))
-            return target.search(query, page)
+            val res = target.search(query, page)
+            res.onSuccess { cacheSummaries(it.items) }
+            return res
         }
+        val semaphore = Semaphore(4)
         val results = coroutineScope {
-            allProviders.take(6).map { provider ->
-                async { provider.search(query, page) }
+            allProviders.map { provider ->
+                async {
+                    semaphore.withPermit {
+                        provider.search(query, page)
+                    }
+                }
             }.awaitAll()
         }
         val combined = interleaveSuccessful(results)
-        if (combined.isNotEmpty()) return Result.success(combined)
+        cacheSummaries(combined)
+        val hasNext = results.any { it.getOrNull()?.hasNextPage == true }
+        if (combined.isNotEmpty()) return Result.success(MangaCatalogPage(combined, hasNext))
         val firstFailure = results.firstNotNullOfOrNull { it.exceptionOrNull() }
-        return if (firstFailure != null) Result.failure(firstFailure) else Result.success(emptyList())
+        return if (firstFailure != null) Result.failure(firstFailure)
+        else Result.success(MangaCatalogPage(emptyList(), false))
     }
 
-    private fun interleaveSuccessful(results: List<Result<List<MangaSummary>>>): List<MangaSummary> {
-        val lists = results.mapNotNull { it.getOrNull() }.filter { it.isNotEmpty() }
+    override suspend fun loadAllCatalogRows(): Result<List<MangaSectionRow>> {
+        val loadError = ensureInstalledExtensionsLoadedInternal()
+        val providers = extensionLoader.getAllProviders().distinctBy { it.sourceId }
+        if (providers.isEmpty()) {
+            return loadError?.exceptionOrNull()?.let { Result.failure(it) }
+                ?: Result.success(emptyList())
+        }
+
+        val semaphore = Semaphore(4)
+        val providerResults = coroutineScope {
+            providers.map { provider ->
+                async {
+                    val pop = semaphore.withPermit { provider.getPopular(1) }
+                    val lat = if (provider.supportsLatest) {
+                        semaphore.withPermit { provider.getLatest(1) }
+                    } else null
+                    Triple(provider, pop, lat)
+                }
+            }.awaitAll()
+        }
+
+        val rows = mutableListOf<MangaSectionRow>()
+        val allPopular = mutableListOf<MangaCatalogPage>()
+        val allLatest = mutableListOf<MangaCatalogPage>()
+
+        for ((provider, popRes, latRes) in providerResults) {
+            val popPage = popRes.getOrNull()
+            if (popPage != null && popPage.items.isNotEmpty()) {
+                cacheSummaries(popPage.items)
+                allPopular.add(popPage)
+            }
+            val latPage = latRes?.getOrNull()
+            if (latPage != null && latPage.items.isNotEmpty()) {
+                cacheSummaries(latPage.items)
+                allLatest.add(latPage)
+            }
+        }
+
+        val mergedLatest = interleavePages(allLatest)
+        val mergedPopular = interleavePages(allPopular)
+
+        if (mergedLatest.isNotEmpty()) {
+            rows.add(
+                MangaSectionRow(
+                    id = "all_latest",
+                    title = "Latest Manga",
+                    sourceId = null,
+                    sourceName = "All Sources",
+                    browseMode = MangaBrowseMode.LATEST,
+                    items = mergedLatest,
+                    hasNextPage = allLatest.any { it.hasNextPage }
+                )
+            )
+        }
+        if (mergedPopular.isNotEmpty()) {
+            rows.add(
+                MangaSectionRow(
+                    id = "all_popular",
+                    title = "Popular Manga",
+                    sourceId = null,
+                    sourceName = "All Sources",
+                    browseMode = MangaBrowseMode.POPULAR,
+                    items = mergedPopular,
+                    hasNextPage = allPopular.any { it.hasNextPage }
+                )
+            )
+        }
+
+        for ((provider, popRes, latRes) in providerResults) {
+            val popPage = popRes.getOrNull()
+            if (popPage != null && popPage.items.isNotEmpty()) {
+                rows.add(
+                    MangaSectionRow(
+                        id = "${provider.sourceId}_popular",
+                        title = "${provider.name} • Popular",
+                        sourceId = provider.sourceId,
+                        sourceName = provider.name,
+                        browseMode = MangaBrowseMode.POPULAR,
+                        items = popPage.items,
+                        hasNextPage = popPage.hasNextPage
+                    )
+                )
+            }
+            val latPage = latRes?.getOrNull()
+            if (latPage != null && latPage.items.isNotEmpty()) {
+                rows.add(
+                    MangaSectionRow(
+                        id = "${provider.sourceId}_latest",
+                        title = "${provider.name} • Latest",
+                        sourceId = provider.sourceId,
+                        sourceName = provider.name,
+                        browseMode = MangaBrowseMode.LATEST,
+                        items = latPage.items,
+                        hasNextPage = latPage.hasNextPage
+                    )
+                )
+            }
+        }
+
+        if (rows.isNotEmpty()) return Result.success(rows)
+
+        val firstErr = providerResults.firstNotNullOfOrNull { it.second.exceptionOrNull() ?: it.third?.exceptionOrNull() }
+        return if (firstErr != null) Result.failure(firstErr) else Result.success(emptyList())
+    }
+
+    private fun interleaveSuccessful(results: List<Result<MangaCatalogPage>>): List<MangaSummary> =
+        interleavePages(results.mapNotNull { it.getOrNull() })
+
+    private fun interleavePages(pages: List<MangaCatalogPage>): List<MangaSummary> {
+        val lists = pages.map { it.items }.filter { it.isNotEmpty() }
         if (lists.isEmpty()) return emptyList()
         val maxLen = lists.maxOf { it.size }
         return buildList {
@@ -367,35 +554,153 @@ class MangaRepositoryImpl @Inject constructor(
         }
     }
 
+    private fun cacheSummaries(items: List<MangaSummary>) {
+        items.forEach { summaryCache[it.id] = it }
+    }
+
     override suspend fun loadMangaDetails(
         extensionId: String,
         sourceId: String,
         mangaUrl: String
     ): Result<MangaDetails> {
-        ensureInstalledExtensionsLoaded()
+        ensureInstalledExtensionsLoadedInternal()
         val provider = extensionLoader.findProvider(extensionId, sourceId)
             ?: return Result.failure(IllegalStateException("Manga provider not loaded"))
-        val summary = MangaSummary(
-            id = "$sourceId:$mangaUrl",
+        val mangaId = "$sourceId:$mangaUrl"
+        val cached = summaryCache[mangaId]
+        val seedSummary = cached ?: MangaSummary(
+            id = mangaId,
             extensionId = extensionId,
             sourceId = sourceId,
             sourceName = provider.name,
             title = "",
             url = mangaUrl
         )
-        return provider.getDetails(summary)
+        val library = withContext(ioDispatcher) { mangaLibraryDao.getById(mangaId) }
+        val readIds = runCatching {
+            json.decodeFromString<List<String>>(library?.readChapterIdsJson ?: "[]")
+        }.getOrDefault(emptyList()).toSet()
+
+        return provider.getDetails(seedSummary).map { details ->
+            val updatedChapters = details.chapters.map { ch ->
+                ch.copy(isRead = ch.id in readIds)
+            }
+            val updatedSummary = details.summary.copy(
+                title = details.summary.title.ifBlank { cached?.title ?: library?.title ?: "Untitled" },
+                coverUrl = details.summary.coverUrl ?: cached?.coverUrl ?: library?.coverUrl
+            )
+            summaryCache[mangaId] = updatedSummary
+            details.copy(
+                summary = updatedSummary,
+                chapters = updatedChapters,
+                isFavorite = library?.isFavorite ?: details.isFavorite
+            )
+        }
     }
 
     override suspend fun loadChapterPages(
         extensionId: String,
         sourceId: String,
         chapter: MangaChapter
-    ): Result<List<MangaPage>> {
-        ensureInstalledExtensionsLoaded()
+    ): Result<List<MangaPage>> = withContext(ioDispatcher) {
+        // Check offline downloaded pages first
+        val offlinePages = readOfflineChapterPages(chapter.id)
+        if (offlinePages != null) {
+            return@withContext Result.success(offlinePages)
+        }
+        ensureInstalledExtensionsLoadedInternal()
         val provider = extensionLoader.findProvider(extensionId, sourceId)
-            ?: return Result.failure(IllegalStateException("Manga provider not loaded"))
-        return provider.getPages(chapter)
+            ?: return@withContext Result.failure(IllegalStateException("Manga provider not loaded"))
+        provider.getPages(chapter)
     }
+
+    override suspend fun downloadChapter(
+        extensionId: String,
+        sourceId: String,
+        mangaId: String,
+        chapter: MangaChapter
+    ): Result<Unit> = withContext(ioDispatcher) {
+        runCatching {
+            ensureInstalledExtensionsLoadedInternal()
+            val provider = extensionLoader.findProvider(extensionId, sourceId)
+                ?: error("Manga provider not loaded")
+            val pages = provider.getPages(chapter).getOrThrow()
+            require(pages.isNotEmpty()) { "No pages available to download for ${chapter.name}" }
+
+            val dir = chapterDownloadDir(mangaId, chapter.id).apply { mkdirs() }
+            val localPaths = MutableList(pages.size) { "" }
+            val semaphore = Semaphore(3)
+            coroutineScope {
+                pages.mapIndexed { idx, page ->
+                    async {
+                        semaphore.withPermit {
+                            val reqBuilder = Request.Builder().url(page.imageUrl)
+                            page.headers.forEach { (k, v) -> reqBuilder.header(k, v) }
+                            val file = File(dir, "page_${idx.toString().padStart(4, '0')}.img")
+                            okHttpClient.newCall(reqBuilder.build()).execute().use { resp ->
+                                if (!resp.isSuccessful) {
+                                    error("HTTP ${resp.code} downloading page ${idx + 1}")
+                                }
+                                resp.body?.byteStream()?.use { input ->
+                                    file.outputStream().use { out -> input.copyTo(out) }
+                                } ?: error("Empty page body")
+                            }
+                            localPaths[idx] = file.absolutePath
+                        }
+                    }
+                }.awaitAll()
+            }
+            val manifest = DownloadedChapterManifest(
+                chapterId = chapter.id,
+                mangaId = mangaId,
+                pagePaths = localPaths
+            )
+            File(dir, "manifest.json").writeText(json.encodeToString(manifest))
+        }
+    }
+
+    override suspend fun deleteDownloadedChapter(mangaId: String, chapterId: String) =
+        withContext(ioDispatcher) {
+            chapterDownloadDir(mangaId, chapterId).deleteRecursively()
+            Unit
+        }
+
+    override suspend fun getDownloadedChapterIds(mangaId: String): Set<String> =
+        withContext(ioDispatcher) {
+            val mangaDir = File(context.filesDir, "manga_downloads/${safeHash(mangaId)}")
+            if (!mangaDir.exists()) return@withContext emptySet()
+            mangaDir.listFiles()?.mapNotNull { chDir ->
+                val manifestFile = File(chDir, "manifest.json")
+                if (!manifestFile.exists()) return@mapNotNull null
+                runCatching {
+                    json.decodeFromString<DownloadedChapterManifest>(manifestFile.readText()).chapterId
+                }.getOrNull()
+            }?.toSet().orEmpty()
+        }
+
+    private fun readOfflineChapterPages(chapterId: String): List<MangaPage>? {
+        val rootDir = File(context.filesDir, "manga_downloads")
+        if (!rootDir.exists()) return null
+        val chHash = safeHash(chapterId)
+        val chDir = rootDir.listFiles()?.firstNotNullOfOrNull { mangaDir ->
+            File(mangaDir, chHash).takeIf { File(it, "manifest.json").exists() }
+        } ?: return null
+        val manifest = runCatching {
+            json.decodeFromString<DownloadedChapterManifest>(File(chDir, "manifest.json").readText())
+        }.getOrNull() ?: return null
+        val files = manifest.pagePaths.map(::File)
+        if (files.isEmpty() || files.any { !it.exists() || it.length() == 0L }) return null
+        return files.mapIndexed { idx, file ->
+            MangaPage(index = idx, imageUrl = Uri.fromFile(file).toString(), headers = emptyMap())
+        }
+    }
+
+    private fun chapterDownloadDir(mangaId: String, chapterId: String): File =
+        File(context.filesDir, "manga_downloads/${safeHash(mangaId)}/${safeHash(chapterId)}")
+
+    private fun safeHash(input: String): String =
+        MessageDigest.getInstance("SHA-256").digest(input.toByteArray())
+            .take(12).joinToString("") { "%02x".format(it) }
 
     override suspend fun toggleFavorite(manga: MangaSummary) = withContext(ioDispatcher) {
         val existing = mangaLibraryDao.getById(manga.id)
@@ -444,9 +749,9 @@ class MangaRepositoryImpl @Inject constructor(
                 extensionId = manga.extensionId,
                 sourceId = manga.sourceId,
                 sourceName = manga.sourceName,
-                title = manga.title,
+                title = manga.title.ifBlank { existing?.title.orEmpty() },
                 url = manga.url,
-                coverUrl = manga.coverUrl,
+                coverUrl = manga.coverUrl ?: existing?.coverUrl,
                 isFavorite = existing?.isFavorite ?: false,
                 lastChapterId = chapter.id,
                 lastChapterName = chapter.name,
@@ -472,28 +777,34 @@ class MangaRepositoryImpl @Inject constructor(
                 id = p.sourceId,
                 name = p.name,
                 lang = p.lang,
-                baseUrl = p.baseUrl
+                baseUrl = p.baseUrl,
+                isVideo = false
             )
         }
     }
 
-    private suspend fun ensureInstalledExtensionsLoaded(): Result<List<MangaSummary>>? {
-        val installed = mangaExtensionDao.observeAll().first()
-            .map { it.toDomain(json) }
-            .filter { it.installState == MangaExtensionInstallState.INSTALLED }
-        var lastError: Throwable? = null
-        for (ext in installed) {
-            if (extensionLoader.getProvidersForExtension(ext.id).isEmpty()) {
-                extensionLoader.loadExtension(ext)
-                    .onSuccess { providers ->
-                        val synced = providersToDescriptors(providers, ext.sources)
-                        if (synced != ext.sources) {
-                            mangaExtensionDao.upsert(ext.copy(sources = synced).toEntity(json))
+    private suspend fun ensureInstalledExtensionsLoadedInternal(): Result<MangaCatalogPage>? =
+        loadMutex.withLock {
+            val installed = mangaExtensionDao.observeAll().first()
+                .map { it.toDomain(json) }
+                .filter { it.installState == MangaExtensionInstallState.INSTALLED }
+            var lastError: Throwable? = null
+            for (ext in installed) {
+                if (!extensionLoader.isExtensionLoaded(ext.id)) {
+                    extensionLoader.loadExtension(ext)
+                        .onSuccess { loaded ->
+                            val synced = if (loaded.descriptors.isNotEmpty()) {
+                                loaded.descriptors
+                            } else {
+                                providersToDescriptors(loaded.mangaProviders, ext.sources)
+                            }
+                            if (synced != ext.sources) {
+                                mangaExtensionDao.upsert(ext.copy(sources = synced).toEntity(json))
+                            }
                         }
-                    }
-                    .onFailure { lastError = it }
+                        .onFailure { lastError = it }
+                }
             }
+            lastError?.let { Result.failure(it) }
         }
-        return lastError?.let { Result.failure(it) }
-    }
 }

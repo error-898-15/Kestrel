@@ -4,14 +4,22 @@ package com.kestrel.pluginhost.aniyomi
 import android.content.Context
 import android.content.pm.PackageManager
 import com.kestrel.core.di.IoDispatcher
+import com.kestrel.domain.model.MangaCatalogPage
 import com.kestrel.domain.model.MangaChapter
 import com.kestrel.domain.model.MangaDetails
 import com.kestrel.domain.model.MangaExtensionMetadata
 import com.kestrel.domain.model.MangaPage
+import com.kestrel.domain.model.MangaSourceDescriptor
 import com.kestrel.domain.model.MangaSummary
 import com.kestrel.domain.provider.MangaSourceProvider
+import com.kestrel.domain.provider.SourceProvider
+import com.kestrel.pluginhost.AdapterRegistry
+import com.kestrel.pluginhost.PluginSandbox
 import dagger.hilt.android.qualifiers.ApplicationContext
 import dalvik.system.PathClassLoader
+import eu.kanade.tachiyomi.animesource.AnimeCatalogueSource
+import eu.kanade.tachiyomi.animesource.AnimeSource
+import eu.kanade.tachiyomi.animesource.AnimeSourceFactory
 import eu.kanade.tachiyomi.source.CatalogueSource
 import eu.kanade.tachiyomi.source.Source
 import eu.kanade.tachiyomi.source.SourceFactory
@@ -22,6 +30,11 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
 import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import uy.kohesive.injekt.InjektRegistry
@@ -30,31 +43,44 @@ import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
 import javax.inject.Singleton
 
+data class LoadedAniyomiExtension(
+    val mangaProviders: List<MangaSourceProvider> = emptyList(),
+    val animeProviders: List<SourceProvider> = emptyList(),
+    val descriptors: List<MangaSourceDescriptor> = emptyList()
+)
+
 /**
  * Loads installed Aniyomi / Keiyoushi / Tachiyomi extension APKs via isolated PathClassLoader
- * backed by Kestrel's Tachiyomi/Mihon extension-lib + Injekt runtime, bridging real Source
- * instances directly into [MangaSourceProvider] with NO shared mock fallback.
+ * backed by Kestrel's Tachiyomi/Aniyomi runtime shims + Injekt registry.
+ * Supports both Manga extensions (`tachiyomi.extension.class`) and Anime/Video extensions
+ * (`tachiyomi.animeextension.class`).
  */
 @Singleton
 class AniyomiExtensionLoader @Inject constructor(
     @ApplicationContext private val context: Context,
     private val okHttpClient: OkHttpClient,
+    private val adapterRegistry: AdapterRegistry,
+    private val pluginSandbox: PluginSandbox,
     @IoDispatcher private val ioDispatcher: CoroutineDispatcher
 ) {
-    private val loadedProviders = ConcurrentHashMap<String, List<MangaSourceProvider>>()
+    private val loadedMangaProviders = ConcurrentHashMap<String, List<MangaSourceProvider>>()
+    private val loadedAnimeProviders = ConcurrentHashMap<String, List<SourceProvider>>()
 
     fun getProvidersForExtension(extensionId: String): List<MangaSourceProvider> =
-        loadedProviders[extensionId].orEmpty()
+        loadedMangaProviders[extensionId].orEmpty()
 
     fun getAllProviders(): List<MangaSourceProvider> =
-        loadedProviders.values.flatten()
+        loadedMangaProviders.values.flatten()
+
+    fun isExtensionLoaded(extensionId: String): Boolean =
+        loadedMangaProviders.containsKey(extensionId) || loadedAnimeProviders.containsKey(extensionId)
 
     fun findProvider(extensionId: String, sourceId: String): MangaSourceProvider? =
-        loadedProviders[extensionId]?.firstOrNull { it.sourceId == sourceId }
-            ?: loadedProviders.values.flatten().firstOrNull { it.sourceId == sourceId }
-            ?: loadedProviders[extensionId]?.firstOrNull()
+        loadedMangaProviders[extensionId]?.firstOrNull { it.sourceId == sourceId }
+            ?: loadedMangaProviders.values.flatten().firstOrNull { it.sourceId == sourceId }
+            ?: loadedMangaProviders[extensionId]?.firstOrNull()
 
-    suspend fun loadExtension(metadata: MangaExtensionMetadata): Result<List<MangaSourceProvider>> =
+    suspend fun loadExtension(metadata: MangaExtensionMetadata): Result<LoadedAniyomiExtension> =
         withContext(ioDispatcher) {
             runCatching {
                 InjektRegistry.ensureInitialized(context, okHttpClient)
@@ -63,23 +89,39 @@ class AniyomiExtensionLoader @Inject constructor(
                 val apkFile = File(apkPath).takeIf { it.exists() && it.length() > 0L }
                     ?: error("Extension APK missing on disk for ${metadata.name}. Please reinstall.")
 
-                val providers = loadSourcesFromApk(metadata, apkFile)
-                if (providers.isEmpty()) {
-                    error("No manga sources found inside ${metadata.name} APK.")
+                val loaded = loadSourcesFromApk(metadata, apkFile)
+                if (loaded.mangaProviders.isEmpty() && loaded.animeProviders.isEmpty()) {
+                    error("No sources found inside ${metadata.name} APK.")
                 }
-                loadedProviders[metadata.id] = providers
-                providers
+
+                if (loaded.mangaProviders.isNotEmpty()) {
+                    loadedMangaProviders[metadata.id] = loaded.mangaProviders
+                } else {
+                    loadedMangaProviders.remove(metadata.id)
+                }
+
+                if (loaded.animeProviders.isNotEmpty()) {
+                    adapterRegistry.unregisterByPlugin(metadata.id)
+                    loaded.animeProviders.forEach { adapterRegistry.register(it) }
+                    loadedAnimeProviders[metadata.id] = loaded.animeProviders
+                } else {
+                    loadedAnimeProviders.remove(metadata.id)
+                }
+
+                loaded
             }
         }
 
     fun unloadExtension(extensionId: String) {
-        loadedProviders.remove(extensionId)
+        loadedMangaProviders.remove(extensionId)
+        loadedAnimeProviders.remove(extensionId)
+        adapterRegistry.unregisterByPlugin(extensionId)
     }
 
     private fun loadSourcesFromApk(
         metadata: MangaExtensionMetadata,
         apkFile: File
-    ): List<MangaSourceProvider> {
+    ): LoadedAniyomiExtension {
         // Android 14+ requires dynamically loaded DEX/APK files to be non-writable
         apkFile.setWritable(false, false)
         apkFile.setReadOnly()
@@ -95,67 +137,128 @@ class AniyomiExtensionLoader @Inject constructor(
         val animeClassAttr = metaData?.getString("tachiyomi.animeextension.class")
         val mangaClassAttr = metaData?.getString("tachiyomi.extension.class")
 
-        if (mangaClassAttr.isNullOrBlank()) {
-            if (!animeClassAttr.isNullOrBlank() || metadata.packageName.contains(".animeextension.")) {
-                error("${metadata.name} is an Aniyomi Anime (video) extension and has no manga catalog.")
-            }
+        if (mangaClassAttr.isNullOrBlank() && animeClassAttr.isNullOrBlank()) {
             error("${metadata.name} APK is missing tachiyomi.extension.class metadata.")
         }
 
         val basePackage = pkgInfo.packageName ?: metadata.packageName
-        val classNames = mangaClassAttr
-            .split(';')
-            .map { it.trim() }
-            .filter { it.isNotEmpty() }
-            .map { raw -> if (raw.startsWith(".")) "$basePackage$raw" else raw }
-
         val classLoader = PathClassLoader(apkFile.absolutePath, context.classLoader)
-        val loadedSources = mutableListOf<Any>()
 
-        for (className in classNames) {
-            val clazz = classLoader.loadClass(className)
-            val instance = clazz.getDeclaredConstructor().apply { isAccessible = true }.newInstance()
-            when (instance) {
-                is SourceFactory -> { loadedSources.addAll(instance.createSources()) }
-                is Source -> { loadedSources.add(instance) }
-                else -> {
-                    val fromCreate = runCatching {
-                        @Suppress("UNCHECKED_CAST")
-                        clazz.getMethod("createSources").invoke(instance) as? List<Any>
-                    }.getOrNull()
-                    val fromLegacy = runCatching {
-                        @Suppress("UNCHECKED_CAST")
-                        clazz.getMethod("getSources").invoke(instance) as? List<Any>
-                    }.getOrNull()
-                    when {
-                        !fromCreate.isNullOrEmpty() -> { loadedSources.addAll(fromCreate) }
-                        !fromLegacy.isNullOrEmpty() -> { loadedSources.addAll(fromLegacy) }
-                        else -> { loadedSources.add(instance) }
+        val mangaProviders = mutableListOf<MangaSourceProvider>()
+        val animeProviders = mutableListOf<SourceProvider>()
+        val descriptors = mutableListOf<MangaSourceDescriptor>()
+
+        if (!mangaClassAttr.isNullOrBlank()) {
+            val classNames = parseClassNames(mangaClassAttr, basePackage)
+            val loadedSources = mutableListOf<Any>()
+            for (className in classNames) {
+                val clazz = classLoader.loadClass(className)
+                val instance = clazz.getDeclaredConstructor().apply { isAccessible = true }.newInstance()
+                when (instance) {
+                    is SourceFactory -> loadedSources.addAll(instance.createSources())
+                    is Source -> loadedSources.add(instance)
+                    else -> {
+                        val fromCreate = runCatching {
+                            @Suppress("UNCHECKED_CAST")
+                            clazz.getMethod("createSources").invoke(instance) as? List<Any>
+                        }.getOrNull()
+                        val fromLegacy = runCatching {
+                            @Suppress("UNCHECKED_CAST")
+                            clazz.getMethod("getSources").invoke(instance) as? List<Any>
+                        }.getOrNull()
+                        when {
+                            !fromCreate.isNullOrEmpty() -> loadedSources.addAll(fromCreate)
+                            !fromLegacy.isNullOrEmpty() -> loadedSources.addAll(fromLegacy)
+                            else -> loadedSources.add(instance)
+                        }
                     }
                 }
             }
-        }
-
-        return loadedSources.mapIndexed { idx, src ->
-            if (src is Source) {
-                DirectTachiyomiSourceProvider(
-                    source = src,
-                    extensionId = metadata.id,
-                    fallbackName = metadata.name,
-                    fallbackLang = metadata.lang
-                )
-            } else {
-                ReflectiveLegacySourceProvider(
-                    sourceObj = src,
-                    extensionId = metadata.id,
-                    fallbackId = "${metadata.id}_$idx",
-                    fallbackName = metadata.name,
-                    fallbackLang = metadata.lang,
-                    ioDispatcher = ioDispatcher
+            loadedSources.forEachIndexed { idx, src ->
+                val provider = if (src is Source) {
+                    DirectTachiyomiSourceProvider(
+                        source = src,
+                        extensionId = metadata.id,
+                        fallbackName = metadata.name,
+                        fallbackLang = metadata.lang
+                    )
+                } else {
+                    ReflectiveLegacySourceProvider(
+                        sourceObj = src,
+                        extensionId = metadata.id,
+                        fallbackId = "${metadata.id}_$idx",
+                        fallbackName = metadata.name,
+                        fallbackLang = metadata.lang,
+                        ioDispatcher = ioDispatcher
+                    )
+                }
+                mangaProviders.add(provider)
+                descriptors.add(
+                    MangaSourceDescriptor(
+                        id = provider.sourceId,
+                        name = provider.name,
+                        lang = provider.lang,
+                        baseUrl = provider.baseUrl,
+                        isVideo = false
+                    )
                 )
             }
         }
+
+        if (!animeClassAttr.isNullOrBlank()) {
+            val classNames = parseClassNames(animeClassAttr, basePackage)
+            val loadedAnimeSources = mutableListOf<AnimeSource>()
+            for (className in classNames) {
+                val clazz = classLoader.loadClass(className)
+                val instance = clazz.getDeclaredConstructor().apply { isAccessible = true }.newInstance()
+                when (instance) {
+                    is AnimeSourceFactory -> loadedAnimeSources.addAll(instance.createSources())
+                    is AnimeSource -> loadedAnimeSources.add(instance)
+                    else -> {
+                        val fromCreate = runCatching {
+                            @Suppress("UNCHECKED_CAST")
+                            clazz.getMethod("createSources").invoke(instance) as? List<AnimeSource>
+                        }.getOrNull()
+                        if (!fromCreate.isNullOrEmpty()) {
+                            loadedAnimeSources.addAll(fromCreate)
+                        }
+                    }
+                }
+            }
+            loadedAnimeSources.forEach { animeSrc ->
+                val adapter = AniyomiAnimeSourceAdapter(
+                    pluginId = metadata.id,
+                    source = animeSrc,
+                    fallbackName = metadata.name,
+                    fallbackLang = metadata.lang,
+                    sandbox = pluginSandbox
+                )
+                animeProviders.add(adapter)
+                val catLang = (animeSrc as? AnimeCatalogueSource)?.lang?.ifBlank { metadata.lang } ?: metadata.lang
+                descriptors.add(
+                    MangaSourceDescriptor(
+                        id = animeSrc.id.toString(),
+                        name = adapter.name,
+                        lang = catLang,
+                        baseUrl = (animeSrc as? eu.kanade.tachiyomi.animesource.online.AnimeHttpSource)?.baseUrl.orEmpty(),
+                        isVideo = true
+                    )
+                )
+            }
+        }
+
+        return LoadedAniyomiExtension(
+            mangaProviders = mangaProviders,
+            animeProviders = animeProviders,
+            descriptors = descriptors
+        )
     }
+
+    private fun parseClassNames(attr: String, basePackage: String): List<String> =
+        attr.split(';')
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .map { raw -> if (raw.startsWith(".")) "$basePackage$raw" else raw }
 }
 
 private class DirectTachiyomiSourceProvider(
@@ -169,6 +272,7 @@ private class DirectTachiyomiSourceProvider(
     override val name: String = source.name.ifBlank { fallbackName }
     override val lang: String = (source as? CatalogueSource)?.lang ?: fallbackLang
     override val baseUrl: String = (source as? HttpSource)?.baseUrl.orEmpty()
+    override val supportsLatest: Boolean = source.supportsLatest
 
     private val defaultHeaders: Map<String, String> by lazy {
         val http = source as? HttpSource ?: return@lazy emptyMap()
@@ -183,15 +287,18 @@ private class DirectTachiyomiSourceProvider(
         }
     }
 
-    override suspend fun getPopular(page: Int): Result<List<MangaSummary>> = runCatching {
+    override suspend fun getPopular(page: Int): Result<MangaCatalogPage> = runCatching {
         mapMangasPage(source.getPopularManga(page))
     }
 
-    override suspend fun getLatest(page: Int): Result<List<MangaSummary>> = runCatching {
+    override suspend fun getLatest(page: Int): Result<MangaCatalogPage> = runCatching {
+        if (!source.supportsLatest) {
+            return@runCatching MangaCatalogPage(emptyList(), false)
+        }
         mapMangasPage(source.getLatestUpdates(page))
     }
 
-    override suspend fun search(query: String, page: Int): Result<List<MangaSummary>> = runCatching {
+    override suspend fun search(query: String, page: Int): Result<MangaCatalogPage> = runCatching {
         val filters = runCatching { source.getFilterList() }.getOrElse { FilterList() }
         mapMangasPage(source.getSearchManga(page, query, filters))
     }
@@ -211,10 +318,12 @@ private class DirectTachiyomiSourceProvider(
         )
         val resolvedManga = update.manga
         val resolvedSummary = manga.copy(
-            title = resolvedManga.title.ifBlank { manga.title },
-            coverUrl = resolvedManga.thumbnail_url ?: manga.coverUrl,
+            title = resolvedManga.title.ifBlank { manga.title }.ifBlank { "Untitled" },
+            coverUrl = resolveUrl(resolvedManga.thumbnail_url) ?: manga.coverUrl,
+            coverHeaders = if (manga.coverHeaders.isNotEmpty()) manga.coverHeaders else defaultHeaders,
             author = resolvedManga.author ?: manga.author,
-            status = mapStatus(resolvedManga.status) ?: manga.status
+            status = mapStatus(resolvedManga.status) ?: manga.status,
+            description = resolvedManga.description ?: manga.description
         )
         val chapters = update.chapters.mapIndexed { idx, ch ->
             MangaChapter(
@@ -252,34 +361,70 @@ private class DirectTachiyomiSourceProvider(
         }
         val pages: List<Page> = source.getPageList(sChapter)
         val http = source as? HttpSource
-        pages.mapIndexedNotNull { idx, page ->
-            val resolvedUrl = page.imageUrl?.takeIf { it.isNotBlank() }
-                ?: if (http != null && page.url.isNotBlank()) {
-                    runCatching { http.getImageUrl(page) }.getOrNull()?.takeIf { it.isNotBlank() }
-                } else {
-                    page.url.takeIf { it.isNotBlank() }
+        val semaphore = Semaphore(4)
+        coroutineScope {
+            pages.mapIndexed { idx, page ->
+                async {
+                    val rawUrl = page.imageUrl?.takeIf { it.isNotBlank() }
+                        ?: if (http != null && page.url.isNotBlank()) {
+                            semaphore.withPermit {
+                                runCatching { http.getImageUrl(page) }.getOrNull()?.takeIf { it.isNotBlank() }
+                            }
+                        } else {
+                            page.url.takeIf { it.isNotBlank() }
+                        }
+                        ?: return@async null
+
+                    val resolvedUrl = resolveUrl(rawUrl) ?: return@async null
+                    val pageForReq = Page(page.index, page.url, resolvedUrl, page.uri)
+                    val perPageHeaders = buildMap {
+                        putAll(defaultHeaders)
+                        if (http != null) {
+                            runCatching { http.resolveImageRequest(pageForReq) }.getOrNull()?.headers?.let { h ->
+                                for (i in 0 until h.size) {
+                                    put(h.name(i), h.value(i))
+                                }
+                            }
+                        }
+                    }
+                    MangaPage(
+                        index = idx,
+                        imageUrl = resolvedUrl,
+                        headers = perPageHeaders
+                    )
                 }
-                ?: return@mapIndexedNotNull null
-            MangaPage(
-                index = idx,
-                imageUrl = resolvedUrl,
-                headers = defaultHeaders
-            )
+            }.awaitAll().filterNotNull()
         }
     }
 
-    private fun mapMangasPage(mp: MangasPage): List<MangaSummary> = mp.mangas.map { item ->
-        MangaSummary(
-            id = "$sourceId:${item.url}",
-            extensionId = extensionId,
-            sourceId = sourceId,
-            sourceName = name,
-            title = item.title.ifBlank { "Untitled" },
-            url = item.url,
-            coverUrl = item.thumbnail_url,
-            author = item.author,
-            status = mapStatus(item.status)
-        )
+    private fun mapMangasPage(mp: MangasPage): MangaCatalogPage {
+        val items = mp.mangas.map { item ->
+            MangaSummary(
+                id = "$sourceId:${item.url}",
+                extensionId = extensionId,
+                sourceId = sourceId,
+                sourceName = name,
+                title = item.title.ifBlank { "Untitled" },
+                url = item.url,
+                coverUrl = resolveUrl(item.thumbnail_url),
+                coverHeaders = defaultHeaders,
+                author = item.author,
+                status = mapStatus(item.status),
+                description = item.description
+            )
+        }
+        return MangaCatalogPage(items = items, hasNextPage = mp.hasNextPage)
+    }
+
+    private fun resolveUrl(raw: String?): String? {
+        val cleaned = raw?.trim()?.takeIf { it.isNotBlank() } ?: return null
+        return when {
+            cleaned.startsWith("http://", ignoreCase = true) ||
+                cleaned.startsWith("https://", ignoreCase = true) -> cleaned
+            cleaned.startsWith("//") -> "https:$cleaned"
+            cleaned.startsWith("/") && baseUrl.isNotBlank() -> "${baseUrl.trimEnd('/')}$cleaned"
+            else -> cleaned
+        }
     }
 
     private fun mapStatus(status: Int): String? = when (status) {
@@ -301,6 +446,7 @@ private class ReflectiveLegacySourceProvider(
     fallbackLang: String,
     private val ioDispatcher: CoroutineDispatcher
 ) : MangaSourceProvider {
+
     private val cls = sourceObj.javaClass
 
     override val sourceId: String = runCatching {
@@ -319,26 +465,31 @@ private class ReflectiveLegacySourceProvider(
         cls.getMethod("getBaseUrl").invoke(sourceObj)?.toString()
     }.getOrNull().orEmpty()
 
-    override suspend fun getPopular(page: Int): Result<List<MangaSummary>> = withContext(ioDispatcher) {
+    override val supportsLatest: Boolean = runCatching {
+        cls.getMethod("getSupportsLatest").invoke(sourceObj) as? Boolean
+    }.getOrNull() ?: true
+
+    override suspend fun getPopular(page: Int): Result<MangaCatalogPage> = withContext(ioDispatcher) {
         runCatching {
             val method = cls.getMethod("fetchPopularManga", Int::class.javaPrimitiveType)
-            extractMangaList(awaitRxSingleOrFirst(method.invoke(sourceObj, page)))
+            extractMangaPage(awaitRxSingleOrFirst(method.invoke(sourceObj, page)))
         }
     }
 
-    override suspend fun getLatest(page: Int): Result<List<MangaSummary>> = withContext(ioDispatcher) {
+    override suspend fun getLatest(page: Int): Result<MangaCatalogPage> = withContext(ioDispatcher) {
         runCatching {
+            if (!supportsLatest) return@runCatching MangaCatalogPage(emptyList(), false)
             val method = cls.getMethod("fetchLatestUpdates", Int::class.javaPrimitiveType)
-            extractMangaList(awaitRxSingleOrFirst(method.invoke(sourceObj, page)))
+            extractMangaPage(awaitRxSingleOrFirst(method.invoke(sourceObj, page)))
         }
     }
 
-    override suspend fun search(query: String, page: Int): Result<List<MangaSummary>> = withContext(ioDispatcher) {
+    override suspend fun search(query: String, page: Int): Result<MangaCatalogPage> = withContext(ioDispatcher) {
         runCatching {
             val filterListClass = cls.classLoader?.loadClass("eu.kanade.tachiyomi.source.model.FilterList")
             val emptyFilters = filterListClass?.getDeclaredConstructor()?.newInstance()
             val method = cls.methods.first { it.name == "fetchSearchManga" && it.parameterTypes.size == 3 }
-            extractMangaList(awaitRxSingleOrFirst(method.invoke(sourceObj, page, query, emptyFilters)))
+            extractMangaPage(awaitRxSingleOrFirst(method.invoke(sourceObj, page, query, emptyFilters)))
         }
     }
 
@@ -350,8 +501,9 @@ private class ReflectiveLegacySourceProvider(
             val chapters = getChapters(manga).getOrDefault(emptyList())
             MangaDetails(
                 summary = manga.copy(
+                    title = readProp(resolved, "getTitle")?.takeIf { it.isNotBlank() } ?: manga.title,
                     author = readProp(resolved, "getAuthor") ?: manga.author,
-                    coverUrl = readProp(resolved, "getThumbnail_url") ?: manga.coverUrl
+                    coverUrl = resolveUrl(readProp(resolved, "getThumbnail_url")) ?: manga.coverUrl
                 ),
                 artist = readProp(resolved, "getArtist"),
                 description = readProp(resolved, "getDescription"),
@@ -398,18 +550,22 @@ private class ReflectiveLegacySourceProvider(
             val list = awaitRxSingleOrFirst(method.invoke(sourceObj, sChapter)) as? List<*> ?: emptyList<Any>()
             list.mapIndexedNotNull { idx, p ->
                 if (p == null) return@mapIndexedNotNull null
-                val imgUrl = readProp(p, "getImageUrl") ?: readProp(p, "getUrl") ?: return@mapIndexedNotNull null
+                val imgUrl = resolveUrl(readProp(p, "getImageUrl") ?: readProp(p, "getUrl"))
+                    ?: return@mapIndexedNotNull null
                 MangaPage(index = idx, imageUrl = imgUrl)
             }
         }
     }
 
-    private fun extractMangaList(pageObj: Any?): List<MangaSummary> {
-        if (pageObj == null) return emptyList()
+    private fun extractMangaPage(pageObj: Any?): MangaCatalogPage {
+        if (pageObj == null) return MangaCatalogPage(emptyList(), false)
         val mangas = runCatching {
             pageObj.javaClass.getMethod("getMangas").invoke(pageObj) as? List<*>
-        }.getOrNull() ?: return emptyList()
-        return mangas.mapNotNull { item ->
+        }.getOrNull() ?: return MangaCatalogPage(emptyList(), false)
+        val hasNext = runCatching {
+            pageObj.javaClass.getMethod("getHasNextPage").invoke(pageObj) as? Boolean
+        }.getOrNull() ?: false
+        val items = mangas.mapNotNull { item ->
             if (item == null) return@mapNotNull null
             val url = readProp(item, "getUrl") ?: return@mapNotNull null
             val title = readProp(item, "getTitle") ?: "Untitled"
@@ -420,9 +576,21 @@ private class ReflectiveLegacySourceProvider(
                 sourceName = name,
                 title = title,
                 url = url,
-                coverUrl = readProp(item, "getThumbnail_url"),
+                coverUrl = resolveUrl(readProp(item, "getThumbnail_url")),
                 author = readProp(item, "getAuthor")
             )
+        }
+        return MangaCatalogPage(items = items, hasNextPage = hasNext)
+    }
+
+    private fun resolveUrl(raw: String?): String? {
+        val cleaned = raw?.trim()?.takeIf { it.isNotBlank() } ?: return null
+        return when {
+            cleaned.startsWith("http://", ignoreCase = true) ||
+                cleaned.startsWith("https://", ignoreCase = true) -> cleaned
+            cleaned.startsWith("//") -> "https:$cleaned"
+            cleaned.startsWith("/") && baseUrl.isNotBlank() -> "${baseUrl.trimEnd('/')}$cleaned"
+            else -> cleaned
         }
     }
 

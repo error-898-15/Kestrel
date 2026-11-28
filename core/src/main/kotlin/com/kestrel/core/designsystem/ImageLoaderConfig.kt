@@ -16,6 +16,7 @@ import coil3.network.okhttp.OkHttpNetworkFetcherFactory
 import coil3.request.ImageRequest
 import coil3.request.allowHardware
 import coil3.request.crossfade
+import coil3.size.Size
 import okhttp3.OkHttpClient
 import java.io.File
 
@@ -69,6 +70,39 @@ fun rememberKestrelImageRequest(
                 .data(url)
                 .size(width, height)
                 .apply {
+                    if (headers.isNotEmpty()) {
+                        val hb = NetworkHeaders.Builder()
+                        headers.forEach { (k, v) -> hb[k] = v }
+                        httpHeaders(hb.build())
+                    }
+                }
+                .build()
+        }
+    }
+}
+
+/**
+ * Builds (and remembers) a Coil ImageRequest preserving original aspect/dimensions,
+ * ideal for tall manga/webtoon strips where bounding pixel dimensions causes distortion or collapse.
+ */
+@Composable
+fun rememberKestrelOriginalImageRequest(
+    url: String?,
+    headers: Map<String, String>,
+    retryNonce: Int = 0
+): ImageRequest? {
+    val context = LocalContext.current
+    return remember(url, headers, retryNonce) {
+        if (url.isNullOrBlank()) {
+            null
+        } else {
+            ImageRequest.Builder(context)
+                .data(url)
+                .size(Size.ORIGINAL)
+                .apply {
+                    if (retryNonce > 0) {
+                        memoryCacheKey("${url}_$retryNonce")
+                    }
                     if (headers.isNotEmpty()) {
                         val hb = NetworkHeaders.Builder()
                         headers.forEach { (k, v) -> hb[k] = v }

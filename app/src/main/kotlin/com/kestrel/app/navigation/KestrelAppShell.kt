@@ -290,6 +290,11 @@ fun KestrelAppShell() {
                         navController.navigate(
                             mangaReaderRoute(extId, srcId, mangaUrl, chapterUrl)
                         )
+                    },
+                    onOpenManga = { manga ->
+                        navController.navigate(
+                            mangaDetailsRoute(manga.extensionId, manga.sourceId, manga.url)
+                        )
                     }
                 )
             }

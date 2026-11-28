@@ -16,7 +16,8 @@ data class MangaSourceDescriptor(
     val id: String,
     val name: String,
     val lang: String,
-    val baseUrl: String = ""
+    val baseUrl: String = "",
+    val isVideo: Boolean = false
 )
 
 @Serializable
@@ -72,8 +73,34 @@ data class MangaSummary(
     val title: String,
     val url: String,
     val coverUrl: String? = null,
+    val coverHeaders: Map<String, String> = emptyMap(),
     val author: String? = null,
-    val status: String? = null
+    val status: String? = null,
+    val description: String? = null,
+    val rating: Double? = null
+)
+
+@Serializable
+enum class MangaBrowseMode {
+    POPULAR,
+    LATEST
+}
+
+@Serializable
+data class MangaCatalogPage(
+    val items: List<MangaSummary> = emptyList(),
+    val hasNextPage: Boolean = false
+)
+
+@Serializable
+data class MangaSectionRow(
+    val id: String,
+    val title: String,
+    val sourceId: String?,
+    val sourceName: String,
+    val browseMode: MangaBrowseMode,
+    val items: List<MangaSummary>,
+    val hasNextPage: Boolean = false
 )
 
 @Serializable
@@ -99,10 +126,35 @@ data class MangaDetails(
 )
 
 @Serializable
+data class MangaProgressInfo(
+    val mangaId: String,
+    val extensionId: String,
+    val sourceId: String,
+    val sourceName: String,
+    val title: String,
+    val url: String,
+    val coverUrl: String? = null,
+    val isFavorite: Boolean = false,
+    val lastChapterId: String? = null,
+    val lastChapterName: String? = null,
+    val lastPageRead: Int = 0,
+    val totalPages: Int = 0,
+    val readChapterIds: Set<String> = emptySet(),
+    val updatedAtEpochMs: Long = 0L
+)
+
+@Serializable
 data class MangaPage(
     val index: Int,
     val imageUrl: String,
     val headers: Map<String, String> = emptyMap()
+)
+
+@Serializable
+data class DownloadedChapterManifest(
+    val chapterId: String,
+    val mangaId: String,
+    val pagePaths: List<String>
 )
 
 @Serializable
@@ -136,7 +188,7 @@ data class MangaReaderSettings(
     val overscroll: Boolean = true,
     val autoWebtoonMode: Boolean = false,
     val navigateByNumber: Boolean = false,
-    val fitToScreenWidth: Boolean = false,
+    val fitToScreenWidth: Boolean = true,
 
     val controlTheme: MangaControlTheme = MangaControlTheme.DEFAULT,
     val background: MangaReaderBackground = MangaReaderBackground.BLACK,

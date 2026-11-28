@@ -55,15 +55,44 @@ abstract class HttpSource : CatalogueSource {
 
     override fun toString(): String = "$name (${lang.uppercase()})"
 
-    // --- tachiyomix 1.6 primary suspend contract (bridges legacy 1.4/1.5 RxJava sources if subclassed) ---
+    private fun isOverridden(methodName: String, vararg params: Class<*>): Boolean {
+        return runCatching {
+            val method = javaClass.getMethod(methodName, *params)
+            method.declaringClass != HttpSource::class.java
+        }.getOrDefault(false)
+    }
+
+    private fun isProtectedOverridden(methodName: String, vararg params: Class<*>): Boolean {
+        var cls: Class<*>? = javaClass
+        while (cls != null && cls != HttpSource::class.java) {
+            val found = runCatching { cls!!.getDeclaredMethod(methodName, *params) }.isSuccess
+            if (found) return true
+            cls = cls.superclass
+        }
+        return false
+    }
+
+    // --- tachiyomix 1.5/1.6 suspend contract (bridges legacy 1.4 RxJava sources cleanly) ---
 
     override suspend fun getPopularManga(page: Int): MangasPage = withContext(Dispatchers.IO) {
+        if (!isProtectedOverridden("popularMangaRequest", Int::class.javaPrimitiveType!!) &&
+            isOverridden("fetchPopularManga", Int::class.javaPrimitiveType!!)
+        ) {
+            @Suppress("DEPRECATION")
+            return@withContext fetchPopularManga(page).toBlocking().first()
+        }
         val req = popularMangaRequest(page)
         val resp = client.newCall(req).awaitSuccess()
         popularMangaParse(resp)
     }
 
     override suspend fun getLatestUpdates(page: Int): MangasPage = withContext(Dispatchers.IO) {
+        if (!isProtectedOverridden("latestUpdatesRequest", Int::class.javaPrimitiveType!!) &&
+            isOverridden("fetchLatestUpdates", Int::class.javaPrimitiveType!!)
+        ) {
+            @Suppress("DEPRECATION")
+            return@withContext fetchLatestUpdates(page).toBlocking().first()
+        }
         val req = latestUpdatesRequest(page)
         val resp = client.newCall(req).awaitSuccess()
         latestUpdatesParse(resp)
@@ -71,10 +100,60 @@ abstract class HttpSource : CatalogueSource {
 
     override suspend fun getSearchManga(page: Int, query: String, filters: FilterList): MangasPage =
         withContext(Dispatchers.IO) {
+            if (!isProtectedOverridden(
+                    "searchMangaRequest",
+                    Int::class.javaPrimitiveType!!,
+                    String::class.java,
+                    FilterList::class.java
+                ) &&
+                isOverridden(
+                    "fetchSearchManga",
+                    Int::class.javaPrimitiveType!!,
+                    String::class.java,
+                    FilterList::class.java
+                )
+            ) {
+                @Suppress("DEPRECATION")
+                return@withContext fetchSearchManga(page, query, filters).toBlocking().first()
+            }
             val req = searchMangaRequest(page, query, filters)
             val resp = client.newCall(req).awaitSuccess()
             searchMangaParse(resp)
         }
+
+    open suspend fun getMangaDetails(manga: SManga): SManga = withContext(Dispatchers.IO) {
+        if (!isOverridden("mangaDetailsRequest", SManga::class.java) &&
+            !isProtectedOverridden("mangaDetailsParse", Response::class.java) &&
+            isOverridden("fetchMangaDetails", SManga::class.java)
+        ) {
+            @Suppress("DEPRECATION")
+            return@withContext fetchMangaDetails(manga).toBlocking().first().also { parsed ->
+                if (parsed.url.isBlank()) parsed.url = manga.url
+                if (parsed.title.isBlank()) parsed.title = manga.title
+                if (parsed.thumbnail_url.isNullOrBlank()) parsed.thumbnail_url = manga.thumbnail_url
+                parsed.initialized = true
+            }
+        }
+        val resp = client.newCall(mangaDetailsRequest(manga)).awaitSuccess()
+        mangaDetailsParse(resp).also { parsed ->
+            if (parsed.url.isBlank()) parsed.url = manga.url
+            if (parsed.title.isBlank()) parsed.title = manga.title
+            if (parsed.thumbnail_url.isNullOrBlank()) parsed.thumbnail_url = manga.thumbnail_url
+            parsed.initialized = true
+        }
+    }
+
+    open suspend fun getChapterList(manga: SManga): List<SChapter> = withContext(Dispatchers.IO) {
+        if (!isOverridden("chapterListRequest", SManga::class.java) &&
+            !isProtectedOverridden("chapterListParse", Response::class.java) &&
+            isOverridden("fetchChapterList", SManga::class.java)
+        ) {
+            @Suppress("DEPRECATION")
+            return@withContext fetchChapterList(manga).toBlocking().first()
+        }
+        val resp = client.newCall(chapterListRequest(manga)).awaitSuccess()
+        chapterListParse(resp)
+    }
 
     override suspend fun getMangaUpdate(
         manga: SManga,
@@ -83,18 +162,12 @@ abstract class HttpSource : CatalogueSource {
         fetchChapters: Boolean,
     ): SMangaUpdate = withContext(Dispatchers.IO) {
         val resolvedManga = if (fetchDetails) {
-            val resp = client.newCall(mangaDetailsRequest(manga)).awaitSuccess()
-            mangaDetailsParse(resp).also { parsed ->
-                if (parsed.url.isBlank()) parsed.url = manga.url
-                if (parsed.title.isBlank()) parsed.title = manga.title
-                parsed.initialized = true
-            }
+            runCatching { getMangaDetails(manga) }.getOrElse { manga }
         } else {
             manga
         }
         val resolvedChapters = if (fetchChapters) {
-            val resp = client.newCall(chapterListRequest(resolvedManga)).awaitSuccess()
-            chapterListParse(resp)
+            getChapterList(resolvedManga)
         } else {
             chapters
         }
@@ -102,6 +175,13 @@ abstract class HttpSource : CatalogueSource {
     }
 
     override suspend fun getPageList(chapter: SChapter): List<Page> = withContext(Dispatchers.IO) {
+        if (!isOverridden("pageListRequest", SChapter::class.java) &&
+            !isProtectedOverridden("pageListParse", Response::class.java) &&
+            isOverridden("fetchPageList", SChapter::class.java)
+        ) {
+            @Suppress("DEPRECATION")
+            return@withContext fetchPageList(chapter).toBlocking().first()
+        }
         val resp = client.newCall(pageListRequest(chapter)).awaitSuccess()
         pageListParse(resp)
     }
@@ -116,6 +196,8 @@ abstract class HttpSource : CatalogueSource {
 
     protected open fun imageRequest(page: Page): Request = GET(page.imageUrl!!, headers)
 
+    fun resolveImageRequest(page: Page): Request = imageRequest(page)
+
     // --- Legacy 1.4/1.5 hooks (kept open so older APKs link & run cleanly) ---
 
     open fun fetchPopularManga(page: Int): Observable<MangasPage> =
@@ -128,18 +210,10 @@ abstract class HttpSource : CatalogueSource {
         Observable.fromCallable { kotlinx.coroutines.runBlocking { getSearchManga(page, query, filters) } }
 
     open fun fetchMangaDetails(manga: SManga): Observable<SManga> =
-        Observable.fromCallable {
-            kotlinx.coroutines.runBlocking {
-                getMangaUpdate(manga, emptyList(), fetchDetails = true, fetchChapters = false).manga
-            }
-        }
+        Observable.fromCallable { kotlinx.coroutines.runBlocking { getMangaDetails(manga) } }
 
     open fun fetchChapterList(manga: SManga): Observable<List<SChapter>> =
-        Observable.fromCallable {
-            kotlinx.coroutines.runBlocking {
-                getMangaUpdate(manga, emptyList(), fetchDetails = false, fetchChapters = true).chapters
-            }
-        }
+        Observable.fromCallable { kotlinx.coroutines.runBlocking { getChapterList(manga) } }
 
     open fun fetchPageList(chapter: SChapter): Observable<List<Page>> =
         Observable.fromCallable { kotlinx.coroutines.runBlocking { getPageList(chapter) } }
@@ -162,25 +236,31 @@ abstract class HttpSource : CatalogueSource {
     protected open fun searchMangaParse(response: Response): MangasPage =
         throw UnsupportedOperationException("searchMangaParse not implemented")
 
-    open fun mangaDetailsRequest(manga: SManga): Request = GET(baseUrl + manga.url, headers)
+    open fun mangaDetailsRequest(manga: SManga): Request = GET(resolveUrl(manga.url), headers)
 
     protected open fun mangaDetailsParse(response: Response): SManga =
         throw UnsupportedOperationException("mangaDetailsParse not implemented")
 
-    open fun chapterListRequest(manga: SManga): Request = GET(baseUrl + manga.url, headers)
+    open fun chapterListRequest(manga: SManga): Request = GET(resolveUrl(manga.url), headers)
 
     protected open fun chapterListParse(response: Response): List<SChapter> =
         throw UnsupportedOperationException("chapterListParse not implemented")
 
-    open fun pageListRequest(chapter: SChapter): Request = GET(baseUrl + chapter.url, headers)
+    open fun pageListRequest(chapter: SChapter): Request = GET(resolveUrl(chapter.url), headers)
 
     protected open fun pageListParse(response: Response): List<Page> =
         throw UnsupportedOperationException("pageListParse not implemented")
 
-    open fun imageUrlRequest(page: Page): Request = GET(page.url, headers)
+    open fun imageUrlRequest(page: Page): Request = GET(resolveUrl(page.url), headers)
 
     protected open fun imageUrlParse(response: Response): String =
         throw UnsupportedOperationException("imageUrlParse not implemented")
+
+    private fun resolveUrl(raw: String): String = when {
+        raw.startsWith("http://", ignoreCase = true) || raw.startsWith("https://", ignoreCase = true) -> raw
+        raw.startsWith("//") -> "https:$raw"
+        else -> baseUrl + raw
+    }
 
     fun SChapter.setUrlWithoutDomain(url: String) {
         this.url = getUrlWithoutDomain(url)
@@ -202,7 +282,7 @@ abstract class HttpSource : CatalogueSource {
         }
     }
 
-    open fun getMangaUrl(manga: SManga): String = baseUrl + manga.url
+    open fun getMangaUrl(manga: SManga): String = resolveUrl(manga.url)
 
-    open fun getChapterUrl(chapter: SChapter): String = baseUrl + chapter.url
+    open fun getChapterUrl(chapter: SChapter): String = resolveUrl(chapter.url)
 }

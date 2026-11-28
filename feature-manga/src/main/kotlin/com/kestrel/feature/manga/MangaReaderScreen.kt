@@ -21,7 +21,6 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -32,9 +31,11 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.KeyboardArrowLeft
 import androidx.compose.material.icons.outlined.Add
+import androidx.compose.material.icons.outlined.ErrorOutline
 import androidx.compose.material.icons.outlined.KeyboardArrowDown
 import androidx.compose.material.icons.outlined.Pause
 import androidx.compose.material.icons.outlined.PlayArrow
+import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Remove
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.SkipNext
@@ -71,8 +72,11 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import coil3.compose.AsyncImage
-import com.kestrel.core.designsystem.rememberKestrelImageRequest
+import coil3.compose.SubcomposeAsyncImage
+import coil3.compose.SubcomposeAsyncImageContent
+import com.kestrel.core.designsystem.EmptyStateView
+import com.kestrel.core.designsystem.rememberKestrelOriginalImageRequest
+import com.kestrel.domain.model.MangaPage
 import com.kestrel.domain.model.MangaReaderBackground
 import com.kestrel.domain.model.MangaReadingLayout
 import kotlinx.coroutines.delay
@@ -86,7 +90,6 @@ fun MangaReaderScreen(
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     val settings = state.readerSettings
     val scope = rememberCoroutineScope()
-
     var controlsVisible by remember { mutableStateOf(true) }
     var showChaptersSheet by remember { mutableStateOf(false) }
     var showSettingsSheet by remember { mutableStateOf(false) }
@@ -95,11 +98,16 @@ fun MangaReaderScreen(
 
     val listState = rememberLazyListState()
     val pagerState = rememberPagerState(pageCount = { maxOf(1, state.pages.size) })
-
     val currentPageIndex = if (settings.layout == MangaReadingLayout.CONTINUOUS) {
         listState.firstVisibleItemIndex
     } else {
         pagerState.currentPage
+    }
+
+    LaunchedEffect(currentPageIndex, state.pages.size, state.currentChapter?.id) {
+        if (state.pages.isNotEmpty() && state.currentChapter != null) {
+            viewModel.onPageChanged(currentPageIndex)
+        }
     }
 
     LaunchedEffect(autoScrolling, settings.layout) {
@@ -157,51 +165,69 @@ fun MangaReaderScreen(
                 detectTapGestures(onTap = { controlsVisible = !controlsVisible })
             }
     ) {
-        if (state.isLoadingPages) {
-            CircularProgressIndicator(
-                color = Color(0xFFC0A4E8),
-                modifier = Modifier.align(Alignment.Center)
-            )
-        } else if (settings.layout == MangaReadingLayout.CONTINUOUS) {
-            LazyColumn(
-                state = listState,
-                modifier = Modifier
-                    .fillMaxSize()
-                    .graphicsLayer {
-                        scaleX = zoomScale
-                        scaleY = zoomScale
-                    },
-                verticalArrangement = Arrangement.spacedBy(if (settings.spacedPages) 14.dp else 0.dp)
-            ) {
-                itemsIndexed(state.pages, key = { idx, p -> "${state.currentChapter?.id}_$idx" }) { _, page ->
-                    AsyncImage(
-                        model = rememberKestrelImageRequest(page.imageUrl, page.headers, 1440, 8192),
-                        contentDescription = null,
-                        contentScale = if (settings.fitToScreenWidth) ContentScale.FillWidth else ContentScale.Fit,
-                        colorFilter = colorFilter,
-                        modifier = Modifier.fillMaxWidth()
-                    )
+        when {
+            state.isLoadingPages -> {
+                CircularProgressIndicator(
+                    color = Color(0xFFC0A4E8),
+                    modifier = Modifier.align(Alignment.Center)
+                )
+            }
+
+            state.pagesError != null || state.pages.isEmpty() -> {
+                EmptyStateView(
+                    icon = Icons.Outlined.ErrorOutline,
+                    title = "Failed to load pages",
+                    description = state.pagesError ?: "No manga pages were returned by this source.",
+                    actionLabel = "Retry",
+                    onAction = viewModel::reloadCurrentChapter
+                )
+            }
+
+            settings.layout == MangaReadingLayout.CONTINUOUS -> {
+                LazyColumn(
+                    state = listState,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .graphicsLayer {
+                            scaleX = zoomScale
+                            scaleY = zoomScale
+                        },
+                    verticalArrangement = Arrangement.spacedBy(if (settings.spacedPages) 14.dp else 0.dp)
+                ) {
+                    itemsIndexed(state.pages, key = { idx, _ -> "${state.currentChapter?.id}_$idx" }) { idx, page ->
+                        MangaReaderPageItem(
+                            page = page,
+                            pageIndex = idx,
+                            isContinuous = true,
+                            fitToWidth = settings.fitToScreenWidth,
+                            canvasColor = canvasColor,
+                            colorFilter = colorFilter
+                        )
+                    }
                 }
             }
-        } else {
-            HorizontalPager(
-                state = pagerState,
-                modifier = Modifier
-                    .fillMaxSize()
-                    .graphicsLayer {
-                        scaleX = zoomScale
-                        scaleY = zoomScale
+
+            else -> {
+                HorizontalPager(
+                    state = pagerState,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .graphicsLayer {
+                            scaleX = zoomScale
+                            scaleY = zoomScale
+                        }
+                ) { pageIdx ->
+                    val page = state.pages.getOrNull(pageIdx)
+                    if (page != null) {
+                        MangaReaderPageItem(
+                            page = page,
+                            pageIndex = pageIdx,
+                            isContinuous = false,
+                            fitToWidth = false,
+                            canvasColor = canvasColor,
+                            colorFilter = colorFilter
+                        )
                     }
-            ) { pageIdx ->
-                val page = state.pages.getOrNull(pageIdx)
-                if (page != null) {
-                    AsyncImage(
-                        model = rememberKestrelImageRequest(page.imageUrl, page.headers, 1440, 8192),
-                        contentDescription = null,
-                        contentScale = ContentScale.Fit,
-                        colorFilter = colorFilter,
-                        modifier = Modifier.fillMaxSize()
-                    )
                 }
             }
         }
@@ -229,11 +255,11 @@ fun MangaReaderScreen(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                if (controlsVisible) {
+                AnimatedVisibility(visible = controlsVisible) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         Box(
                             modifier = Modifier
@@ -250,15 +276,13 @@ fun MangaReaderScreen(
                                 tint = Color.White
                             )
                         }
-
-                        // Center Chapter Selector Pill
                         Row(
                             modifier = Modifier
                                 .weight(1f)
-                                .height(48.dp)
-                                .clip(RoundedCornerShape(24.dp))
+                                .height(46.dp)
+                                .clip(RoundedCornerShape(23.dp))
                                 .background(Color(0xEB1C1924))
-                                .border(1.dp, Color.White.copy(alpha = 0.12f), RoundedCornerShape(24.dp))
+                                .border(1.dp, Color.White.copy(alpha = 0.12f), RoundedCornerShape(23.dp))
                                 .clickable { showChaptersSheet = true }
                                 .padding(horizontal = 14.dp),
                             verticalAlignment = Alignment.CenterVertically,
@@ -290,7 +314,7 @@ fun MangaReaderScreen(
                                     overflow = TextOverflow.Ellipsis
                                 )
                                 Text(
-                                    text = "Chapter ${state.currentChapterIndex} of ${state.chapters.size}",
+                                    text = "Chapter ${state.currentChapterIndex + 1} of ${maxOf(1, state.chapters.size)}",
                                     color = Color(0xFFB8B4C4),
                                     fontSize = 11.sp,
                                     maxLines = 1
@@ -302,7 +326,6 @@ fun MangaReaderScreen(
                                 tint = Color(0xFFB8B4C4)
                             )
                         }
-
                         Box(
                             modifier = Modifier
                                 .size(44.dp)
@@ -320,7 +343,6 @@ fun MangaReaderScreen(
                         }
                     }
                 }
-
                 Box(
                     modifier = Modifier
                         .clip(RoundedCornerShape(50))
@@ -399,7 +421,6 @@ fun MangaReaderScreen(
                 ) {
                     Icon(Icons.Outlined.SkipPrevious, contentDescription = "Previous chapter", tint = Color.White)
                 }
-
                 val maxIdx = maxOf(1, state.pages.size - 1)
                 Slider(
                     value = currentPageIndex.toFloat().coerceIn(0f, maxIdx.toFloat()),
@@ -421,7 +442,6 @@ fun MangaReaderScreen(
                     ),
                     modifier = Modifier.weight(1f)
                 )
-
                 IconButton(
                     onClick = viewModel::nextChapter,
                     enabled = state.currentChapterIndex + 1 < state.chapters.size
@@ -452,4 +472,99 @@ fun MangaReaderScreen(
             onDismiss = { showSettingsSheet = false }
         )
     }
+}
+
+@Composable
+private fun MangaReaderPageItem(
+    page: MangaPage,
+    pageIndex: Int,
+    isContinuous: Boolean,
+    fitToWidth: Boolean,
+    canvasColor: Color,
+    colorFilter: ColorFilter
+) {
+    var retryNonce by remember(page.imageUrl) { mutableIntStateOf(0) }
+    val imageRequest = rememberKestrelOriginalImageRequest(page.imageUrl, page.headers, retryNonce)
+
+    SubcomposeAsyncImage(
+        model = imageRequest,
+        contentDescription = "Page ${pageIndex + 1}",
+        contentScale = if (isContinuous && fitToWidth) {
+            ContentScale.FillWidth
+        } else {
+            ContentScale.Fit
+        },
+        colorFilter = colorFilter,
+        modifier = if (isContinuous) {
+            Modifier.fillMaxWidth()
+        } else {
+            Modifier.fillMaxSize()
+        },
+        loading = {
+            Box(
+                modifier = if (isContinuous) {
+                    Modifier
+                        .fillMaxWidth()
+                        .height(420.dp)
+                        .background(canvasColor)
+                } else {
+                    Modifier
+                        .fillMaxSize()
+                        .background(canvasColor)
+                },
+                contentAlignment = Alignment.Center
+            ) {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    CircularProgressIndicator(
+                        color = Color(0xFFC0A4E8),
+                        strokeWidth = 2.5.dp,
+                        modifier = Modifier.size(28.dp)
+                    )
+                    Text(
+                        text = "Loading page ${pageIndex + 1}...",
+                        color = Color(0xFF9F96B8),
+                        fontSize = 12.sp
+                    )
+                }
+            }
+        },
+        error = {
+            Box(
+                modifier = (if (isContinuous) {
+                    Modifier
+                        .fillMaxWidth()
+                        .height(340.dp)
+                } else {
+                    Modifier.fillMaxSize()
+                })
+                    .background(Color(0xFF161220))
+                    .clickable { retryNonce++ },
+                contentAlignment = Alignment.Center
+            ) {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Outlined.Refresh,
+                        contentDescription = "Retry page",
+                        tint = Color(0xFFC0A4E8),
+                        modifier = Modifier.size(28.dp)
+                    )
+                    Text(
+                        text = "Page ${pageIndex + 1} failed to load · Tap to retry",
+                        color = Color(0xFFD6CEE8),
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+            }
+        },
+        success = {
+            SubcomposeAsyncImageContent()
+        }
+    )
 }

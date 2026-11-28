@@ -22,6 +22,8 @@
 -keep class org.jsoup.** { *; }
 -keep class com.fleeksoft.ksoup.** { *; }
 -keep class io.ktor.** { *; }
+-keep class kotlinx.serialization.** { *; }
+-keep class okio.** { *; }
 -keep class androidx.appcompat.app.** { *; }
 -keep class androidx.fragment.app.** { *; }
 -keepattributes *Annotation*,Signature,InnerClasses,EnclosingMethod

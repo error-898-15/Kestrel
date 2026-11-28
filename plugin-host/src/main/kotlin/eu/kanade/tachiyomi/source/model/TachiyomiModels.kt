@@ -81,7 +81,7 @@ class MangasPage(val mangas: List<SManga>, val hasNextPage: Boolean) {
     ): MangasPage = MangasPage(mangas, hasNextPage)
 }
 
-class Page(
+class Page @JvmOverloads constructor(
     val index: Int,
     val url: String = "",
     var imageUrl: String? = null,
