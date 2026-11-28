@@ -1,4 +1,4 @@
-# Preserve CloudStream & Hikari plugin API classes under original package names for runtime DexClassLoader resolution
+# Preserve CloudStream, Hikari, Injekt, and Tachiyomi/Aniyomi plugin API classes under original package names for runtime DexClassLoader / PathClassLoader resolution
 -keep class com.lagradost.cloudstream3.** { *; }
 -keep interface com.lagradost.cloudstream3.** { *; }
 -keep enum com.lagradost.cloudstream3.** { *; }
@@ -8,6 +8,14 @@
 -keep interface com.hikari.ext.** { *; }
 -keep enum com.hikari.ext.** { *; }
 -keep class com.hikari.app.** { *; }
+-keep class eu.kanade.tachiyomi.** { *; }
+-keep interface eu.kanade.tachiyomi.** { *; }
+-keep enum eu.kanade.tachiyomi.** { *; }
+-keep class uy.kohesive.injekt.** { *; }
+-keep interface uy.kohesive.injekt.** { *; }
+-keep class rx.** { *; }
+-keep class okhttp3.** { *; }
+-keep class androidx.preference.** { *; }
 -keep class com.google.android.material.** { *; }
 -keep class com.google.gson.** { *; }
 -keep class com.fasterxml.jackson.** { *; }
@@ -19,4 +27,6 @@
 -keepattributes *Annotation*,Signature,InnerClasses,EnclosingMethod
 -dontwarn com.lagradost.cloudstream3.**
 -dontwarn com.hikari.**
+-dontwarn eu.kanade.tachiyomi.**
+-dontwarn uy.kohesive.injekt.**
 -dontwarn com.google.android.material.**

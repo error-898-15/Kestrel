@@ -30,9 +30,10 @@ android {
 dependencies {
     implementation(project(":core"))
     implementation(project(":domain"))
+
     coreLibraryDesugaring(libs.desugar.jdk.libs)
 
-    // Pinned CloudStream library & runtime dependencies expected by .cs3 plugins
+    // Pinned CloudStream & Tachiyomi/Aniyomi runtime host dependencies
     implementation(libs.cloudstream.library)
     implementation(libs.jackson.module.kotlin)
     implementation(libs.jsoup)
@@ -40,12 +41,15 @@ dependencies {
     implementation(libs.rhino)
     implementation(libs.quickjs.kt)
     implementation(libs.androidx.appcompat)
+    implementation(libs.androidx.preference)
     implementation(libs.material)
     implementation(libs.gson)
     implementation(libs.okhttp)
+    implementation(libs.okhttp.brotli)
+    implementation(libs.okhttp.zstd)
+    implementation(libs.rxjava)
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.kotlinx.serialization.json)
-
     implementation(libs.hilt.android)
     ksp(libs.hilt.compiler)
 

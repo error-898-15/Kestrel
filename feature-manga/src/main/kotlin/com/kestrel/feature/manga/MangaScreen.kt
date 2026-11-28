@@ -16,6 +16,7 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.AutoStories
+import androidx.compose.material.icons.outlined.ErrorOutline
 import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.runtime.Composable
@@ -55,7 +56,8 @@ fun MangaScreen(
     val sources = state.installedExtensions.flatMap { ext ->
         if (ext.sources.isNotEmpty()) ext.sources
         else listOf(com.kestrel.domain.model.MangaSourceDescriptor(ext.id, ext.name, ext.lang))
-    }
+    }.distinctBy { it.id }
+    val duplicateSourceNames = sources.groupingBy { it.name }.eachCount()
 
     KestrelBackground(
         modifier = modifier.fillMaxSize(),
@@ -70,9 +72,9 @@ fun MangaScreen(
                 GlassScreenHeader(
                     title = "Manga",
                     subtitle = if (state.installedExtensions.isEmpty()) {
-                        "Install Aniyomi sources in Settings → Manga Source"
+                        "Install Aniyomi sources in Settings -> Manga Source"
                     } else {
-                        "${state.installedExtensions.size} installed Aniyomi extension(s)"
+                        "${state.installedExtensions.size} installed extension(s)"
                     },
                     trailing = {
                         GlassCircleButton(
@@ -107,9 +109,14 @@ fun MangaScreen(
                             onClick = { viewModel.selectSource(null) }
                         )
                     }
-                    items(sources.distinctBy { it.id }, key = { it.id }) { src ->
+                    items(sources, key = { it.id }) { src ->
+                        val chipLabel = if ((duplicateSourceNames[src.name] ?: 0) > 1) {
+                            "${src.name} (${src.lang.uppercase()})"
+                        } else {
+                            src.name
+                        }
                         GlassChip(
-                            text = src.name,
+                            text = chipLabel,
                             selected = state.selectedSourceId == src.id,
                             onClick = { viewModel.selectSource(src.id) }
                         )
@@ -124,13 +131,34 @@ fun MangaScreen(
                                 modifier = Modifier.align(Alignment.Center)
                             )
                         }
+                        state.error != null && state.items.isEmpty() -> {
+                            EmptyStateView(
+                                icon = Icons.Outlined.ErrorOutline,
+                                title = "Source error",
+                                description = state.error.orEmpty(),
+                                actionLabel = "Retry",
+                                onAction = viewModel::loadCatalog
+                            )
+                        }
                         state.items.isEmpty() -> {
                             EmptyStateView(
                                 icon = Icons.Outlined.AutoStories,
-                                title = "No manga loaded",
-                                description = "Install an Aniyomi manga extension in Settings → Manga Source to browse and read chapters.",
-                                actionLabel = "Open Manga Source",
-                                onAction = onOpenMangaSourceSettings
+                                title = if (state.installedExtensions.isEmpty()) {
+                                    "No manga loaded"
+                                } else {
+                                    "No results from this source"
+                                },
+                                description = if (state.installedExtensions.isEmpty()) {
+                                    "Install an Aniyomi manga extension in Settings -> Manga Source to browse and read chapters."
+                                } else {
+                                    "Try another search query, switch provider, or check the extension in Settings -> Manga Source."
+                                },
+                                actionLabel = if (state.installedExtensions.isEmpty()) "Open Manga Source" else "Retry",
+                                onAction = if (state.installedExtensions.isEmpty()) {
+                                    onOpenMangaSourceSettings
+                                } else {
+                                    viewModel::loadCatalog
+                                }
                             )
                         }
                         else -> {

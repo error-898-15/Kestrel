@@ -124,8 +124,8 @@ class MangaRepositoryImpl @Inject constructor(
         withContext(ioDispatcher) { runCatching { addRepositoryInternal(rawInput) } }
 
     private suspend fun addRepositoryInternal(rawInput: String): MangaRepoConfig {
-        val (resolvedUrl, body) = urlResolver.fetchText(rawInput)
-        val parsed = repoParser.parse(rawInput.trim(), resolvedUrl, body)
+        val (resolvedUrl, rawBytes) = urlResolver.fetchBytes(rawInput)
+        val parsed = repoParser.parseBytes(rawInput.trim(), resolvedUrl, rawBytes)
         mangaRepoDao.upsert(parsed.repo.toEntity())
         val existingById = mangaExtensionDao.getByRepo(parsed.repo.id).associateBy { it.id }
         val merged = parsed.extensions.map { ext ->
@@ -180,31 +180,48 @@ class MangaRepositoryImpl @Inject constructor(
                     .toEntity(json)
             )
             runCatching {
-                var localApkPath: String? = null
-                if (current.apkUrl.isNotBlank()) {
-                    val dir = File(context.filesDir, "manga_extensions/${current.repoId}").apply { mkdirs() }
-                    val outFile = File(dir, "${current.packageName}.apk")
-                    val req = Request.Builder()
-                        .url(current.apkUrl)
-                        .header("User-Agent", RepoUrlResolver.BROWSER_USER_AGENT)
-                        .build()
-                    okHttpClient.newCall(req).execute().use { resp ->
-                        if (resp.isSuccessful) {
-                            resp.body?.byteStream()?.use { input ->
-                                outFile.outputStream().use { output -> input.copyTo(output) }
-                            }
-                            localApkPath = outFile.absolutePath
-                        }
-                    }
+                require(current.apkUrl.isNotBlank()) {
+                    "No APK download URL provided for ${current.name}"
                 }
+                val dir = File(context.filesDir, "manga_extensions/${current.repoId}").apply { mkdirs() }
+                val outFile = File(dir, "${current.packageName}.apk")
+                if (outFile.exists()) {
+                    outFile.setWritable(true, false)
+                    outFile.delete()
+                }
+                val req = Request.Builder()
+                    .url(current.apkUrl)
+                    .header("User-Agent", RepoUrlResolver.BROWSER_USER_AGENT)
+                    .build()
+                okHttpClient.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) {
+                        error("HTTP ${resp.code} downloading ${current.name} APK")
+                    }
+                    resp.body?.byteStream()?.use { input ->
+                        outFile.outputStream().use { output -> input.copyTo(output) }
+                    } ?: error("Empty APK response body for ${current.name}")
+                }
+                require(outFile.exists() && outFile.length() > 64L) {
+                    "Downloaded APK file is empty for ${current.name}"
+                }
+                val header = ByteArray(2)
+                outFile.inputStream().use { it.read(header) }
+                require(header[0] == 'P'.code.toByte() && header[1] == 'K'.code.toByte()) {
+                    "Downloaded file is not a valid APK archive"
+                }
+
+                outFile.setWritable(false, false)
+                outFile.setReadOnly()
+
                 val installed = current.copy(
-                    localApkPath = localApkPath,
+                    localApkPath = outFile.absolutePath,
                     isEnabled = true,
                     installState = MangaExtensionInstallState.INSTALLED,
                     lastError = null
                 )
+                // Validate APK loads cleanly before marking installed
+                extensionLoader.loadExtension(installed).getOrThrow()
                 mangaExtensionDao.upsert(installed.toEntity(json))
-                extensionLoader.loadExtension(installed)
                 installed
             }.onFailure { err ->
                 mangaExtensionDao.upsert(
@@ -232,7 +249,12 @@ class MangaRepositoryImpl @Inject constructor(
     override suspend fun uninstallExtension(extensionId: String) = withContext(ioDispatcher) {
         val current = mangaExtensionDao.getById(extensionId)?.toDomain(json) ?: return@withContext
         extensionLoader.unloadExtension(extensionId)
-        current.localApkPath?.let { File(it).delete() }
+        current.localApkPath?.let { path ->
+            File(path).apply {
+                setWritable(true, false)
+                delete()
+            }
+        }
         mangaExtensionDao.upsert(
             current.copy(
                 localApkPath = null,
@@ -284,22 +306,62 @@ class MangaRepositoryImpl @Inject constructor(
         }
 
     override suspend fun browsePopular(sourceId: String?, page: Int): Result<List<MangaSummary>> {
-        ensureInstalledExtensionsLoaded()
-        val providers = extensionLoader.getAllProviders()
-        val target = if (sourceId != null) providers.firstOrNull { it.sourceId == sourceId } else providers.firstOrNull()
-        return target?.getPopular(page) ?: Result.success(emptyList())
+        val loadError = ensureInstalledExtensionsLoaded()
+        val providers = extensionLoader.getAllProviders().distinctBy { it.sourceId }
+        if (providers.isEmpty()) {
+            return loadError ?: Result.success(emptyList())
+        }
+        if (sourceId != null) {
+            val target = providers.firstOrNull { it.sourceId == sourceId }
+                ?: providers.firstOrNull { it.extensionId == sourceId }
+                ?: return Result.failure(IllegalStateException("Selected manga provider is not loaded"))
+            return target.getPopular(page)
+        }
+        val results = coroutineScope {
+            providers.take(6).map { provider ->
+                async { provider.getPopular(page) }
+            }.awaitAll()
+        }
+        val combined = interleaveSuccessful(results)
+        if (combined.isNotEmpty()) return Result.success(combined)
+        val firstFailure = results.firstNotNullOfOrNull { it.exceptionOrNull() }
+        return if (firstFailure != null) Result.failure(firstFailure) else Result.success(emptyList())
     }
 
     override suspend fun searchManga(query: String, sourceId: String?, page: Int): Result<List<MangaSummary>> {
-        ensureInstalledExtensionsLoaded()
-        val providers = extensionLoader.getAllProviders()
-            .filter { sourceId == null || it.sourceId == sourceId }
-        val results = coroutineScope {
-            providers.take(5).map { provider ->
-                async { provider.search(query, page).getOrDefault(emptyList()) }
-            }.awaitAll().flatten()
+        val loadError = ensureInstalledExtensionsLoaded()
+        val allProviders = extensionLoader.getAllProviders().distinctBy { it.sourceId }
+        if (allProviders.isEmpty()) {
+            return loadError ?: Result.success(emptyList())
         }
-        return Result.success(results)
+        if (sourceId != null) {
+            val target = allProviders.firstOrNull { it.sourceId == sourceId }
+                ?: allProviders.firstOrNull { it.extensionId == sourceId }
+                ?: return Result.failure(IllegalStateException("Selected manga provider is not loaded"))
+            return target.search(query, page)
+        }
+        val results = coroutineScope {
+            allProviders.take(6).map { provider ->
+                async { provider.search(query, page) }
+            }.awaitAll()
+        }
+        val combined = interleaveSuccessful(results)
+        if (combined.isNotEmpty()) return Result.success(combined)
+        val firstFailure = results.firstNotNullOfOrNull { it.exceptionOrNull() }
+        return if (firstFailure != null) Result.failure(firstFailure) else Result.success(emptyList())
+    }
+
+    private fun interleaveSuccessful(results: List<Result<List<MangaSummary>>>): List<MangaSummary> {
+        val lists = results.mapNotNull { it.getOrNull() }.filter { it.isNotEmpty() }
+        if (lists.isEmpty()) return emptyList()
+        val maxLen = lists.maxOf { it.size }
+        return buildList {
+            for (i in 0 until maxLen) {
+                for (list in lists) {
+                    if (i < list.size) add(list[i])
+                }
+            }
+        }
     }
 
     override suspend fun loadMangaDetails(
@@ -397,14 +459,16 @@ class MangaRepositoryImpl @Inject constructor(
         appPreferences.updateMangaReaderSettings(transform)
     }
 
-    private suspend fun ensureInstalledExtensionsLoaded() {
+    private suspend fun ensureInstalledExtensionsLoaded(): Result<List<MangaSummary>>? {
         val installed = mangaExtensionDao.observeAll().first()
             .map { it.toDomain(json) }
             .filter { it.installState == MangaExtensionInstallState.INSTALLED }
+        var lastError: Throwable? = null
         for (ext in installed) {
             if (extensionLoader.getProvidersForExtension(ext.id).isEmpty()) {
-                extensionLoader.loadExtension(ext)
+                extensionLoader.loadExtension(ext).onFailure { lastError = it }
             }
         }
+        return lastError?.let { Result.failure(it) }
     }
 }
