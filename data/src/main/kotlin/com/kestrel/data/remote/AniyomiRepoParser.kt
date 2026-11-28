@@ -87,7 +87,7 @@ class AniyomiRepoParser @Inject constructor(
 
         if (root is JsonArray) {
             val name = deriveRepoName(resolvedUrl)
-            val extensions = root.mapIndexedNotNull { idx, el ->
+            val extensions = root.mapIndexedNotNull { _, el ->
                 val obj = el as? JsonObject ?: return@mapIndexedNotNull null
                 val pkg = obj.str("pkg") ?: obj.str("packageName") ?: return@mapIndexedNotNull null
                 val rawName = obj.str("name").orEmpty().ifBlank { pkg }
@@ -229,14 +229,13 @@ class AniyomiRepoParser @Inject constructor(
         val extRecords = if (extListBytes != null) {
             decodeProtoMessage(extListBytes)[1].orEmpty()
         } else {
-            // Fallback for older flat RepoProto messages where field 1 contains extension sub-messages
             root[1].orEmpty().filter { it.bytes != null && decodeProtoMessage(it.bytes).containsKey(2) }
         }
 
-        val extensions = extRecords.mapIndexedNotNull { idx, rec ->
-            val extBytes = rec.bytes ?: return@mapIndexedNotNull null
+        val extensions = extRecords.mapNotNull { rec ->
+            val extBytes = rec.bytes ?: return@mapNotNull null
             val ext = decodeProtoMessage(extBytes)
-            val pkg = protoString(ext, 2).ifBlank { return@mapIndexedNotNull null }
+            val pkg = protoString(ext, 2).ifBlank { return@mapNotNull null }
             val name = protoString(ext, 1).ifBlank { pkg }
                 .replace(Regex("^(Aniyomi|Tachiyomi):\\s*", RegexOption.IGNORE_CASE), "")
                 .ifBlank { pkg }
@@ -379,8 +378,8 @@ class AniyomiRepoParser @Inject constructor(
             MangaSourceDescriptor(
                 id = s.str("id") ?: "${pkg}_$idx",
                 name = s.str("name") ?: fallbackName,
-                lang = s.str("lang") ?: fallbackLang,
-                baseUrl = s.str("baseUrl").orEmpty()
+                lang = s.str("language") ?: s.str("lang") ?: fallbackLang,
+                baseUrl = s.str("homeUrl") ?: s.str("baseUrl").orEmpty()
             )
         }
     }

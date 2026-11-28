@@ -20,7 +20,9 @@ import com.kestrel.domain.model.MangaExtensionTestResult
 import com.kestrel.domain.model.MangaPage
 import com.kestrel.domain.model.MangaReaderSettings
 import com.kestrel.domain.model.MangaRepoConfig
+import com.kestrel.domain.model.MangaSourceDescriptor
 import com.kestrel.domain.model.MangaSummary
+import com.kestrel.domain.provider.MangaSourceProvider
 import com.kestrel.domain.repository.MangaRepository
 import com.kestrel.pluginhost.aniyomi.AniyomiExtensionLoader
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -213,14 +215,15 @@ class MangaRepositoryImpl @Inject constructor(
                 outFile.setWritable(false, false)
                 outFile.setReadOnly()
 
-                val installed = current.copy(
+                val baseInstalled = current.copy(
                     localApkPath = outFile.absolutePath,
                     isEnabled = true,
                     installState = MangaExtensionInstallState.INSTALLED,
                     lastError = null
                 )
-                // Validate APK loads cleanly before marking installed
-                extensionLoader.loadExtension(installed).getOrThrow()
+                val providers = extensionLoader.loadExtension(baseInstalled).getOrThrow()
+                val syncedSources = providersToDescriptors(providers, baseInstalled.sources)
+                val installed = baseInstalled.copy(sources = syncedSources)
                 mangaExtensionDao.upsert(installed.toEntity(json))
                 installed
             }.onFailure { err ->
@@ -459,6 +462,21 @@ class MangaRepositoryImpl @Inject constructor(
         appPreferences.updateMangaReaderSettings(transform)
     }
 
+    private fun providersToDescriptors(
+        providers: List<MangaSourceProvider>,
+        existing: List<MangaSourceDescriptor>
+    ): List<MangaSourceDescriptor> {
+        if (providers.isEmpty()) return existing
+        return providers.map { p ->
+            MangaSourceDescriptor(
+                id = p.sourceId,
+                name = p.name,
+                lang = p.lang,
+                baseUrl = p.baseUrl
+            )
+        }
+    }
+
     private suspend fun ensureInstalledExtensionsLoaded(): Result<List<MangaSummary>>? {
         val installed = mangaExtensionDao.observeAll().first()
             .map { it.toDomain(json) }
@@ -466,7 +484,14 @@ class MangaRepositoryImpl @Inject constructor(
         var lastError: Throwable? = null
         for (ext in installed) {
             if (extensionLoader.getProvidersForExtension(ext.id).isEmpty()) {
-                extensionLoader.loadExtension(ext).onFailure { lastError = it }
+                extensionLoader.loadExtension(ext)
+                    .onSuccess { providers ->
+                        val synced = providersToDescriptors(providers, ext.sources)
+                        if (synced != ext.sources) {
+                            mangaExtensionDao.upsert(ext.copy(sources = synced).toEntity(json))
+                        }
+                    }
+                    .onFailure { lastError = it }
             }
         }
         return lastError?.let { Result.failure(it) }
