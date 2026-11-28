@@ -6,10 +6,12 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AutoStories
 import androidx.compose.material.icons.filled.Bookmarks
 import androidx.compose.material.icons.filled.Explore
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.outlined.AutoStories
 import androidx.compose.material.icons.outlined.Bookmarks
 import androidx.compose.material.icons.outlined.Explore
 import androidx.compose.material.icons.outlined.Search
@@ -43,6 +45,9 @@ import com.kestrel.core.designsystem.GlassNavItem
 import com.kestrel.feature.details.DetailsScreen
 import com.kestrel.feature.home.HomeScreen
 import com.kestrel.feature.library.LibraryScreen
+import com.kestrel.feature.manga.MangaDetailsScreen
+import com.kestrel.feature.manga.MangaReaderScreen
+import com.kestrel.feature.manga.MangaScreen
 import com.kestrel.feature.player.PlayerScreen
 import com.kestrel.feature.search.SearchScreen
 import com.kestrel.feature.settings.SettingsDestination
@@ -69,6 +74,13 @@ sealed class KestrelRoute(
         selectedIcon = Icons.Filled.Search
     )
 
+    data object Manga : KestrelRoute(
+        route = "manga",
+        label = "Manga",
+        icon = Icons.Outlined.AutoStories,
+        selectedIcon = Icons.Filled.AutoStories
+    )
+
     data object Library : KestrelRoute(
         route = "library",
         label = "Library",
@@ -87,6 +99,7 @@ sealed class KestrelRoute(
 private val TopLevelRoutes = listOf(
     KestrelRoute.Home,
     KestrelRoute.Search,
+    KestrelRoute.Manga,
     KestrelRoute.Library,
     KestrelRoute.Settings
 )
@@ -95,6 +108,26 @@ private fun detailsRoute(providerId: String, url: String): String {
     val encProvider = URLEncoder.encode(providerId, "UTF-8")
     val encUrl = URLEncoder.encode(url, "UTF-8")
     return "details?providerId=$encProvider&url=$encUrl"
+}
+
+private fun mangaDetailsRoute(extensionId: String, sourceId: String, mangaUrl: String): String {
+    val encExt = URLEncoder.encode(extensionId, "UTF-8")
+    val encSource = URLEncoder.encode(sourceId, "UTF-8")
+    val encUrl = URLEncoder.encode(mangaUrl, "UTF-8")
+    return "manga_details?extensionId=$encExt&sourceId=$encSource&mangaUrl=$encUrl"
+}
+
+private fun mangaReaderRoute(
+    extensionId: String,
+    sourceId: String,
+    mangaUrl: String,
+    chapterUrl: String
+): String {
+    val encExt = URLEncoder.encode(extensionId, "UTF-8")
+    val encSource = URLEncoder.encode(sourceId, "UTF-8")
+    val encManga = URLEncoder.encode(mangaUrl, "UTF-8")
+    val encChapter = URLEncoder.encode(chapterUrl, "UTF-8")
+    return "manga_reader?extensionId=$encExt&sourceId=$encSource&mangaUrl=$encManga&chapterUrl=$encChapter"
 }
 
 @Composable
@@ -115,7 +148,6 @@ fun KestrelAppShell() {
             )
         }
     }
-
     var pendingSettingsDestination by remember { mutableStateOf<SettingsDestination?>(null) }
     var settingsNavNonce by remember { mutableIntStateOf(0) }
     var navBarCollapsed by remember { mutableStateOf(false) }
@@ -170,6 +202,12 @@ fun KestrelAppShell() {
         navigateToTopTab(KestrelRoute.Settings.route)
     }
 
+    val openMangaSourcesInSettings: () -> Unit = {
+        pendingSettingsDestination = SettingsDestination.MANGA_SOURCE
+        settingsNavNonce++
+        navigateToTopTab(KestrelRoute.Settings.route)
+    }
+
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -193,6 +231,16 @@ fun KestrelAppShell() {
                     onOpenExtensions = openSourcesInSettings,
                     onOpenMedia = { media ->
                         navController.navigate(detailsRoute(media.providerId, media.url))
+                    }
+                )
+            }
+            composable(KestrelRoute.Manga.route) {
+                MangaScreen(
+                    onOpenMangaSourceSettings = openMangaSourcesInSettings,
+                    onOpenManga = { manga ->
+                        navController.navigate(
+                            mangaDetailsRoute(manga.extensionId, manga.sourceId, manga.url)
+                        )
                     }
                 )
             }
@@ -227,6 +275,36 @@ fun KestrelAppShell() {
             }
             composable("player") {
                 PlayerScreen(onBack = { navController.popBackStack() })
+            }
+            composable(
+                route = "manga_details?extensionId={extensionId}&sourceId={sourceId}&mangaUrl={mangaUrl}",
+                arguments = listOf(
+                    navArgument("extensionId") { type = NavType.StringType; defaultValue = "" },
+                    navArgument("sourceId") { type = NavType.StringType; defaultValue = "" },
+                    navArgument("mangaUrl") { type = NavType.StringType; defaultValue = "" }
+                )
+            ) {
+                MangaDetailsScreen(
+                    onBack = { navController.popBackStack() },
+                    onReadChapter = { extId, srcId, mangaUrl, chapterUrl ->
+                        navController.navigate(
+                            mangaReaderRoute(extId, srcId, mangaUrl, chapterUrl)
+                        )
+                    }
+                )
+            }
+            composable(
+                route = "manga_reader?extensionId={extensionId}&sourceId={sourceId}&mangaUrl={mangaUrl}&chapterUrl={chapterUrl}",
+                arguments = listOf(
+                    navArgument("extensionId") { type = NavType.StringType; defaultValue = "" },
+                    navArgument("sourceId") { type = NavType.StringType; defaultValue = "" },
+                    navArgument("mangaUrl") { type = NavType.StringType; defaultValue = "" },
+                    navArgument("chapterUrl") { type = NavType.StringType; defaultValue = "" }
+                )
+            ) {
+                MangaReaderScreen(
+                    onBack = { navController.popBackStack() }
+                )
             }
         }
 

@@ -1,0 +1,410 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+package com.kestrel.data.repository
+
+import android.content.Context
+import com.kestrel.core.di.IoDispatcher
+import com.kestrel.data.local.MangaExtensionDao
+import com.kestrel.data.local.MangaLibraryDao
+import com.kestrel.data.local.MangaLibraryEntity
+import com.kestrel.data.local.MangaRepoDao
+import com.kestrel.data.local.toDomain
+import com.kestrel.data.local.toEntity
+import com.kestrel.data.preferences.AppPreferences
+import com.kestrel.data.remote.AniyomiRepoParser
+import com.kestrel.data.remote.RepoUrlResolver
+import com.kestrel.domain.model.MangaChapter
+import com.kestrel.domain.model.MangaDetails
+import com.kestrel.domain.model.MangaExtensionInstallState
+import com.kestrel.domain.model.MangaExtensionMetadata
+import com.kestrel.domain.model.MangaExtensionTestResult
+import com.kestrel.domain.model.MangaPage
+import com.kestrel.domain.model.MangaReaderSettings
+import com.kestrel.domain.model.MangaRepoConfig
+import com.kestrel.domain.model.MangaSummary
+import com.kestrel.domain.repository.MangaRepository
+import com.kestrel.pluginhost.aniyomi.AniyomiExtensionLoader
+import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withContext
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import java.io.File
+import javax.inject.Inject
+import javax.inject.Singleton
+
+@Singleton
+class MangaRepositoryImpl @Inject constructor(
+    @ApplicationContext private val context: Context,
+    private val mangaRepoDao: MangaRepoDao,
+    private val mangaExtensionDao: MangaExtensionDao,
+    private val mangaLibraryDao: MangaLibraryDao,
+    private val urlResolver: RepoUrlResolver,
+    private val repoParser: AniyomiRepoParser,
+    private val extensionLoader: AniyomiExtensionLoader,
+    private val appPreferences: AppPreferences,
+    private val okHttpClient: OkHttpClient,
+    private val json: Json,
+    @IoDispatcher private val ioDispatcher: CoroutineDispatcher
+) : MangaRepository {
+
+    private val seedMutex = Mutex()
+
+    override val repositories: Flow<List<MangaRepoConfig>> =
+        mangaRepoDao.observeAll().map { list -> list.map { it.toDomain() } }
+
+    override val extensions: Flow<List<MangaExtensionMetadata>> =
+        mangaExtensionDao.observeAll().map { list -> list.map { it.toDomain(json) } }
+
+    override val readerSettings: Flow<MangaReaderSettings> =
+        appPreferences.mangaReaderSettings
+
+    override suspend fun ensureDefaultMangaRepositoriesSeeded() = withContext(ioDispatcher) {
+        seedMutex.withLock {
+            val alreadySeeded = appPreferences.getSeededMangaRepoUrls()
+            val pending = DefaultMangaRepositories.ALL.filterNot { it in alreadySeeded }
+            if (pending.isEmpty()) return@withContext
+            val existingUrls = mangaRepoDao.observeAll().first()
+                .flatMap { listOf(it.url, it.resolvedUrl) }
+                .toSet()
+            val semaphore = Semaphore(3)
+            coroutineScope {
+                pending.map { repoUrl ->
+                    async {
+                        semaphore.withPermit {
+                            if (repoUrl in existingUrls) {
+                                appPreferences.markMangaRepoSeeded(repoUrl)
+                                return@withPermit
+                            }
+                            runCatching {
+                                addRepositoryInternal(repoUrl)
+                                appPreferences.markMangaRepoSeeded(repoUrl)
+                            }
+                        }
+                    }
+                }.awaitAll()
+            }
+            Unit
+        }
+    }
+
+    override suspend fun restoreDefaultMangaRepositories(): Result<Int> = withContext(ioDispatcher) {
+        runCatching {
+            appPreferences.clearSeededMangaRepos()
+            val existingUrls = mangaRepoDao.observeAll().first()
+                .flatMap { listOf(it.url, it.resolvedUrl) }
+                .toSet()
+            var added = 0
+            for (url in DefaultMangaRepositories.ALL) {
+                if (url !in existingUrls) {
+                    if (runCatching { addRepositoryInternal(url) }.isSuccess) {
+                        added++
+                        appPreferences.markMangaRepoSeeded(url)
+                    }
+                } else {
+                    appPreferences.markMangaRepoSeeded(url)
+                }
+            }
+            added
+        }
+    }
+
+    override suspend fun addRepository(rawInput: String): Result<MangaRepoConfig> =
+        withContext(ioDispatcher) { runCatching { addRepositoryInternal(rawInput) } }
+
+    private suspend fun addRepositoryInternal(rawInput: String): MangaRepoConfig {
+        val (resolvedUrl, body) = urlResolver.fetchText(rawInput)
+        val parsed = repoParser.parse(rawInput.trim(), resolvedUrl, body)
+        mangaRepoDao.upsert(parsed.repo.toEntity())
+        val existingById = mangaExtensionDao.getByRepo(parsed.repo.id).associateBy { it.id }
+        val merged = parsed.extensions.map { ext ->
+            val old = existingById[ext.id]
+            if (old != null) {
+                ext.copy(
+                    localApkPath = old.localApkPath,
+                    isEnabled = old.isEnabled,
+                    installState = runCatching { MangaExtensionInstallState.valueOf(old.installState) }
+                        .getOrDefault(ext.installState)
+                )
+            } else {
+                ext
+            }
+        }
+        mangaExtensionDao.upsertAll(merged.map { it.toEntity(json) })
+        return parsed.repo
+    }
+
+    override suspend fun refreshRepository(repoId: String): Result<MangaRepoConfig> =
+        withContext(ioDispatcher) {
+            val existing = mangaRepoDao.getById(repoId)?.toDomain()
+                ?: return@withContext Result.failure(IllegalArgumentException("Repository not found"))
+            runCatching {
+                addRepositoryInternal(existing.url)
+            }.onFailure { err ->
+                mangaRepoDao.upsert(
+                    existing.copy(
+                        isHealthy = false,
+                        lastCheckedEpochMs = System.currentTimeMillis(),
+                        lastError = err.message ?: "Refresh failed"
+                    ).toEntity()
+                )
+            }
+        }
+
+    override suspend fun removeRepository(repoId: String) = withContext(ioDispatcher) {
+        val exts = mangaExtensionDao.getByRepo(repoId)
+        exts.forEach { extensionLoader.unloadExtension(it.id) }
+        File(context.filesDir, "manga_extensions/$repoId").deleteRecursively()
+        mangaExtensionDao.deleteByRepo(repoId)
+        mangaRepoDao.deleteById(repoId)
+    }
+
+    override suspend fun installExtension(extensionId: String): Result<MangaExtensionMetadata> =
+        withContext(ioDispatcher) {
+            val entity = mangaExtensionDao.getById(extensionId)
+                ?: return@withContext Result.failure(IllegalArgumentException("Extension not found"))
+            val current = entity.toDomain(json)
+            mangaExtensionDao.upsert(
+                current.copy(installState = MangaExtensionInstallState.INSTALLING, lastError = null)
+                    .toEntity(json)
+            )
+            runCatching {
+                var localApkPath: String? = null
+                if (current.apkUrl.isNotBlank()) {
+                    val dir = File(context.filesDir, "manga_extensions/${current.repoId}").apply { mkdirs() }
+                    val outFile = File(dir, "${current.packageName}.apk")
+                    val req = Request.Builder()
+                        .url(current.apkUrl)
+                        .header("User-Agent", RepoUrlResolver.BROWSER_USER_AGENT)
+                        .build()
+                    okHttpClient.newCall(req).execute().use { resp ->
+                        if (resp.isSuccessful) {
+                            resp.body?.byteStream()?.use { input ->
+                                outFile.outputStream().use { output -> input.copyTo(output) }
+                            }
+                            localApkPath = outFile.absolutePath
+                        }
+                    }
+                }
+                val installed = current.copy(
+                    localApkPath = localApkPath,
+                    isEnabled = true,
+                    installState = MangaExtensionInstallState.INSTALLED,
+                    lastError = null
+                )
+                mangaExtensionDao.upsert(installed.toEntity(json))
+                extensionLoader.loadExtension(installed)
+                installed
+            }.onFailure { err ->
+                mangaExtensionDao.upsert(
+                    current.copy(
+                        installState = MangaExtensionInstallState.ERROR,
+                        lastError = err.message ?: "Install failed"
+                    ).toEntity(json)
+                )
+            }
+        }
+
+    override suspend fun installAllInRepo(repoId: String): Result<Int> = withContext(ioDispatcher) {
+        runCatching {
+            val list = mangaExtensionDao.getByRepo(repoId)
+            var count = 0
+            for (ext in list) {
+                if (ext.installState != MangaExtensionInstallState.INSTALLED.name) {
+                    if (installExtension(ext.id).isSuccess) count++
+                }
+            }
+            count
+        }
+    }
+
+    override suspend fun uninstallExtension(extensionId: String) = withContext(ioDispatcher) {
+        val current = mangaExtensionDao.getById(extensionId)?.toDomain(json) ?: return@withContext
+        extensionLoader.unloadExtension(extensionId)
+        current.localApkPath?.let { File(it).delete() }
+        mangaExtensionDao.upsert(
+            current.copy(
+                localApkPath = null,
+                isEnabled = false,
+                installState = MangaExtensionInstallState.NOT_INSTALLED,
+                lastError = null
+            ).toEntity(json)
+        )
+    }
+
+    override suspend fun testExtension(extensionId: String): MangaExtensionTestResult =
+        withContext(ioDispatcher) {
+            val ext = mangaExtensionDao.getById(extensionId)?.toDomain(json)
+                ?: return@withContext MangaExtensionTestResult(
+                    extensionId = extensionId,
+                    isReachable = false,
+                    statusCode = 0,
+                    latencyMs = 0L,
+                    checkedUrl = "",
+                    error = "Extension not found"
+                )
+            val target = ext.sources.firstOrNull { it.baseUrl.isNotBlank() }?.baseUrl ?: ext.apkUrl
+            val started = System.currentTimeMillis()
+            runCatching {
+                val req = Request.Builder()
+                    .url(target)
+                    .head()
+                    .header("User-Agent", RepoUrlResolver.BROWSER_USER_AGENT)
+                    .build()
+                okHttpClient.newCall(req).execute().use { resp ->
+                    MangaExtensionTestResult(
+                        extensionId = extensionId,
+                        isReachable = resp.code < 500,
+                        statusCode = resp.code,
+                        latencyMs = System.currentTimeMillis() - started,
+                        checkedUrl = target
+                    )
+                }
+            }.getOrElse { err ->
+                MangaExtensionTestResult(
+                    extensionId = extensionId,
+                    isReachable = false,
+                    statusCode = 0,
+                    latencyMs = System.currentTimeMillis() - started,
+                    checkedUrl = target,
+                    error = err.message
+                )
+            }
+        }
+
+    override suspend fun browsePopular(sourceId: String?, page: Int): Result<List<MangaSummary>> {
+        ensureInstalledExtensionsLoaded()
+        val providers = extensionLoader.getAllProviders()
+        val target = if (sourceId != null) providers.firstOrNull { it.sourceId == sourceId } else providers.firstOrNull()
+        return target?.getPopular(page) ?: Result.success(emptyList())
+    }
+
+    override suspend fun searchManga(query: String, sourceId: String?, page: Int): Result<List<MangaSummary>> {
+        ensureInstalledExtensionsLoaded()
+        val providers = extensionLoader.getAllProviders()
+            .filter { sourceId == null || it.sourceId == sourceId }
+        val results = coroutineScope {
+            providers.take(5).map { provider ->
+                async { provider.search(query, page).getOrDefault(emptyList()) }
+            }.awaitAll().flatten()
+        }
+        return Result.success(results)
+    }
+
+    override suspend fun loadMangaDetails(
+        extensionId: String,
+        sourceId: String,
+        mangaUrl: String
+    ): Result<MangaDetails> {
+        ensureInstalledExtensionsLoaded()
+        val provider = extensionLoader.findProvider(extensionId, sourceId)
+            ?: return Result.failure(IllegalStateException("Manga provider not loaded"))
+        val summary = MangaSummary(
+            id = "$sourceId:$mangaUrl",
+            extensionId = extensionId,
+            sourceId = sourceId,
+            sourceName = provider.name,
+            title = "",
+            url = mangaUrl
+        )
+        return provider.getDetails(summary)
+    }
+
+    override suspend fun loadChapterPages(
+        extensionId: String,
+        sourceId: String,
+        chapter: MangaChapter
+    ): Result<List<MangaPage>> {
+        ensureInstalledExtensionsLoaded()
+        val provider = extensionLoader.findProvider(extensionId, sourceId)
+            ?: return Result.failure(IllegalStateException("Manga provider not loaded"))
+        return provider.getPages(chapter)
+    }
+
+    override suspend fun toggleFavorite(manga: MangaSummary) = withContext(ioDispatcher) {
+        val existing = mangaLibraryDao.getById(manga.id)
+        if (existing != null) {
+            mangaLibraryDao.upsert(
+                existing.copy(isFavorite = !existing.isFavorite, updatedAtEpochMs = System.currentTimeMillis())
+            )
+        } else {
+            mangaLibraryDao.upsert(
+                MangaLibraryEntity(
+                    mangaId = manga.id,
+                    extensionId = manga.extensionId,
+                    sourceId = manga.sourceId,
+                    sourceName = manga.sourceName,
+                    title = manga.title,
+                    url = manga.url,
+                    coverUrl = manga.coverUrl,
+                    isFavorite = true,
+                    lastChapterId = null,
+                    lastChapterName = null,
+                    lastPageRead = 0,
+                    totalPages = 0,
+                    readChapterIdsJson = "[]",
+                    updatedAtEpochMs = System.currentTimeMillis()
+                )
+            )
+        }
+    }
+
+    override suspend fun saveChapterProgress(
+        manga: MangaSummary,
+        chapter: MangaChapter,
+        pageIndex: Int,
+        totalPages: Int
+    ) = withContext(ioDispatcher) {
+        val existing = mangaLibraryDao.getById(manga.id)
+        val readIds = runCatching {
+            json.decodeFromString<List<String>>(existing?.readChapterIdsJson ?: "[]")
+        }.getOrDefault(emptyList()).toMutableSet()
+        if (totalPages > 0 && pageIndex >= totalPages - 2) {
+            readIds.add(chapter.id)
+        }
+        mangaLibraryDao.upsert(
+            MangaLibraryEntity(
+                mangaId = manga.id,
+                extensionId = manga.extensionId,
+                sourceId = manga.sourceId,
+                sourceName = manga.sourceName,
+                title = manga.title,
+                url = manga.url,
+                coverUrl = manga.coverUrl,
+                isFavorite = existing?.isFavorite ?: false,
+                lastChapterId = chapter.id,
+                lastChapterName = chapter.name,
+                lastPageRead = pageIndex,
+                totalPages = totalPages,
+                readChapterIdsJson = json.encodeToString(readIds.toList()),
+                updatedAtEpochMs = System.currentTimeMillis()
+            )
+        )
+    }
+
+    override suspend fun updateReaderSettings(transform: (MangaReaderSettings) -> MangaReaderSettings) {
+        appPreferences.updateMangaReaderSettings(transform)
+    }
+
+    private suspend fun ensureInstalledExtensionsLoaded() {
+        val installed = mangaExtensionDao.observeAll().first()
+            .map { it.toDomain(json) }
+            .filter { it.installState == MangaExtensionInstallState.INSTALLED }
+        for (ext in installed) {
+            if (extensionLoader.getProvidersForExtension(ext.id).isEmpty()) {
+                extensionLoader.loadExtension(ext)
+            }
+        }
+    }
+}

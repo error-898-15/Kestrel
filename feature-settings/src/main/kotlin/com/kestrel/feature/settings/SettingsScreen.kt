@@ -51,6 +51,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.automirrored.outlined.KeyboardArrowRight
 import androidx.compose.material.icons.outlined.ArrowDropDown
+import androidx.compose.material.icons.outlined.AutoStories
 import androidx.compose.material.icons.outlined.Check
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.DeleteOutline
@@ -128,6 +129,9 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil3.compose.AsyncImage
 import com.kestrel.core.designsystem.kestrelNavClearance
 import com.kestrel.core.designsystem.rememberKestrelImageRequest
+import com.kestrel.domain.model.MangaExtensionInstallState
+import com.kestrel.domain.model.MangaExtensionMetadata
+import com.kestrel.domain.model.MangaRepoConfig
 import com.kestrel.domain.model.PlaybackStartMode
 import com.kestrel.domain.model.PlayerOrientationMode
 import com.kestrel.domain.model.PluginInstallState
@@ -145,6 +149,8 @@ enum class SettingsDestination {
     HUB,
     ADDONS,
     PLUGINS,
+    MANGA_SOURCE,
+    MANGA_REPO_DETAIL,
     SERVERS,
     PLAYER
 }
@@ -179,6 +185,8 @@ fun SettingsScreen(
     viewModel: SettingsViewModel = hiltViewModel()
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
+    val mangaViewModel: MangaSourceViewModel = hiltViewModel()
+    val mangaState by mangaViewModel.uiState.collectAsStateWithLifecycle()
     val backStack = remember { mutableStateListOf(SettingsDestination.HUB) }
     var activePickerFamily by remember { mutableStateOf<RepoType?>(null) }
 
@@ -230,11 +238,53 @@ fun SettingsScreen(
                 SettingsDestination.HUB -> {
                     SettingsHubPage(
                         state = state,
+                        mangaRepoCount = mangaState.repos.size,
+                        mangaInstalledCount = mangaState.extensions.count {
+                            it.installState == MangaExtensionInstallState.INSTALLED
+                        },
                         onSearchChanged = viewModel::onSettingsSearchChanged,
                         onNavigate = navigateTo,
                         onResetDisclaimer = viewModel::resetDisclaimer,
                         onDismissBanner = viewModel::dismissBanner
                     )
+                }
+
+                SettingsDestination.MANGA_SOURCE -> {
+                    MangaSourcePage(
+                        state = mangaState,
+                        onBack = navigateBack,
+                        onRepoInputChanged = mangaViewModel::onMangaRepoInputChanged,
+                        onAddRepo = mangaViewModel::addMangaRepository,
+                        onOpenRepo = { repoId ->
+                            mangaViewModel.selectMangaRepo(repoId)
+                            navigateTo(SettingsDestination.MANGA_REPO_DETAIL)
+                        },
+                        onRefreshRepo = mangaViewModel::refreshMangaRepository,
+                        onDeleteRepo = mangaViewModel::removeMangaRepository,
+                        onRestoreDefaults = mangaViewModel::restoreDefaultMangaRepositories,
+                        onDismissBanner = mangaViewModel::dismissBanner
+                    )
+                }
+
+                SettingsDestination.MANGA_REPO_DETAIL -> {
+                    val selectedRepo = mangaState.repos.firstOrNull { it.id == mangaState.selectedRepoId }
+                    if (selectedRepo == null) {
+                        LaunchedEffect(Unit) { navigateBack() }
+                        Box(modifier = Modifier.fillMaxSize())
+                    } else {
+                        MangaRepoDetailPage(
+                            state = mangaState,
+                            repo = selectedRepo,
+                            onBack = navigateBack,
+                            onSearchChanged = mangaViewModel::onMangaExtensionSearchChanged,
+                            onTestAll = mangaViewModel::testAllMangaExtensions,
+                            onInstallAll = mangaViewModel::installAllMangaExtensions,
+                            onTest = mangaViewModel::testMangaExtension,
+                            onInstall = mangaViewModel::installMangaExtension,
+                            onUninstall = mangaViewModel::uninstallMangaExtension,
+                            onDismissBanner = mangaViewModel::dismissBanner
+                        )
+                    }
                 }
 
                 SettingsDestination.PLAYER -> {
@@ -357,7 +407,9 @@ private fun SettingsHubPage(
     onSearchChanged: (String) -> Unit,
     onNavigate: (SettingsDestination) -> Unit,
     onResetDisclaimer: () -> Unit,
-    onDismissBanner: () -> Unit
+    onDismissBanner: () -> Unit,
+    mangaRepoCount: Int = 0,
+    mangaInstalledCount: Int = 0
 ) {
     val navClearance = kestrelNavClearance()
     val query = state.actions.settingsSearchQuery
@@ -376,6 +428,13 @@ private fun SettingsHubPage(
                 keywords = "plugins nuvio cloudstream cs3 vega zangetsu skystream hikari scraper repositories providers install",
                 icon = Icons.Outlined.Extension,
                 destination = SettingsDestination.PLUGINS
+            ),
+            SettingsSearchEntry(
+                title = "Manga Source",
+                breadcrumb = "Sources • Aniyomi & Keiyoushi manga repositories",
+                keywords = "manga source aniyomi tachiyomi keiyoushi extensions repositories",
+                icon = Icons.Outlined.AutoStories,
+                destination = SettingsDestination.MANGA_SOURCE
             ),
             SettingsSearchEntry(
                 title = "Servers",
@@ -536,6 +595,16 @@ private fun SettingsHubPage(
                             "$repoCount repositories • $pluginCount providers"
                         },
                         onClick = { onNavigate(SettingsDestination.PLUGINS) }
+                    )
+                    HorizontalDivider(
+                        color = DividerLine,
+                        modifier = Modifier.padding(start = 68.dp, end = 16.dp)
+                    )
+                    SettingsMenuRow(
+                        icon = Icons.Outlined.AutoStories,
+                        title = "Manga Source",
+                        subtitle = "$mangaRepoCount Aniyomi repositories • $mangaInstalledCount installed",
+                        onClick = { onNavigate(SettingsDestination.MANGA_SOURCE) }
                     )
                     HorizontalDivider(
                         color = DividerLine,
@@ -3427,4 +3496,461 @@ private fun formatFileSize(bytes: Long): String {
     if (kb < 1024.0) return String.format(Locale.US, "%.0f KB", kb)
     val mb = kb / 1024.0
     return String.format(Locale.US, "%.1f MB", mb)
+}
+
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun MangaSourcePage(
+    state: MangaSourceUiState,
+    onBack: () -> Unit,
+    onRepoInputChanged: (String) -> Unit,
+    onAddRepo: () -> Unit,
+    onOpenRepo: (String) -> Unit,
+    onRefreshRepo: (String) -> Unit,
+    onDeleteRepo: (String) -> Unit,
+    onRestoreDefaults: () -> Unit,
+    onDismissBanner: () -> Unit
+) {
+    val navClearance = kestrelNavClearance()
+    val banner = state.bannerMessage
+    val installedTotal = state.extensions.count { it.installState == MangaExtensionInstallState.INSTALLED }
+
+    LazyColumn(
+        modifier = Modifier
+            .fillMaxSize()
+            .statusBarsPadding(),
+        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = navClearance + 24.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
+        item(key = "manga_header") {
+            OledSubPageHeader(title = "Manga Source", onBack = onBack)
+        }
+
+        if (!banner.isNullOrBlank()) {
+            item(key = "manga_banner") {
+                OledBanner(
+                    message = banner,
+                    isError = state.bannerIsError,
+                    onDismiss = onDismissBanner
+                )
+            }
+        }
+
+        item(key = "manga_overview") {
+            OledGroupCard {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        MetadataPill("${state.repos.size} repos")
+                        MetadataPill("${state.extensions.size} extensions")
+                        MetadataPill("$installedTotal installed")
+                    }
+                    Text(
+                        text = "Aniyomi / Keiyoushi manga extension repositories. Install a source, then read manga from the Manga tab.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = InkSecondary
+                    )
+                }
+            }
+        }
+
+        item(key = "manga_add_label") {
+            SectionEyebrow("ADD REPOSITORY")
+        }
+
+        item(key = "manga_add_card") {
+            OledGroupCard {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    OledUrlTextField(
+                        value = state.repoInput,
+                        onValueChange = onRepoInputChanged,
+                        placeholder = "Aniyomi repository URL (index.min.json / index.json)",
+                        onSubmit = onAddRepo
+                    )
+                    OledCrimsonButton(
+                        text = "Add repository",
+                        enabled = state.repoInput.isNotBlank() && !state.isAddingRepo,
+                        busy = state.isAddingRepo,
+                        onClick = onAddRepo
+                    )
+                }
+            }
+        }
+
+        item(key = "manga_repos_label") {
+            SectionEyebrow("REPOSITORIES (${state.repos.size})")
+        }
+
+        if (state.repos.isEmpty()) {
+            item(key = "manga_repos_empty") {
+                OledGroupCard {
+                    Text(
+                        text = "No repositories yet. Default Aniyomi repositories are being added...",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = InkSecondary,
+                        modifier = Modifier.padding(16.dp)
+                    )
+                }
+            }
+        } else {
+            items(state.repos, key = { it.id }) { repo ->
+                val extCount = state.extensions.count { it.repoId == repo.id }
+                val installedCount = state.extensions.count {
+                    it.repoId == repo.id && it.installState == MangaExtensionInstallState.INSTALLED
+                }
+                OledGroupCard {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { onOpenRepo(repo.id) }
+                            .padding(horizontal = 16.dp, vertical = 14.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(44.dp)
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(CrimsonIconBg),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = repo.badgeLabel.ifBlank { repo.name.take(3).uppercase(Locale.US) },
+                                style = MaterialTheme.typography.labelLarge,
+                                fontWeight = FontWeight.Bold,
+                                color = CrimsonAccent,
+                                maxLines = 1
+                            )
+                        }
+                        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                            Text(
+                                text = repo.name,
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Medium,
+                                color = InkPrimary,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Text(
+                                text = "$extCount extensions • $installedCount installed",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = InkSecondary
+                            )
+                            if (!repo.isHealthy && !repo.lastError.isNullOrBlank()) {
+                                Text(
+                                    text = repo.lastError.orEmpty(),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = CrimsonAccent,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                        }
+                        IconButton(onClick = { onRefreshRepo(repo.id) }) {
+                            if (repo.id in state.refreshingRepoIds) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(18.dp),
+                                    strokeWidth = 2.dp,
+                                    color = CrimsonAccent
+                                )
+                            } else {
+                                Icon(
+                                    imageVector = Icons.Outlined.Refresh,
+                                    contentDescription = "Refresh",
+                                    tint = InkSecondary
+                                )
+                            }
+                        }
+                        IconButton(onClick = { onDeleteRepo(repo.id) }) {
+                            Icon(
+                                imageVector = Icons.Outlined.DeleteOutline,
+                                contentDescription = "Remove",
+                                tint = InkSecondary
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        item(key = "manga_restore") {
+            OledGroupCard {
+                TextOnlyMenuRow(
+                    title = "Restore default repositories",
+                    subtitle = "Re-add the Aniyomi, Keiyoushi and other built-in manga repositories.",
+                    onClick = onRestoreDefaults
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun MangaRepoDetailPage(
+    state: MangaSourceUiState,
+    repo: MangaRepoConfig,
+    onBack: () -> Unit,
+    onSearchChanged: (String) -> Unit,
+    onTestAll: (String) -> Unit,
+    onInstallAll: (String) -> Unit,
+    onTest: (String) -> Unit,
+    onInstall: (MangaExtensionMetadata) -> Unit,
+    onUninstall: (String) -> Unit,
+    onDismissBanner: () -> Unit
+) {
+    val navClearance = kestrelNavClearance()
+    val banner = state.bannerMessage
+    val query = state.searchQuery.trim().lowercase(Locale.US)
+    val repoExtensions = remember(state.extensions, repo.id) {
+        state.extensions.filter { it.repoId == repo.id }
+    }
+    val visible = remember(repoExtensions, query) {
+        if (query.isEmpty()) repoExtensions
+        else repoExtensions.filter {
+            it.name.lowercase(Locale.US).contains(query) ||
+                it.packageName.lowercase(Locale.US).contains(query) ||
+                it.lang.lowercase(Locale.US).contains(query)
+        }
+    }
+    val notInstalledCount = visible.count { it.installState != MangaExtensionInstallState.INSTALLED }
+    val testingAll = repo.id in state.testingAllRepoIds
+    val installingAll = repo.id in state.installingAllRepoIds
+
+    LazyColumn(
+        modifier = Modifier
+            .fillMaxSize()
+            .statusBarsPadding(),
+        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = navClearance + 24.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        item(key = "repo_header") {
+            OledSubPageHeader(title = repo.name, onBack = onBack)
+        }
+
+        if (!banner.isNullOrBlank()) {
+            item(key = "repo_banner") {
+                OledBanner(
+                    message = banner,
+                    isError = state.bannerIsError,
+                    onDismiss = onDismissBanner
+                )
+            }
+        }
+
+        item(key = "repo_search") {
+            OledSearchField(
+                value = state.searchQuery,
+                onValueChange = onSearchChanged,
+                placeholder = "Search this repo...",
+                onClear = { onSearchChanged("") }
+            )
+        }
+
+        item(key = "repo_actions") {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                OledCrimsonButton(
+                    text = if (testingAll) "Testing..." else "Test all (${visible.size})",
+                    enabled = visible.isNotEmpty() && !testingAll,
+                    busy = testingAll,
+                    onClick = { onTestAll(repo.id) },
+                    modifier = Modifier.weight(1f)
+                )
+                OledCrimsonButton(
+                    text = if (installingAll) "Installing..." else "Install all ($notInstalledCount)",
+                    enabled = notInstalledCount > 0 && !installingAll,
+                    busy = installingAll,
+                    onClick = { onInstallAll(repo.id) },
+                    modifier = Modifier.weight(1f)
+                )
+            }
+        }
+
+        if (visible.isEmpty()) {
+            item(key = "repo_empty") {
+                OledGroupCard {
+                    Text(
+                        text = if (repoExtensions.isEmpty()) "This repository has no extensions." else "No extensions match your search.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = InkSecondary,
+                        modifier = Modifier.padding(16.dp)
+                    )
+                }
+            }
+        } else {
+            items(visible, key = { it.id }) { ext ->
+                MangaExtensionCard(
+                    extension = ext,
+                    testResult = state.testResults[ext.id],
+                    isTesting = ext.id in state.testingIds,
+                    isBusy = ext.id in state.busyIds,
+                    onTest = { onTest(ext.id) },
+                    onInstall = { onInstall(ext) },
+                    onUninstall = { onUninstall(ext.id) }
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun MangaExtensionCard(
+    extension: MangaExtensionMetadata,
+    testResult: com.kestrel.domain.model.MangaExtensionTestResult?,
+    isTesting: Boolean,
+    isBusy: Boolean,
+    onTest: () -> Unit,
+    onInstall: () -> Unit,
+    onUninstall: () -> Unit
+) {
+    val installed = extension.installState == MangaExtensionInstallState.INSTALLED
+    val installing = isBusy || extension.installState == MangaExtensionInstallState.INSTALLING
+
+    OledGroupCard {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                ExtensionPuzzleIcon(
+                    iconUrl = extension.iconUrl,
+                    fallbackTint = CrimsonAccent
+                )
+                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                    Text(
+                        text = extension.name,
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = InkPrimary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Text(
+                        text = "${extension.lang.uppercase(Locale.US)} · v${extension.versionName} · ${extension.packageName} · v${extension.versionCode}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = InkSecondary,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    if (extension.isNsfw) {
+                        Text(
+                            text = "NSFW",
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = CrimsonAccent
+                        )
+                    }
+                }
+            }
+
+            if (testResult != null) {
+                val ok = testResult.isReachable
+                Text(
+                    text = if (ok) {
+                        "Reachable • HTTP ${testResult.statusCode} • ${testResult.latencyMs} ms"
+                    } else {
+                        "Unreachable • ${testResult.error ?: "HTTP ${testResult.statusCode}"}"
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (ok) PluginGreen else CrimsonAccent,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+            if (extension.installState == MangaExtensionInstallState.ERROR && !extension.lastError.isNullOrBlank()) {
+                Text(
+                    text = extension.lastError.orEmpty(),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = CrimsonAccent,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                MangaActionButton(
+                    text = if (isTesting) "Testing..." else "Test",
+                    filled = false,
+                    enabled = !isTesting,
+                    busy = isTesting,
+                    onClick = onTest,
+                    modifier = Modifier.weight(1f)
+                )
+                MangaActionButton(
+                    text = when {
+                        installing -> "Installing..."
+                        installed -> "Uninstall"
+                        extension.installState == MangaExtensionInstallState.ERROR -> "Retry"
+                        else -> "Install"
+                    },
+                    filled = !installed,
+                    enabled = !installing,
+                    busy = installing,
+                    onClick = if (installed) onUninstall else onInstall,
+                    modifier = Modifier.weight(1f)
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun MangaActionButton(
+    text: String,
+    filled: Boolean,
+    enabled: Boolean,
+    busy: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Button(
+        onClick = onClick,
+        enabled = enabled,
+        modifier = modifier.height(42.dp),
+        shape = RoundedCornerShape(12.dp),
+        colors = ButtonDefaults.buttonColors(
+            containerColor = if (filled) CrimsonAccent else PillSurface,
+            contentColor = if (filled) Color.White else InkPrimary,
+            disabledContainerColor = if (filled) CrimsonMutedButton else PillSurface,
+            disabledContentColor = Color.White.copy(alpha = 0.55f)
+        )
+    ) {
+        if (busy) {
+            CircularProgressIndicator(
+                modifier = Modifier.size(16.dp),
+                strokeWidth = 2.dp,
+                color = Color.White
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+        }
+        Text(
+            text = text,
+            style = MaterialTheme.typography.labelLarge,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 1
+        )
+    }
 }

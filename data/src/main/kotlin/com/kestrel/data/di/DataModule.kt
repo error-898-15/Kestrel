@@ -5,15 +5,20 @@ import android.content.Context
 import androidx.room.Room
 import com.kestrel.data.local.KestrelDatabase
 import com.kestrel.data.local.LibraryDao
+import com.kestrel.data.local.MangaExtensionDao
+import com.kestrel.data.local.MangaLibraryDao
+import com.kestrel.data.local.MangaRepoDao
 import com.kestrel.data.local.PluginDao
 import com.kestrel.data.local.RepoDao
 import com.kestrel.data.preferences.AppPreferences
 import com.kestrel.data.repository.CatalogRepositoryImpl
 import com.kestrel.data.repository.ExtensionRepositoryImpl
 import com.kestrel.data.repository.LibraryRepositoryImpl
+import com.kestrel.data.repository.MangaRepositoryImpl
 import com.kestrel.domain.repository.CatalogRepository
 import com.kestrel.domain.repository.ExtensionRepository
 import com.kestrel.domain.repository.LibraryRepository
+import com.kestrel.domain.repository.MangaRepository
 import com.kestrel.domain.repository.SettingsRepository
 import dagger.Binds
 import dagger.Module
@@ -41,6 +46,10 @@ abstract class DataBindModule {
     @Binds
     @Singleton
     abstract fun bindSettingsRepository(impl: AppPreferences): SettingsRepository
+
+    @Binds
+    @Singleton
+    abstract fun bindMangaRepository(impl: MangaRepositoryImpl): MangaRepository
 }
 
 @Module
@@ -62,4 +71,13 @@ object DataProvideModule {
 
     @Provides
     fun provideLibraryDao(db: KestrelDatabase): LibraryDao = db.libraryDao()
+
+    @Provides
+    fun provideMangaRepoDao(db: KestrelDatabase): MangaRepoDao = db.mangaRepoDao()
+
+    @Provides
+    fun provideMangaExtensionDao(db: KestrelDatabase): MangaExtensionDao = db.mangaExtensionDao()
+
+    @Provides
+    fun provideMangaLibraryDao(db: KestrelDatabase): MangaLibraryDao = db.mangaLibraryDao()
 }

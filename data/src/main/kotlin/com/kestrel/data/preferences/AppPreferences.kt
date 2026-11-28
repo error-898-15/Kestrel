@@ -10,6 +10,7 @@ import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.core.stringSetPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import com.kestrel.domain.model.MangaReaderSettings
 import com.kestrel.domain.model.PlayerOrientationMode
 import com.kestrel.domain.model.ServerSearchSettings
 import com.kestrel.domain.repository.SettingsRepository
@@ -35,6 +36,8 @@ class AppPreferences @Inject constructor(
         val PLAYER_ORIENTATION_MODE = stringPreferencesKey("player_orientation_mode")
         val SERVER_SEARCH_SETTINGS = stringPreferencesKey("server_search_settings_json")
         val SEEDED_DEFAULT_REPO_URLS = stringSetPreferencesKey("seeded_default_repo_urls")
+        val SEEDED_MANGA_REPO_URLS = stringSetPreferencesKey("seeded_manga_repo_urls")
+        val MANGA_READER_SETTINGS = stringPreferencesKey("manga_reader_settings_json")
     }
 
     val disclaimerAccepted: Flow<Boolean> = context.kestrelDataStore.data.map { prefs ->
@@ -79,6 +82,53 @@ class AppPreferences @Inject constructor(
     suspend fun clearSeededDefaultRepos() {
         context.kestrelDataStore.edit { prefs ->
             prefs.remove(Keys.SEEDED_DEFAULT_REPO_URLS)
+        }
+    }
+
+    val mangaReaderSettings: Flow<MangaReaderSettings> =
+        context.kestrelDataStore.data.map { prefs ->
+            val raw = prefs[Keys.MANGA_READER_SETTINGS]
+            if (raw.isNullOrBlank()) {
+                MangaReaderSettings()
+            } else {
+                runCatching {
+                    json.decodeFromString(MangaReaderSettings.serializer(), raw)
+                }.getOrDefault(MangaReaderSettings())
+            }
+        }
+
+    suspend fun updateMangaReaderSettings(
+        transform: (MangaReaderSettings) -> MangaReaderSettings
+    ) {
+        context.kestrelDataStore.edit { prefs ->
+            val current = prefs[Keys.MANGA_READER_SETTINGS]
+                ?.takeIf { it.isNotBlank() }
+                ?.let { raw ->
+                    runCatching {
+                        json.decodeFromString(MangaReaderSettings.serializer(), raw)
+                    }.getOrNull()
+                }
+                ?: MangaReaderSettings()
+            prefs[Keys.MANGA_READER_SETTINGS] = json.encodeToString(
+                MangaReaderSettings.serializer(),
+                transform(current)
+            )
+        }
+    }
+
+    suspend fun getSeededMangaRepoUrls(): Set<String> =
+        context.kestrelDataStore.data.first()[Keys.SEEDED_MANGA_REPO_URLS].orEmpty()
+
+    suspend fun markMangaRepoSeeded(url: String) {
+        context.kestrelDataStore.edit { prefs ->
+            val current = prefs[Keys.SEEDED_MANGA_REPO_URLS].orEmpty()
+            prefs[Keys.SEEDED_MANGA_REPO_URLS] = current + url
+        }
+    }
+
+    suspend fun clearSeededMangaRepos() {
+        context.kestrelDataStore.edit { prefs ->
+            prefs.remove(Keys.SEEDED_MANGA_REPO_URLS)
         }
     }
 
