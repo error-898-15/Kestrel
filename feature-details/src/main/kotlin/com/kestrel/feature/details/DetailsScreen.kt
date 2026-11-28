@@ -398,7 +398,7 @@ fun DetailsScreen(
                                     contentPadding = PaddingValues(horizontal = 20.dp),
                                     horizontalArrangement = Arrangement.spacedBy(12.dp)
                                 ) {
-                                    items(seasons, key = { it.season }) { seasonInfo ->
+                                    itemsIndexed(seasons, key = { idx, s -> "season_${s.season}_$idx" }) { _, seasonInfo ->
                                         SeasonPosterCard(
                                             seasonInfo = seasonInfo,
                                             selected = seasonInfo.season == state.selectedSeason,
@@ -419,7 +419,7 @@ fun DetailsScreen(
                                     contentPadding = PaddingValues(horizontal = 20.dp),
                                     horizontalArrangement = Arrangement.spacedBy(14.dp)
                                 ) {
-                                    items(visibleEpisodes, key = { it.id }) { ep ->
+                                    itemsIndexed(visibleEpisodes, key = { idx, ep -> "ep_card_${ep.id}_$idx" }) { _, ep ->
                                         LandscapeEpisodeCard(
                                             episode = ep,
                                             fallbackPoster = details.backdropUrl ?: details.posterUrl,
@@ -430,7 +430,7 @@ fun DetailsScreen(
                                 }
                             }
                         } else {
-                            items(visibleEpisodes, key = { it.id }) { ep ->
+                            itemsIndexed(visibleEpisodes, key = { idx, ep -> "ep_row_${ep.id}_$idx" }) { _, ep ->
                                 CompactEpisodeRow(
                                     episode = ep,
                                     onClick = { viewModel.resolveForPlay(ep) },
@@ -1523,7 +1523,7 @@ private fun SourcePickerSheet(
             }
         }
 
-        items(visibleStreams, key = { it.id }) { source ->
+        itemsIndexed(visibleStreams, key = { idx, source -> "stream_${source.id}_$idx" }) { _, source ->
             KestrelCard(
                 onClick = { onSelect(source) },
                 modifier = Modifier.fillMaxWidth(),

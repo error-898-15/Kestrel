@@ -16,11 +16,15 @@ import com.kestrel.domain.repository.ExtensionRepository
 import com.kestrel.domain.repository.SettingsRepository
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import java.util.Locale
@@ -77,12 +81,28 @@ data class SettingsUiState(
     val allNonStremioPlugins: List<PluginMetadata> = emptyList(),
     val filteredNonStremioPlugins: List<PluginMetadata> = emptyList(),
     val repoNameById: Map<String, String> = emptyMap(),
+    val pluginCountByRepo: Map<String, Int> = emptyMap(),
+    val enabledNonStremioCount: Int = 0,
     val configurablePluginIds: Set<String> = emptySet(),
     val actions: SettingsActionState = SettingsActionState()
 ) {
     val bannerMessage: String? get() = actions.bannerMessage
 }
 
+private data class IndexedRepoData(
+    val stremioRepos: List<RepoConfig>,
+    val stremioAddons: List<PluginMetadata>,
+    val pluginRepos: List<RepoConfig>,
+    val repoNameById: Map<String, String>,
+    val allNonStremioPlugins: List<PluginMetadata>,
+    val pluginCountByRepo: Map<String, Int>,
+    val enabledNonStremioCount: Int,
+    val searchBlobByPluginId: Map<String, String>,
+    val byPluginIdTemplate: Map<String, InstalledServerExtension>,
+    val configurableIds: Set<String>
+)
+
+@OptIn(FlowPreview::class)
 @HiltViewModel
 class SettingsViewModel @Inject constructor(
     private val settingsRepository: SettingsRepository,
@@ -118,42 +138,18 @@ class SettingsViewModel @Inject constructor(
                 extensionRepository.repositories,
                 extensionRepository.plugins,
                 extensionRepository.configurablePluginIds
-            ) { repos, plugins, configurableIds ->
-                Triple(repos, plugins, configurableIds)
-            }
-
-            combine(
-                serverSliceFlow,
-                repoSliceFlow,
-                actionState
-            ) { (serverSettings, playbackPrefs, activeProviders), (repos, allPlugins, configurableIds), actions ->
-                val (playbackSpeed, playerOrientationMode) = playbackPrefs
-                val byPluginId = LinkedHashMap<String, InstalledServerExtension>()
-
-                activeProviders.forEach { provider ->
-                    byPluginId[provider.pluginId] = InstalledServerExtension(
-                        id = provider.pluginId,
-                        name = provider.name,
-                        repoType = provider.repoType,
-                        language = provider.language
-                    )
-                }
-
-                allPlugins
-                    .filter { it.localFilePath != null && it.isEnabled }
-                    .forEach { plugin ->
-                        if (plugin.id !in byPluginId) {
-                            byPluginId[plugin.id] = InstalledServerExtension(
-                                id = plugin.id,
-                                name = plugin.displayName.ifBlank { plugin.internalName },
-                                repoType = plugin.repoType,
-                                language = plugin.language
-                            )
-                        }
+            ) { repos, allPlugins, configurableIds ->
+                val byPluginIdTemplate = LinkedHashMap<String, InstalledServerExtension>()
+                allPlugins.forEach { plugin ->
+                    if (plugin.localFilePath != null && plugin.isEnabled) {
+                        byPluginIdTemplate[plugin.id] = InstalledServerExtension(
+                            id = plugin.id,
+                            name = plugin.displayName.ifBlank { plugin.internalName },
+                            repoType = plugin.repoType,
+                            language = plugin.language
+                        )
                     }
-
-                val sortedActive = byPluginId.values.sortedBy { it.name.lowercase(Locale.US) }
-
+                }
                 val stremioRepos = repos.filter { it.type == RepoType.STREMIO }
                 val stremioAddons = allPlugins
                     .filter { it.repoType == RepoType.STREMIO }
@@ -171,24 +167,97 @@ class SettingsViewModel @Inject constructor(
                         )
                     )
 
-                val query = actions.pluginSearchQuery.trim().lowercase(Locale.US)
-                val filteredPlugins = allNonStremioPlugins.filter { plugin ->
-                    val matchesRepo = actions.selectedPluginRepoId == null ||
-                        plugin.repoId == actions.selectedPluginRepoId
-                    val matchesMode = when (actions.pluginFilterMode) {
-                        PluginFilterMode.ALL -> true
-                        PluginFilterMode.INSTALLED -> plugin.installState == PluginInstallState.INSTALLED ||
-                            plugin.installState == PluginInstallState.UPDATE_AVAILABLE
-                        PluginFilterMode.UPDATES -> plugin.installState == PluginInstallState.UPDATE_AVAILABLE
-                    }
+                val pluginCountByRepo = HashMap<String, Int>()
+                var enabledNonStremioCount = 0
+                val searchBlobByPluginId = HashMap<String, String>(allNonStremioPlugins.size)
+                allNonStremioPlugins.forEach { plugin ->
+                    pluginCountByRepo[plugin.repoId] = (pluginCountByRepo[plugin.repoId] ?: 0) + 1
+                    if (plugin.isEnabled) enabledNonStremioCount++
                     val repoName = repoNameById[plugin.repoId].orEmpty()
-                    val matchesQuery = query.isEmpty() ||
-                        plugin.displayName.lowercase(Locale.US).contains(query) ||
-                        plugin.internalName.lowercase(Locale.US).contains(query) ||
-                        plugin.description.lowercase(Locale.US).contains(query) ||
-                        repoName.lowercase(Locale.US).contains(query) ||
-                        plugin.tvTypes.any { it.lowercase(Locale.US).contains(query) }
-                    matchesRepo && matchesMode && matchesQuery
+                    searchBlobByPluginId[plugin.id] = buildString {
+                        append(plugin.displayName)
+                        append('
+')
+                        append(plugin.internalName)
+                        append('
+')
+                        append(plugin.description)
+                        append('
+')
+                        append(repoName)
+                        if (plugin.tvTypes.isNotEmpty()) {
+                            append('
+')
+                            append(plugin.tvTypes.joinToString("
+"))
+                        }
+                    }.lowercase(Locale.US)
+                }
+
+                IndexedRepoData(
+                    stremioRepos = stremioRepos,
+                    stremioAddons = stremioAddons,
+                    pluginRepos = pluginRepos,
+                    repoNameById = repoNameById,
+                    allNonStremioPlugins = allNonStremioPlugins,
+                    pluginCountByRepo = pluginCountByRepo,
+                    enabledNonStremioCount = enabledNonStremioCount,
+                    searchBlobByPluginId = searchBlobByPluginId,
+                    byPluginIdTemplate = byPluginIdTemplate,
+                    configurableIds = configurableIds
+                )
+            }
+
+            val debouncedQueryFlow = actionState
+                .map { it.pluginSearchQuery.trim().lowercase(Locale.US) }
+                .distinctUntilChanged()
+                .debounce(120L)
+
+            combine(
+                serverSliceFlow,
+                repoSliceFlow,
+                actionState,
+                debouncedQueryFlow
+            ) { (serverSettings, playbackPrefs, activeProviders), repoData, actions, query ->
+                val (playbackSpeed, playerOrientationMode) = playbackPrefs
+                val byPluginId = LinkedHashMap<String, InstalledServerExtension>()
+
+                activeProviders.forEach { provider ->
+                    byPluginId[provider.pluginId] = InstalledServerExtension(
+                        id = provider.pluginId,
+                        name = provider.name,
+                        repoType = provider.repoType,
+                        language = provider.language
+                    )
+                }
+                repoData.byPluginIdTemplate.forEach { (id, ext) ->
+                    if (id !in byPluginId) {
+                        byPluginId[id] = ext
+                    }
+                }
+
+                val sortedActive = byPluginId.values.sortedBy { it.name.lowercase(Locale.US) }
+
+                val filteredPlugins = if (
+                    query.isEmpty() &&
+                    actions.selectedPluginRepoId == null &&
+                    actions.pluginFilterMode == PluginFilterMode.ALL
+                ) {
+                    repoData.allNonStremioPlugins
+                } else {
+                    repoData.allNonStremioPlugins.filter { plugin ->
+                        val matchesRepo = actions.selectedPluginRepoId == null ||
+                            plugin.repoId == actions.selectedPluginRepoId
+                        val matchesMode = when (actions.pluginFilterMode) {
+                            PluginFilterMode.ALL -> true
+                            PluginFilterMode.INSTALLED -> plugin.installState == PluginInstallState.INSTALLED ||
+                                plugin.installState == PluginInstallState.UPDATE_AVAILABLE
+                            PluginFilterMode.UPDATES -> plugin.installState == PluginInstallState.UPDATE_AVAILABLE
+                        }
+                        val matchesQuery = query.isEmpty() ||
+                            repoData.searchBlobByPluginId[plugin.id].orEmpty().contains(query)
+                        matchesRepo && matchesMode && matchesQuery
+                    }
                 }
 
                 SettingsUiState(
@@ -203,13 +272,15 @@ class SettingsViewModel @Inject constructor(
                     skyStreamExtensions = sortedActive.filter { it.repoType == RepoType.SKYSTREAM },
                     hikariExtensions = sortedActive.filter { it.repoType == RepoType.HIKARI },
                     totalActiveExtensions = sortedActive.size,
-                    stremioRepos = stremioRepos,
-                    stremioAddons = stremioAddons,
-                    pluginRepos = pluginRepos,
-                    allNonStremioPlugins = allNonStremioPlugins,
+                    stremioRepos = repoData.stremioRepos,
+                    stremioAddons = repoData.stremioAddons,
+                    pluginRepos = repoData.pluginRepos,
+                    allNonStremioPlugins = repoData.allNonStremioPlugins,
                     filteredNonStremioPlugins = filteredPlugins,
-                    repoNameById = repoNameById,
-                    configurablePluginIds = configurableIds,
+                    repoNameById = repoData.repoNameById,
+                    pluginCountByRepo = repoData.pluginCountByRepo,
+                    enabledNonStremioCount = repoData.enabledNonStremioCount,
+                    configurablePluginIds = repoData.configurableIds,
                     actions = actions
                 )
             }

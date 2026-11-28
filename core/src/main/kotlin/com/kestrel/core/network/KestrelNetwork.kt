@@ -55,24 +55,33 @@ object KestrelCookieJar : CookieJar {
 }
 
 /**
- * DNS-over-HTTPS (Cloudflare + Google JSON DoH) with short-lived cache and automatic
- * fallback to system DNS. Prevents ISP DNS poisoning/blocking on provider domains.
+ * Fast DNS with automatic DNS-over-HTTPS fallback.
+ * Uses System DNS immediately when valid (zero extra latency on healthy networks),
+ * and falls back to DoH (with short timeouts & dead-endpoint cooldown) when
+ * system DNS fails or returns hijacked loopback/unspecified addresses.
  */
 object KestrelDohDns : Dns {
     private data class CacheEntry(val addresses: List<InetAddress>, val expiresAtMs: Long)
 
+    private const val CACHE_TTL_MS = 5 * 60_000L
+    private const val ENDPOINT_COOLDOWN_MS = 2 * 60_000L
+    private const val MAX_CACHE_ENTRIES = 512
+
     private val cache = ConcurrentHashMap<String, CacheEntry>()
+    private val endpointCooldownUntil = ConcurrentHashMap<String, Long>()
+
     private val bootstrapClient: OkHttpClient by lazy {
         OkHttpClient.Builder()
             .dns(Dns.SYSTEM)
-            .connectTimeout(5, TimeUnit.SECONDS)
-            .readTimeout(5, TimeUnit.SECONDS)
+            .connectTimeout(2500, TimeUnit.MILLISECONDS)
+            .readTimeout(2500, TimeUnit.MILLISECONDS)
+            .callTimeout(3000, TimeUnit.MILLISECONDS)
             .build()
     }
 
     private val dohEndpoints = listOf(
-        "https://1.1.1.1/dns-query",
-        "https://dns.google/resolve"
+        "https://dns.google/resolve",
+        "https://1.1.1.1/dns-query"
     )
 
     override fun lookup(hostname: String): List<InetAddress> {
@@ -93,32 +102,42 @@ object KestrelDohDns : Dns {
             }
         }
 
-        // Try system DNS first; if it resolves to an obviously hijacked loopback/unspecified
-        // address or throws UnknownHostException, resolve cleanly via DoH.
+        // Try system DNS first; return immediately if valid so healthy networks never block on DoH.
         val systemResult = runCatching { Dns.SYSTEM.lookup(hostname) }.getOrNull()
         val validSystem = systemResult?.filterNot {
             it.isLoopbackAddress || it.isAnyLocalAddress || it.hostAddress == "0.0.0.0"
         }.orEmpty()
 
-        val dohResult = resolveViaDoh(cleanHost)
-        val finalList = when {
-            dohResult.isNotEmpty() -> dohResult
-            validSystem.isNotEmpty() -> validSystem
-            else -> systemResult ?: emptyList()
+        val finalList = if (validSystem.isNotEmpty()) {
+            validSystem
+        } else {
+            val dohResult = resolveViaDoh(cleanHost, now)
+            when {
+                dohResult.isNotEmpty() -> dohResult
+                !systemResult.isNullOrEmpty() -> systemResult
+                else -> emptyList()
+            }
         }
 
         if (finalList.isEmpty()) {
-            throw UnknownHostException("Unable to resolve host $hostname via DoH or System DNS")
+            throw UnknownHostException("Unable to resolve host $hostname via System DNS or DoH")
         }
 
-        cache[cleanHost] = CacheEntry(finalList, now + 5 * 60_000L)
+        if (cache.size > MAX_CACHE_ENTRIES) {
+            cache.entries.removeIf { it.value.expiresAtMs <= now }
+            if (cache.size > MAX_CACHE_ENTRIES) cache.clear()
+        }
+        cache[cleanHost] = CacheEntry(finalList, now + CACHE_TTL_MS)
         return finalList
     }
 
-    private fun resolveViaDoh(hostname: String): List<InetAddress> {
+    private fun resolveViaDoh(hostname: String, nowMs: Long): List<InetAddress> {
         for (endpoint in dohEndpoints) {
+            val blockedUntil = endpointCooldownUntil[endpoint] ?: 0L
+            if (blockedUntil > nowMs) continue
             val resolved = queryEndpoint(endpoint, hostname)
             if (resolved.isNotEmpty()) return resolved
+            endpointCooldownUntil[endpoint] = System.currentTimeMillis() + ENDPOINT_COOLDOWN_MS
         }
         return emptyList()
     }

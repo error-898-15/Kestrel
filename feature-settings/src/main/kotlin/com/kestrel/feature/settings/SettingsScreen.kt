@@ -40,6 +40,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -126,6 +127,7 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil3.compose.AsyncImage
 import com.kestrel.core.designsystem.kestrelNavClearance
+import com.kestrel.core.designsystem.rememberKestrelImageRequest
 import com.kestrel.domain.model.PlaybackStartMode
 import com.kestrel.domain.model.PlayerOrientationMode
 import com.kestrel.domain.model.PluginInstallState
@@ -676,7 +678,7 @@ private fun PlayerSettingsPage(
                         color = InkPrimary
                     )
                     LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        items(speedOptions) { spd ->
+                        items(speedOptions, key = { "player_spd_$it" }) { spd ->
                             val label = if (spd == 1.0f) "1x" else "${spd}x"
                             OledFilterChip(
                                 text = label,
@@ -1001,7 +1003,7 @@ private fun PluginsPage(
     val repos = state.pluginRepos
     val allPlugins = state.allNonStremioPlugins
     val visiblePlugins = state.filteredNonStremioPlugins
-    val enabledCount = allPlugins.count { it.isEnabled }
+    val enabledCount = state.enabledNonStremioCount
     val repoInput = state.actions.pluginRepoInput
 
     LazyColumn(
@@ -1087,8 +1089,8 @@ private fun PluginsPage(
                 SectionEyebrow("INSTALLED REPOSITORIES")
             }
 
-            items(repos, key = { "repo_${it.id}" }) { repo ->
-                val count = allPlugins.count { it.repoId == repo.id }
+            items(repos, key = { "repo_${it.id}" }, contentType = { "repo_card" }) { repo ->
+                val count = state.pluginCountByRepo[repo.id] ?: 0
                 val isRefreshing = repo.id in state.actions.refreshingRepoIds
                 val isInstallingAll = repo.id in state.actions.installingRepoIds
 
@@ -1253,7 +1255,7 @@ private fun PluginsPage(
                 }
             }
         } else {
-            items(visiblePlugins, key = { "plugin_${it.id}" }) { plugin ->
+            itemsIndexed(visiblePlugins, key = { idx, it -> "plugin_${it.id}_$idx" }, contentType = { _, _ -> "plugin_card" }) { _, plugin ->
                 val repoName = state.repoNameById[plugin.repoId] ?: plugin.repoType.name
                 val isBusy = plugin.id in state.actions.busyPluginIds || plugin.installState == PluginInstallState.INSTALLING
                 val isConfigurable = plugin.id in state.configurablePluginIds
@@ -1316,22 +1318,19 @@ private fun PluginsPage(
                             )
                         }
 
-                        // Metadata chips & details (type, version, language, size, authors)
-                        FlowRow(
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            verticalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            if (plugin.tvTypes.isNotEmpty()) {
-                                MetadataPill(plugin.tvTypes.joinToString(" | "))
-                            }
-                            MetadataPill("v${plugin.version}")
-                            if (plugin.language.isNotBlank()) {
-                                MetadataPill(plugin.language.uppercase(Locale.US))
-                            }
-                            MetadataPill(repoTypeLabel(plugin.repoType))
-                            plugin.fileSizeBytes?.takeIf { it > 0L }?.let { bytes ->
-                                MetadataPill(formatFileSize(bytes))
-                            }
+                        // Single lightweight metadata pill (avoids per-card FlowRow intrinsic passes across 300+ plugins)
+                        val repoTypeBadge = repoTypeLabel(plugin.repoType)
+                        val metaSummary = remember(plugin.id, plugin.version, plugin.fileSizeBytes, repoTypeBadge) {
+                            buildList {
+                                if (plugin.tvTypes.isNotEmpty()) add(plugin.tvTypes.joinToString(" | "))
+                                add("v${plugin.version}")
+                                if (plugin.language.isNotBlank()) add(plugin.language.uppercase(Locale.US))
+                                add(repoTypeBadge)
+                                plugin.fileSizeBytes?.takeIf { it > 0L }?.let { add(formatFileSize(it)) }
+                            }.joinToString(" · ")
+                        }
+                        if (metaSummary.isNotBlank()) {
+                            MetadataPill(metaSummary)
                         }
 
                         if (plugin.authors.isNotEmpty()) {
@@ -1847,7 +1846,7 @@ private fun PlaybackAndServersPage(
                         color = InkPrimary
                     )
                     LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        items(speedOptions) { spd ->
+                        items(speedOptions, key = { "servers_spd_$it" }) { spd ->
                             val label = if (spd == 1.0f) "1x" else "${spd}x"
                             OledFilterChip(
                                 text = label,
@@ -2207,9 +2206,15 @@ private fun ExtensionPuzzleIcon(
             .background(Color(0xFF1F191C)),
         contentAlignment = Alignment.Center
     ) {
-        if (!iconUrl.isNullOrBlank()) {
+        val iconRequest = rememberKestrelImageRequest(
+            url = iconUrl,
+            headers = emptyMap(),
+            width = 96,
+            height = 96
+        )
+        if (iconRequest != null) {
             AsyncImage(
-                model = iconUrl,
+                model = iconRequest,
                 contentDescription = null,
                 contentScale = ContentScale.Crop,
                 modifier = Modifier
@@ -2697,7 +2702,7 @@ private fun ServerExtensionPickerDialog(
                             .heightIn(max = 360.dp),
                         verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        items(filtered, key = { it.id }) { ext ->
+                        itemsIndexed(filtered, key = { idx, ext -> "${ext.id}_$idx" }) { _, ext ->
                             val isSelected = ext.id in selectedIds
                             Row(
                                 modifier = Modifier

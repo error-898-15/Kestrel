@@ -1,3 +1,4 @@
+import org.jetbrains.kotlin.compose.compiler.gradle.ComposeCompilerGradlePluginExtension
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
 
@@ -16,5 +17,12 @@ plugins {
 subprojects {
     tasks.withType<KotlinCompile>().configureEach {
         compilerOptions.jvmTarget.set(JvmTarget.JVM_11)
+    }
+    plugins.withId("org.jetbrains.kotlin.plugin.compose") {
+        extensions.configure<ComposeCompilerGradlePluginExtension> {
+            stabilityConfigurationFiles.add(
+                rootProject.layout.projectDirectory.file("compose-stability.conf")
+            )
+        }
     }
 }

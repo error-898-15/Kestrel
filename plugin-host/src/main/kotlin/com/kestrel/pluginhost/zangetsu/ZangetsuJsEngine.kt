@@ -1,18 +1,26 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package com.kestrel.pluginhost.zangetsu
 
+import com.kestrel.domain.model.ProviderSettingField
+import com.kestrel.domain.model.ProviderSettingType
 import com.kestrel.pluginhost.nuvio.NuvioJsEngine
+import com.kestrel.pluginhost.settings.ProviderSettingsStore
 import org.json.JSONObject
 import javax.inject.Inject
 import javax.inject.Singleton
 
 @Singleton
 class ZangetsuJsEngine @Inject constructor(
-    private val nuvioJsEngine: NuvioJsEngine
+    private val nuvioJsEngine: NuvioJsEngine,
+    private val settingsStore: ProviderSettingsStore
 ) {
     private fun baseSetup(sourceId: String): String = """
         globalThis.__SOURCE_ID = ${JSONObject.quote(sourceId)};
         var __SOURCE_ID = ${JSONObject.quote(sourceId)};
+        globalThis.SOURCE_ID = ${JSONObject.quote(sourceId)};
+        var SOURCE_ID = ${JSONObject.quote(sourceId)};
+        globalThis.__settings = globalThis.__settings || {};
+        globalThis.__settings[${JSONObject.quote(sourceId)}] = globalThis.SCRAPER_SETTINGS || {};
     """.trimIndent()
 
     suspend fun getHome(
@@ -168,5 +176,58 @@ class ZangetsuJsEngine @Inject constructor(
             callScript = callScript,
             timeoutMs = timeoutMs
         )
+    }
+
+    suspend fun inspectSettingsSchema(
+        pluginId: String,
+        sourceId: String,
+        scriptCode: String,
+        timeoutMs: Long = 8_000L
+    ): List<ProviderSettingField> {
+        val callScript = """
+            (async function() {
+              try {
+                var target = (typeof module !== 'undefined' && module.exports) ? module.exports : globalThis;
+                var fn = (typeof getSettings === 'function' ? getSettings : null) ||
+                  target.getSettings || target.onSettings || globalThis.onSettings;
+                if (typeof fn !== 'function') {
+                  __nuvioResult({ fields: [] });
+                  return;
+                }
+                var out = await Promise.resolve(fn());
+                __nuvioResult({ fields: Array.isArray(out) ? out : [] });
+              } catch (e) {
+                __nuvioResult({ fields: [], error: (e && e.message) ? String(e.message) : String(e) });
+              }
+            })();
+        """.trimIndent()
+
+        val output = nuvioJsEngine.evaluateCustomScript(
+            pluginId = pluginId,
+            scraperId = "zangetsu-$sourceId-settings",
+            setupScript = baseSetup(sourceId),
+            scriptCode = scriptCode,
+            callScript = callScript,
+            timeoutMs = timeoutMs
+        )
+
+        val fields = nuvioJsEngine.parseSettingsArray(pluginId, output.optJSONArray("fields")).toMutableList()
+        if (scriptCode.contains("api.themoviedb.org") &&
+            fields.none { it.key.equals("tmdbApiKey", ignoreCase = true) || it.key.equals("tmdb_api_key", ignoreCase = true) }
+        ) {
+            val savedValues = settingsStore.getValues(pluginId)
+            fields.add(
+                ProviderSettingField(
+                    key = "tmdbApiKey",
+                    type = ProviderSettingType.PASSWORD,
+                    label = "TMDB API Key (Optional)",
+                    description = "Optional TMDB v3 API key used when this provider queries TMDB.",
+                    defaultValue = "",
+                    currentValue = savedValues["tmdbApiKey"].orEmpty(),
+                    required = false
+                )
+            )
+        }
+        return fields
     }
 }

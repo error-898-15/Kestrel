@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Bookmarks
@@ -157,7 +158,7 @@ fun LibraryScreen(
                             ),
                             verticalArrangement = Arrangement.spacedBy(12.dp)
                         ) {
-                            items(items, key = { it.mediaId }) { entry ->
+                            itemsIndexed(items, key = { idx, entry -> "${entry.mediaId}_$idx" }) { _, entry ->
                                 LibraryEntryCard(
                                     entry = entry,
                                     showRemove = state.selectedTab == LibraryTab.HISTORY,

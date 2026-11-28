@@ -6,11 +6,14 @@ import androidx.lifecycle.viewModelScope
 import com.kestrel.domain.model.CatalogRow
 import com.kestrel.domain.repository.CatalogRepository
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
@@ -30,6 +33,7 @@ data class HomeUiState(
     val providerErrors: List<String> = emptyList()
 )
 
+@OptIn(FlowPreview::class)
 @HiltViewModel
 class HomeViewModel @Inject constructor(
     private val catalogRepository: CatalogRepository
@@ -45,13 +49,17 @@ class HomeViewModel @Inject constructor(
 
     init {
         viewModelScope.launch {
-            catalogRepository.syncEnabledPlugins(force = false)
+            runCatching { catalogRepository.syncEnabledPlugins(force = false) }
             catalogRepository.activeProviders
                 .map { list ->
                     list.filter { it.hasCatalog }
                         .map { ProviderOption(providerId = it.providerId, name = it.name) }
                 }
                 .distinctUntilChanged()
+                .debounce(300L)
+                .catch { _ ->
+                    _uiState.update { it.copy(isLoading = false) }
+                }
                 .collectLatest { options ->
                     val optionIds = options.map { it.providerId }.toSet()
                     val currentSelected = _uiState.value.selectedProviderId
@@ -76,13 +84,16 @@ class HomeViewModel @Inject constructor(
                 }
         }
         viewModelScope.launch {
-            catalogRepository.homeReloadRequests.collect {
-                allCachedRows = emptyList()
-                allCachedErrors = emptyMap()
-                if (lastLoadedProviderIds.isNotEmpty()) {
-                    refreshCatalogs()
+            catalogRepository.homeReloadRequests
+                .debounce(200L)
+                .catch { }
+                .collect {
+                    allCachedRows = emptyList()
+                    allCachedErrors = emptyMap()
+                    if (lastLoadedProviderIds.isNotEmpty()) {
+                        refreshCatalogs()
+                    }
                 }
-            }
         }
     }
 
@@ -124,21 +135,26 @@ class HomeViewModel @Inject constructor(
             catalogRepository.fetchHomeCatalogsStream(
                 providerFilterId = selectedAtStart,
                 page = 1
-            ).collect { result ->
-                allCachedRows = (allCachedRows.filterNot { it.providerId == result.providerId } + result.rows)
-                allCachedErrors = if (result.errorMessage != null) {
-                    allCachedErrors + (result.providerId to "${result.providerName}: ${result.errorMessage}")
-                } else {
-                    allCachedErrors - result.providerId
+            )
+                .catch { err ->
+                    val msg = err.message ?: "Catalog refresh failed"
+                    allCachedErrors = allCachedErrors + ("_stream" to msg)
                 }
-                val currentFilter = _uiState.value.selectedProviderId
-                _uiState.update {
-                    it.copy(
-                        rows = filterRows(allCachedRows, currentFilter),
-                        providerErrors = filterErrors(allCachedErrors, currentFilter)
-                    )
+                .collect { result ->
+                    allCachedRows = (allCachedRows.filterNot { it.providerId == result.providerId } + result.rows)
+                    allCachedErrors = if (result.errorMessage != null) {
+                        allCachedErrors + (result.providerId to "${result.providerName}: ${result.errorMessage}")
+                    } else {
+                        allCachedErrors - result.providerId
+                    }
+                    val currentFilter = _uiState.value.selectedProviderId
+                    _uiState.update {
+                        it.copy(
+                            rows = filterRows(allCachedRows, currentFilter),
+                            providerErrors = filterErrors(allCachedErrors, currentFilter)
+                        )
+                    }
                 }
-            }
 
             val finalFilter = _uiState.value.selectedProviderId
             _uiState.update {

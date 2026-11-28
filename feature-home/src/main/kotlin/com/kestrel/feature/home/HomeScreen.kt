@@ -268,7 +268,7 @@ fun HomeScreen(
                                     onClick = { viewModel.selectProvider(null) }
                                 )
                             }
-                            items(state.providers, key = { it.providerId }, contentType = { "chip" }) { provider ->
+                            itemsIndexed(state.providers, key = { idx, p -> "${p.providerId}_$idx" }, contentType = { _, _ -> "chip" }) { _, provider ->
                                 GlassChip(
                                     text = provider.name,
                                     selected = state.selectedProviderId == provider.providerId,

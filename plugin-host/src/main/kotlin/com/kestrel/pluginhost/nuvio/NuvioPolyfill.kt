@@ -2,11 +2,12 @@
 package com.kestrel.pluginhost.nuvio
 
 /**
- * Browser-like JavaScript host polyfill injected into QuickJS before running Nuvio scrapers:
- * - fetch(url, options), Headers, AbortController, axios shim
- * - Stateful Jsoup-backed cheerio.load(html) supporting $(sel, ctx), filter, closest, parent, next, prev, siblings, etc.
+ * Browser-like JavaScript host polyfill injected into QuickJS before running Nuvio, Vega, Zangetsu, and SkyStream scrapers:
+ * - fetch(url, options) with followRedirects, timeoutMs, browser:true WebView fallback, and case-insensitive headers
+ * - Headers, AbortController, axios shim, URL, URLSearchParams, absUrl
+ * - Stateful Jsoup-backed cheerio.load(html) supporting $(sel, ctx), nextUntil, remove, empty, clone, add, Symbol.iterator, etc.
  * - Native-backed CryptoJS (AES CBC/ECB/CTR + OpenSSL EVP_BytesToKey, MD5, SHA1/256/512, HMAC, enc.Utf8/Base64/Hex/Latin1)
- * - URL, URLSearchParams, TextEncoder, TextDecoder, Buffer, atob/btoa, console, setTimeout/clearTimeout
+ * - TextEncoder, TextDecoder, Buffer, atob/btoa, console, setTimeout/clearTimeout
  * - __nuvioResult(payload) bridge back to Kotlin
  */
 internal object NuvioPolyfill {
@@ -184,7 +185,8 @@ internal object NuvioPolyfill {
               this.signal = {
                 aborted: false,
                 addEventListener: function() {},
-                removeEventListener: function() {}
+                removeEventListener: function() {},
+                dispatchEvent: function() { return true; }
               };
               this.abort = function() {
                 this.signal.aborted = true;
@@ -273,17 +275,31 @@ internal object NuvioPolyfill {
             global.URL = function(input, base) {
               var raw = String(input || '').trim();
               if (base && !/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(raw)) {
-                var b = String(base);
+                var b = String(base).trim();
                 var originMatch = b.match(/^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^\/?#]+)/);
                 var origin = originMatch ? originMatch[1] : '';
-                if (raw.indexOf('//') === 0) {
+                if (!raw) {
+                  raw = b;
+                } else if (raw.indexOf('//') === 0) {
                   var protoMatch = b.match(/^([a-zA-Z][a-zA-Z0-9+.-]*:)/);
                   raw = (protoMatch ? protoMatch[1] : 'https:') + raw;
-                } else if (raw.indexOf('/') === 0) {
+                } else if (raw.charAt(0) === '/') {
                   raw = origin + raw;
+                } else if (raw.charAt(0) === '?') {
+                  var baseNoQ = b.split('#')[0].split('?')[0];
+                  if (origin && baseNoQ.length <= origin.length) baseNoQ = origin + '/';
+                  raw = baseNoQ + raw;
+                } else if (raw.charAt(0) === '#') {
+                  raw = b.split('#')[0] + raw;
                 } else {
                   var basePath = b.split('?')[0].split('#')[0];
-                  raw = basePath.replace(/\/[^\/]*$/, '/') + raw;
+                  if (origin && basePath.length <= origin.length) {
+                    raw = origin + '/' + raw.replace(/^\.\//, '');
+                  } else {
+                    var lastSlash = basePath.lastIndexOf('/');
+                    var dir = lastSlash >= origin.length ? basePath.slice(0, lastSlash + 1) : (origin + '/');
+                    raw = dir + raw.replace(/^\.\//, '');
+                  }
                 }
               }
               var m = raw.match(/^([a-zA-Z][a-zA-Z0-9+.-]*:)\/\/(?:[^@\/?#]+@)?([^\/?#:]+(?::\d+)?)(\/[^?#]*)?(\?[^#]*)?(#.*)?$/);
@@ -308,6 +324,29 @@ internal object NuvioPolyfill {
             };
             global.URL.prototype.toString = function() { return this.href; };
             global.URL.prototype.toJSON = function() { return this.href; };
+          }
+
+          if (typeof global.absUrl === 'undefined') {
+            global.absUrl = function(href, base) {
+              var h = String(href == null ? '' : href).trim();
+              if (!h) return '';
+              if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(h)) return h;
+              if (/^(?:data|javascript|mailto|magnet):/i.test(h)) return h;
+              var b = String(base == null ? '' : base).trim();
+              if (!b) return h;
+              try {
+                return new global.URL(h, b).toString();
+              } catch (e) {
+                if (h.indexOf('//') === 0) {
+                  var pm = b.match(/^([a-zA-Z][a-zA-Z0-9+.-]*:)/);
+                  return (pm ? pm[1] : 'https:') + h;
+                }
+                var om = b.match(/^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^\/?#]+)/);
+                var origin = om ? om[1] : b.replace(/\/+$/, '');
+                if (h.charAt(0) === '/') return origin + h;
+                return b.replace(/\/+$/, '') + '/' + h.replace(/^\/+/, '');
+              }
+            };
           }
 
           global.fetch = async function(url, opts) {
@@ -340,18 +379,61 @@ internal object NuvioPolyfill {
             if (opts.body !== undefined && opts.body !== null) {
               bodyPayload = (opts.body instanceof global.URLSearchParams) ? opts.body.toString() : String(opts.body);
             }
+            var redirectMode = opts.redirect;
+            if (!redirectMode && opts.followRedirects === false) {
+              redirectMode = 'manual';
+            }
             var payload = {
               url: String(url),
               method: (opts.method || 'GET').toUpperCase(),
               headers: mergedHeaders,
               body: bodyPayload,
-              redirect: opts.redirect || 'follow'
+              redirect: redirectMode || 'follow',
+              timeoutMs: Number(opts.timeoutMs || opts.timeout || 0)
             };
-            var raw = await __nuvioFetchAsync(JSON.stringify(payload));
+            var raw = opts.browser
+              ? await __nuvioWebViewFetchAsync(JSON.stringify(payload))
+              : await __nuvioFetchAsync(JSON.stringify(payload));
             var res = JSON.parse(raw);
             if (res.error) throw new Error(res.error);
             var bodyText = res.body || '';
             var rawHeaders = res.headers || {};
+
+            function buildResponseHeaders() {
+              var hdrs = {};
+              for (var hk in rawHeaders) {
+                if (Object.prototype.hasOwnProperty.call(rawHeaders, hk)) {
+                  hdrs[hk] = rawHeaders[hk];
+                  var lowerHk = String(hk).toLowerCase();
+                  if (!Object.prototype.hasOwnProperty.call(hdrs, lowerHk)) {
+                    hdrs[lowerHk] = rawHeaders[hk];
+                  }
+                }
+              }
+              var def = function(name, fn) {
+                Object.defineProperty(hdrs, name, { value: fn, enumerable: false, configurable: true });
+              };
+              def('get', function(name) {
+                var lower = String(name || '').toLowerCase();
+                for (var h in rawHeaders) {
+                  if (String(h).toLowerCase() === lower) return rawHeaders[h];
+                }
+                return null;
+              });
+              def('has', function(name) { return hdrs.get(name) !== null; });
+              def('entries', function() {
+                return Object.keys(rawHeaders).map(function(key) { return [key, rawHeaders[key]]; });
+              });
+              def('keys', function() { return Object.keys(rawHeaders); });
+              def('values', function() {
+                return Object.keys(rawHeaders).map(function(key) { return rawHeaders[key]; });
+              });
+              def('forEach', function(cb) {
+                Object.keys(rawHeaders).forEach(function(key) { cb(rawHeaders[key], key, hdrs); });
+              });
+              return hdrs;
+            }
+
             function makeResponse() {
               return {
                 ok: res.status >= 200 && res.status < 300,
@@ -360,22 +442,7 @@ internal object NuvioPolyfill {
                 url: res.url || payload.url,
                 redirected: Boolean(res.redirected),
                 body: bodyText,
-                headers: {
-                  get: function(name) {
-                    var lower = String(name).toLowerCase();
-                    for (var hk in rawHeaders) {
-                      if (hk.toLowerCase() === lower) return rawHeaders[hk];
-                    }
-                    return null;
-                  },
-                  has: function(name) { return this.get(name) !== null; },
-                  entries: function() {
-                    return Object.keys(rawHeaders).map(function(k) { return [k, rawHeaders[k]]; });
-                  },
-                  forEach: function(cb) {
-                    Object.keys(rawHeaders).forEach(function(k) { cb(rawHeaders[k], k); });
-                  }
-                },
+                headers: buildResponseHeaders(),
                 text: async function() { return bodyText; },
                 json: async function() { return JSON.parse(bodyText); },
                 arrayBuffer: async function() { return new Uint8Array(utf8StrToBytes(bodyText)).buffer; },
@@ -459,7 +526,7 @@ internal object NuvioPolyfill {
               }
             },
             mode: { CBC: 'CBC', ECB: 'ECB', CTR: 'CTR', CFB: 'CFB', OFB: 'OFB' },
-            pad: { Pkcs7: 'Pkcs7', ZeroPadding: 'ZeroPadding', NoPadding: 'NoPadding' },
+            pad: { Pkcs7: 'Pkcs7', PKCS7: 'Pkcs7', NoPadding: 'NoPadding', ZeroPadding: 'ZeroPadding' },
             MD5: function(msg) {
               var res = JSON.parse(__nuvioCall(JSON.stringify({ op: 'cryptoDigest', algo: 'MD5', hex: toHexFromInput(msg) })) || '{}');
               return makeWordArray(res.hex || '');
@@ -554,22 +621,61 @@ internal object NuvioPolyfill {
               html: String(html || '')
             })) || '{}');
             var docId = loadRes.docId || 0;
+            var domVersion = 1;
 
-            function wrapNodes(nodes, prevSelection) {
-              var arr = Array.isArray(nodes) ? nodes : [];
+            function tagNodes(nodes) {
+              if (!Array.isArray(nodes)) return [];
+              for (var i = 0; i < nodes.length; i++) {
+                if (nodes[i] && typeof nodes[i] === 'object') {
+                  nodes[i]._v = domVersion;
+                }
+              }
+              return nodes;
+            }
+
+            function ensureFresh(node) {
+              if (!node || typeof node.nodeId !== 'number') return node;
+              if (node._v === domVersion) return node;
+              var fresh = JSON.parse(__nuvioCall(JSON.stringify({
+                op: 'domRead',
+                nodeId: node.nodeId
+              })) || 'null');
+              if (fresh && typeof fresh === 'object') {
+                node.text = fresh.text || '';
+                node.html = fresh.html || '';
+                node.outerHtml = fresh.outerHtml || '';
+                node.attrs = fresh.attrs || node.attrs || {};
+              }
+              node._v = domVersion;
+              return node;
+            }
+
+            function wrapNodes(nodes, prevSelection, skipIndex) {
+              var arr = tagNodes(Array.isArray(nodes) ? nodes : []);
               var sel = {
                 _isCheerioSelection: true,
                 _nodes: arr,
                 _prev: prevSelection || null,
                 length: arr.length,
-                text: function() {
-                  return arr.map(function(n) { return n.text || ''; }).join('');
+                attribs: arr.length ? (arr[0].attrs || {}) : {},
+                tagName: arr.length ? (arr[0].tagName || '') : '',
+                text: function(newVal) {
+                  if (newVal !== undefined) {
+                    arr.forEach(function(n) { n.text = String(newVal); });
+                    return sel;
+                  }
+                  return arr.map(function(n) { return ensureFresh(n).text || ''; }).join('');
                 },
                 html: function() {
-                  return arr.length ? (arr[0].html || '') : null;
+                  return arr.length ? (ensureFresh(arr[0]).html || '') : null;
                 },
                 attr: function(name, val) {
                   if (!arr.length) return undefined;
+                  if (typeof name === 'object' && name !== null) {
+                    arr[0].attrs = arr[0].attrs || {};
+                    Object.keys(name).forEach(function(k) { arr[0].attrs[k] = String(name[k]); });
+                    return sel;
+                  }
                   if (val !== undefined) {
                     arr[0].attrs = arr[0].attrs || {};
                     arr[0].attrs[name] = String(val);
@@ -618,38 +724,51 @@ internal object NuvioPolyfill {
                   })) || '{}');
                   return typeof res.index === 'number' ? res.index : -1;
                 },
-                first: function() { return wrapNodes(arr.length ? [arr[0]] : [], sel); },
-                last: function() { return wrapNodes(arr.length ? [arr[arr.length - 1]] : [], sel); },
+                first: function() { return wrapNodes(arr.length ? [arr[0]] : [], sel, false); },
+                last: function() { return wrapNodes(arr.length ? [arr[arr.length - 1]] : [], sel, false); },
                 eq: function(i) {
                   var idx = i < 0 ? arr.length + i : i;
-                  return wrapNodes(arr[idx] ? [arr[idx]] : [], sel);
+                  return wrapNodes(arr[idx] ? [arr[idx]] : [], sel, false);
                 },
                 slice: function(start, end) {
-                  return wrapNodes(arr.slice(start, end), sel);
+                  return wrapNodes(arr.slice(start, end), sel, false);
                 },
                 get: function(i) {
-                  if (i === undefined) return arr.map(function(n) { return wrapNodes([n], sel); });
+                  if (i === undefined) return arr.map(function(n) { return wrapNodes([n], sel, true); });
                   var idx = i < 0 ? arr.length + i : i;
-                  return arr[idx] ? wrapNodes([arr[idx]], sel) : undefined;
+                  return arr[idx] ? wrapNodes([arr[idx]], sel, true) : undefined;
                 },
                 find: function(sub) {
-                  if (!arr.length || !sub) return wrapNodes([], sel);
+                  if (!arr.length || !sub) return wrapNodes([], sel, true);
                   var found = JSON.parse(__nuvioCall(JSON.stringify({
                     op: 'domSelect',
                     docId: docId,
                     selector: String(sub),
                     contextNodeIds: arr.map(function(n) { return n.nodeId; })
                   })) || '[]');
-                  return wrapNodes(found, sel);
+                  return wrapNodes(found, sel, false);
+                },
+                add: function(other) {
+                  var extra = $(other);
+                  var combined = arr.slice();
+                  var seen = {};
+                  combined.forEach(function(n) { seen[n.nodeId] = true; });
+                  (extra._nodes || []).forEach(function(n) {
+                    if (!seen[n.nodeId]) {
+                      seen[n.nodeId] = true;
+                      combined.push(n);
+                    }
+                  });
+                  return wrapNodes(combined, sel, false);
                 },
                 filter: function(matcher) {
-                  if (!arr.length) return wrapNodes([], sel);
+                  if (!arr.length) return wrapNodes([], sel, true);
                   if (typeof matcher === 'function') {
                     var matched = arr.filter(function(n, idx) {
-                      var w = wrapNodes([n], sel);
+                      var w = wrapNodes([n], sel, true);
                       return Boolean(matcher.call(w, idx, w));
                     });
-                    return wrapNodes(matched, sel);
+                    return wrapNodes(matched, sel, false);
                   }
                   var found = JSON.parse(__nuvioCall(JSON.stringify({
                     op: 'domFilter',
@@ -657,16 +776,16 @@ internal object NuvioPolyfill {
                     selector: String(matcher || ''),
                     invert: false
                   })) || '[]');
-                  return wrapNodes(found, sel);
+                  return wrapNodes(found, sel, false);
                 },
                 not: function(matcher) {
-                  if (!arr.length) return wrapNodes([], sel);
+                  if (!arr.length) return wrapNodes([], sel, true);
                   if (typeof matcher === 'function') {
                     var kept = arr.filter(function(n, idx) {
-                      var w = wrapNodes([n], sel);
+                      var w = wrapNodes([n], sel, true);
                       return !matcher.call(w, idx, w);
                     });
-                    return wrapNodes(kept, sel);
+                    return wrapNodes(kept, sel, false);
                   }
                   var found = JSON.parse(__nuvioCall(JSON.stringify({
                     op: 'domFilter',
@@ -674,54 +793,40 @@ internal object NuvioPolyfill {
                     selector: String(matcher || ''),
                     invert: true
                   })) || '[]');
-                  return wrapNodes(found, sel);
+                  return wrapNodes(found, sel, false);
                 },
-                children: function(selector) {
-                  return traverse('children', selector);
-                },
-                parent: function(selector) {
-                  return traverse('parent', selector);
-                },
-                parents: function(selector) {
-                  return traverse('parents', selector);
-                },
-                closest: function(selector) {
-                  return traverse('closest', selector);
-                },
-                next: function(selector) {
-                  return traverse('next', selector);
-                },
-                nextAll: function(selector) {
-                  return traverse('nextAll', selector);
-                },
-                prev: function(selector) {
-                  return traverse('prev', selector);
-                },
-                prevAll: function(selector) {
-                  return traverse('prevAll', selector);
-                },
-                siblings: function(selector) {
-                  return traverse('siblings', selector);
-                },
-                contents: function() {
-                  return traverse('children', null);
-                },
+                children: function(selector) { return traverse('children', selector); },
+                parent: function(selector) { return traverse('parent', selector); },
+                parents: function(selector) { return traverse('parents', selector); },
+                closest: function(selector) { return traverse('closest', selector); },
+                next: function(selector) { return traverse('next', selector); },
+                nextAll: function(selector) { return traverse('nextAll', selector); },
+                nextUntil: function(selector, filterSel) { return traverse('nextUntil', selector, filterSel); },
+                prev: function(selector) { return traverse('prev', selector); },
+                prevAll: function(selector) { return traverse('prevAll', selector); },
+                siblings: function(selector) { return traverse('siblings', selector); },
+                contents: function() { return traverse('children', null); },
                 clone: function() {
-                  return wrapNodes(arr.slice(), sel);
+                  if (!arr.length) return wrapNodes([], sel, true);
+                  var cloned = JSON.parse(__nuvioCall(JSON.stringify({
+                    op: 'domClone',
+                    nodeIds: arr.map(function(n) { return n.nodeId; })
+                  })) || '[]');
+                  return wrapNodes(cloned, sel, false);
                 },
                 end: function() {
-                  return prevSelection || wrapNodes([], null);
+                  return prevSelection || wrapNodes([], null, true);
                 },
                 each: function(cb) {
                   arr.forEach(function(n, idx) {
-                    var w = wrapNodes([n], sel);
+                    var w = wrapNodes([n], sel, true);
                     cb.call(w, idx, w);
                   });
                   return sel;
                 },
                 map: function(cb) {
                   var out = arr.map(function(n, idx) {
-                    var w = wrapNodes([n], sel);
+                    var w = wrapNodes([n], sel, true);
                     return cb.call(w, idx, w);
                   });
                   var mappedSel = {
@@ -732,36 +837,71 @@ internal object NuvioPolyfill {
                   return mappedSel;
                 },
                 toArray: function() {
-                  return arr.map(function(n) { return wrapNodes([n], sel); });
+                  return arr.map(function(n) { return wrapNodes([n], sel, true); });
                 },
-                remove: function() { return sel; },
-                empty: function() { return sel; }
+                remove: function(selector) {
+                  if (!arr.length) return sel;
+                  __nuvioCall(JSON.stringify({
+                    op: 'domRemove',
+                    nodeIds: arr.map(function(n) { return n.nodeId; }),
+                    selector: selector ? String(selector) : null
+                  }));
+                  domVersion++;
+                  return sel;
+                },
+                empty: function() {
+                  if (!arr.length) return sel;
+                  __nuvioCall(JSON.stringify({
+                    op: 'domEmpty',
+                    nodeIds: arr.map(function(n) { return n.nodeId; })
+                  }));
+                  domVersion++;
+                  return sel;
+                }
               };
 
-              function traverse(kind, selector) {
-                if (!arr.length) return wrapNodes([], sel);
+              function traverse(kind, selector, filterSel) {
+                if (!arr.length) return wrapNodes([], sel, true);
                 var items = JSON.parse(__nuvioCall(JSON.stringify({
                   op: 'domTraverse',
                   kind: kind,
                   nodeIds: arr.map(function(n) { return n.nodeId; }),
-                  selector: selector ? String(selector) : null
+                  selector: selector ? String(selector) : null,
+                  filter: filterSel ? String(filterSel) : null
                 })) || '[]');
-                return wrapNodes(items, sel);
+                return wrapNodes(items, sel, false);
               }
 
-              for (var i = 0; i < arr.length; i++) {
-                sel[i] = wrapNodes([arr[i]], sel);
+              if (!skipIndex) {
+                for (var i = 0; i < arr.length; i++) {
+                  sel[i] = wrapNodes([arr[i]], sel, true);
+                }
               }
+
+              if (typeof Symbol !== 'undefined' && Symbol.iterator) {
+                sel[Symbol.iterator] = function() {
+                  var idx = 0;
+                  return {
+                    next: function() {
+                      if (idx < arr.length) {
+                        return { value: wrapNodes([arr[idx++]], sel, true), done: false };
+                      }
+                      return { value: undefined, done: true };
+                    }
+                  };
+                };
+              }
+
               return sel;
             }
 
             var $ = function(selector, context) {
-              if (!selector) return wrapNodes([], null);
+              if (!selector) return wrapNodes([], null, true);
               if (typeof selector === 'object') {
                 if (selector._isCheerioSelection) return selector;
-                if (typeof selector.nodeId === 'number') return wrapNodes([selector], null);
+                if (typeof selector.nodeId === 'number') return wrapNodes([selector], null, false);
                 if (typeof selector.text === 'function') return selector;
-                return wrapNodes([], null);
+                return wrapNodes([], null, true);
               }
               var selStr = String(selector).trim();
               if (selStr.charAt(0) === '<' && selStr.indexOf('>') > 0) {
@@ -773,7 +913,7 @@ internal object NuvioPolyfill {
                   return context.find(selStr);
                 }
                 if (typeof context === 'object' && typeof context.nodeId === 'number') {
-                  return wrapNodes([context], null).find(selStr);
+                  return wrapNodes([context], null, true).find(selStr);
                 }
                 if (typeof context === 'string') {
                   return createCheerioInstance(context)(selStr);
@@ -785,11 +925,11 @@ internal object NuvioPolyfill {
                 selector: selStr,
                 contextNodeIds: []
               })) || '[]');
-              return wrapNodes(items, null);
+              return wrapNodes(items, null, false);
             };
             $.html = function(el) {
               if (el && el._isCheerioSelection && el._nodes && el._nodes.length) {
-                return el._nodes[0].outerHtml || '';
+                return ensureFresh(el._nodes[0]).outerHtml || '';
               }
               return String(html || '');
             };
@@ -861,7 +1001,8 @@ internal object NuvioPolyfill {
                 method: method,
                 headers: headers,
                 body: bodyStr,
-                redirect: redirectMode
+                redirect: redirectMode,
+                timeoutMs: Number(cfg.timeout || cfg.timeoutMs || defaults.timeout || 0)
               }).then(function(r) {
                 return r.text().then(function(t) {
                   var data = t;

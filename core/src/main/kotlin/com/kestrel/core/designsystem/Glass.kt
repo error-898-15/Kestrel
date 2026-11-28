@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package com.kestrel.core.designsystem
 
-import android.os.Build
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
-import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -15,7 +13,6 @@ import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -23,10 +20,8 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBars
-import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
@@ -52,38 +47,24 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
-import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.RoundRect
 import androidx.compose.ui.geometry.Size
-import androidx.compose.ui.graphics.BlurEffect
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.Path
-import androidx.compose.ui.graphics.TileMode
+import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.graphics.drawscope.clipPath
-import androidx.compose.ui.graphics.drawscope.translate
 import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.graphics.layer.GraphicsLayer
-import androidx.compose.ui.graphics.layer.drawLayer
 import androidx.compose.ui.graphics.lerp
-import androidx.compose.ui.graphics.rememberGraphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.layout.onGloballyPositioned
-import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
-import androidx.compose.ui.unit.IntOffset
-import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.lerp
 import androidx.compose.ui.unit.sp
 import kotlin.math.abs
 import kotlin.math.max
@@ -91,168 +72,91 @@ import kotlin.math.min
 import kotlin.math.roundToInt
 
 // ---------------------------------------------------------------------------------------------
-// Backdrop capture: the shell marks its content as a "glass source"; floating glass panels
-// (the bottom bar) then draw a blurred copy of whatever sits behind them (API 31+).
-// On older devices they fall back to a translucent frosted fill.
+// Lightweight GPU-only liquid-glass surfaces (no per-frame offscreen layer recording or BlurEffect
+// re-rasterization during LazyColumn/LazyRow scrolling).
 // ---------------------------------------------------------------------------------------------
 
 @Stable
-class GlassState internal constructor(internal val layer: GraphicsLayer) {
-    internal var sourceOrigin by mutableStateOf(Offset.Zero)
-}
+class GlassState internal constructor()
 
-/**
- * Screens that have their own scrolling content under floating glass controls provide a state here
- * so every glass control below it (chips, circle buttons, header) gets a real blurred backdrop.
- */
 val LocalGlassState = compositionLocalOf<GlassState?> { null }
 
 @Composable
-fun rememberGlassState(): GlassState {
-    val layer = rememberGraphicsLayer()
-    return remember(layer) { GlassState(layer) }
-}
+fun rememberGlassState(): GlassState = remember { GlassState() }
 
-/** Records the content of this node into [state] while still drawing it normally. */
-fun Modifier.glassSource(state: GlassState): Modifier = this
-    .onGloballyPositioned { state.sourceOrigin = it.positionInRoot() }
-    .drawWithContent {
-        val w = size.width.toInt()
-        val h = size.height.toInt()
-        if (w > 0 && h > 0) {
-            state.layer.record(this, layoutDirection, IntSize(w, h)) {
-                this@drawWithContent.drawContent()
-            }
-            drawLayer(state.layer)
-        } else {
-            drawContent()
-        }
-    }
+/** Preserved for call-site compatibility; avoids offscreen full-screen re-recording on scroll. */
+fun Modifier.glassSource(@Suppress("UNUSED_PARAMETER") state: GlassState): Modifier = this
 
 /**
- * Liquid-glass surface: optional blurred backdrop, translucent tint, top sheen and a
- * light-catching gradient rim. Draw-only, so it never changes layout.
+ * GPU-friendly frosted liquid-glass surface: translucent frosted base, tint, top sheen, and
+ * light-catching gradient rim. Draw-only, never allocates GraphicsLayers or invalidates layout.
  */
 @Composable
 fun Modifier.glassPanel(
     cornerRadius: Dp,
-    state: GlassState? = LocalGlassState.current,
-    blurRadius: Dp = 22.dp,
+    @Suppress("UNUSED_PARAMETER") state: GlassState? = LocalGlassState.current,
+    @Suppress("UNUSED_PARAMETER") blurRadius: Dp = 22.dp,
     tint: Color = Color.White.copy(alpha = 0.08f),
     rimColor: Color = Color.White,
     rimAlpha: Float = 0.5f,
     sheen: Boolean = true,
     depth: Boolean = true
 ): Modifier {
-    var origin by remember { mutableStateOf(Offset.Zero) }
-    val blurLayer = rememberGraphicsLayer()
-    val clipPathObj = remember { Path() }
-    val density = LocalDensity.current
-    val canBlur = state != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
-    val cachedBlurEffect = remember(canBlur, blurRadius, density) {
-        if (canBlur) {
-            val blurPx = with(density) { blurRadius.toPx() }
-            if (blurPx > 0f) BlurEffect(blurPx, blurPx, TileMode.Clamp) else null
-        } else {
-            null
+    val frostedBase = remember(tint) {
+        if (tint.alpha < 0.28f) Color(0xA610131A) else Color.Transparent
+    }
+    return this.drawBehind {
+        val w = size.width
+        val h = size.height
+        if (w <= 0f || h <= 0f) return@drawBehind
+        val r = min(cornerRadius.toPx(), min(w, h) / 2f)
+        val radius = CornerRadius(r, r)
+
+        if (frostedBase.alpha > 0f) {
+            drawRoundRect(color = frostedBase, cornerRadius = radius)
         }
-    }
-    val positioned = if (canBlur) {
-        Modifier.onGloballyPositioned { origin = it.positionInRoot() }
-    } else {
-        Modifier
-    }
-    return this
-        .then(positioned)
-        .drawBehind {
-            val w = size.width
-            val h = size.height
-            if (w <= 0f || h <= 0f) return@drawBehind
-            val r = min(cornerRadius.toPx(), min(w, h) / 2f)
-            val radius = CornerRadius(r, r)
+        drawRoundRect(color = tint, cornerRadius = radius)
 
-            if (canBlur && state != null && cachedBlurEffect != null) {
-                val shift = state.sourceOrigin - origin
-                if (blurLayer.renderEffect !== cachedBlurEffect) {
-                    blurLayer.renderEffect = cachedBlurEffect
-                }
-                blurLayer.record(this, layoutDirection, IntSize(w.toInt(), h.toInt())) {
-                    translate(shift.x, shift.y) {
-                        drawLayer(state.layer)
-                    }
-                }
-                clipPathObj.reset()
-                clipPathObj.addRoundRect(RoundRect(0f, 0f, w, h, radius))
-                clipPath(clipPathObj) {
-                    drawLayer(blurLayer)
-                }
-            }
-            drawRoundRect(color = tint, cornerRadius = radius)
-
-            if (depth) {
-                // Thickness: glass gets slightly denser toward the bottom edge.
-                drawRoundRect(
-                    brush = Brush.verticalGradient(
-                        colors = listOf(Color.Transparent, Color.Black.copy(alpha = 0.16f)),
-                        startY = h * 0.45f,
-                        endY = h
-                    ),
-                    cornerRadius = radius
-                )
-            }
-
-            if (sheen) {
-                drawRoundRect(
-                    brush = Brush.verticalGradient(
-                        colors = listOf(Color.White.copy(alpha = 0.16f), Color.Transparent),
-                        startY = 0f,
-                        endY = h * 0.6f
-                    ),
-                    cornerRadius = radius
-                )
-                // Specular glint in the top-left corner, like light hitting curved glass.
-                drawRoundRect(
-                    brush = Brush.radialGradient(
-                        colors = listOf(Color.White.copy(alpha = 0.20f), Color.Transparent),
-                        center = Offset(w * 0.18f, 0f),
-                        radius = max(w, h) * 0.55f
-                    ),
-                    cornerRadius = radius
-                )
-            }
-
-            if (depth) {
-                // Faint inner rim = refraction edge of the glass.
-                val inner = 3.dp.toPx()
-                if (w > inner * 2 && h > inner * 2) {
-                    drawRoundRect(
-                        color = Color.White.copy(alpha = 0.05f),
-                        topLeft = Offset(inner, inner),
-                        size = Size(w - inner * 2, h - inner * 2),
-                        cornerRadius = CornerRadius(max(r - inner, 0f)),
-                        style = Stroke(width = 1.dp.toPx())
-                    )
-                }
-            }
-
-            val stroke = 1.2.dp.toPx()
+        if (depth) {
             drawRoundRect(
-                brush = Brush.linearGradient(
-                    colors = listOf(
-                        rimColor.copy(alpha = rimAlpha),
-                        rimColor.copy(alpha = 0.07f),
-                        rimColor.copy(alpha = 0.07f),
-                        rimColor.copy(alpha = rimAlpha * 0.65f)
-                    ),
-                    start = Offset.Zero,
-                    end = Offset(w, h)
+                brush = Brush.verticalGradient(
+                    colors = listOf(Color.Transparent, Color.Black.copy(alpha = 0.16f)),
+                    startY = h * 0.45f,
+                    endY = h
                 ),
-                topLeft = Offset(stroke / 2f, stroke / 2f),
-                size = Size(w - stroke, h - stroke),
-                cornerRadius = CornerRadius(max(r - stroke / 2f, 0f)),
-                style = Stroke(width = stroke)
+                cornerRadius = radius
             )
         }
+
+        if (sheen) {
+            drawRoundRect(
+                brush = Brush.verticalGradient(
+                    colors = listOf(Color.White.copy(alpha = 0.13f), Color.Transparent),
+                    startY = 0f,
+                    endY = h * 0.55f
+                ),
+                cornerRadius = radius
+            )
+        }
+
+        val stroke = 1.dp.toPx()
+        drawRoundRect(
+            brush = Brush.linearGradient(
+                colors = listOf(
+                    rimColor.copy(alpha = rimAlpha),
+                    rimColor.copy(alpha = 0.07f),
+                    rimColor.copy(alpha = 0.07f),
+                    rimColor.copy(alpha = rimAlpha * 0.65f)
+                ),
+                start = Offset.Zero,
+                end = Offset(w, h)
+            ),
+            topLeft = Offset(stroke / 2f, stroke / 2f),
+            size = Size(w - stroke, h - stroke),
+            cornerRadius = CornerRadius(max(r - stroke / 2f, 0f)),
+            style = Stroke(width = stroke)
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -557,8 +461,11 @@ fun GlassTabs(
 
         Box(
             modifier = Modifier
-                .offset { IntOffset((insetPx + position * tabWidthPx).roundToInt(), insetPx.roundToInt()) }
                 .size(width = tabWidth, height = tabsHeight - inset * 2)
+                .graphicsLayer {
+                    translationX = insetPx + position * tabWidthPx
+                    translationY = insetPx
+                }
                 .glassPanel(
                     cornerRadius = (tabsHeight - inset * 2) / 2,
                     tint = colors.accentAmber.copy(alpha = 0.2f),
@@ -596,7 +503,7 @@ fun GlassTabs(
 }
 
 // ---------------------------------------------------------------------------------------------
-// Floating liquid-glass bottom navigation with scroll-collapse & smooth crimson capsule
+// Floating liquid-glass bottom navigation with GPU-only scroll-collapse & smooth crimson capsule
 // ---------------------------------------------------------------------------------------------
 
 @Immutable
@@ -644,18 +551,24 @@ fun GlassNavBar(
         modifier = modifier.fillMaxWidth(),
         contentAlignment = Alignment.BottomCenter
     ) {
-        val expandedWidth = maxWidth
-        val compactWidth = min(expandedWidth.value, (count * 54f) + inset.value * 2f).dp
-        val barWidth = lerp(expandedWidth, compactWidth, collapseFraction)
-        val barHeight = lerp(NavBarHeight, 50.dp, collapseFraction)
+        val barWidth = maxWidth
+        val barHeight = NavBarHeight
         val labelAlpha = (1f - collapseFraction * 2.1f).coerceIn(0f, 1f)
         val iconShiftPx = with(density) { (-7.5f * (1f - collapseFraction)).dp.toPx() }
         val labelShiftPx = with(density) { 12.dp.toPx() }
+        val collapseDropPx = with(density) { (6.dp * collapseFraction).toPx() }
 
         Box(
             modifier = Modifier
-                .width(barWidth)
-                .height(barHeight)
+                .size(width = barWidth, height = barHeight)
+                .graphicsLayer {
+                    val sx = 1f - 0.14f * collapseFraction
+                    val sy = 1f - 0.22f * collapseFraction
+                    scaleX = sx
+                    scaleY = sy
+                    translationY = collapseDropPx
+                    transformOrigin = TransformOrigin(0.5f, 1f)
+                }
                 .clip(RoundedCornerShape(50))
                 .drawBehind {
                     val w = size.width
@@ -701,7 +614,6 @@ fun GlassNavBar(
             val insetPx = with(density) { inset.toPx() }
             val indicatorHeight = barHeight - inset * 2
 
-            // GPU-only sliding crimson capsule highlight (no layout/blur invalidations).
             Box(
                 modifier = Modifier
                     .size(width = itemWidth, height = indicatorHeight)

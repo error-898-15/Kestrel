@@ -6,13 +6,19 @@ import android.util.Log
 import com.dokar.quickjs.binding.AsyncFunctionBinding
 import com.dokar.quickjs.binding.FunctionBinding
 import com.dokar.quickjs.quickJs
+import com.hikari.app.net.Http
 import com.kestrel.domain.model.ProviderSettingField
 import com.kestrel.domain.model.ProviderSettingOption
 import com.kestrel.domain.model.ProviderSettingType
 import com.kestrel.pluginhost.settings.ProviderSettingsStore
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExecutorCoroutineDispatcher
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
@@ -25,9 +31,12 @@ import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import org.jsoup.select.Elements
+import java.net.URLEncoder
 import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.IdentityHashMap
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
@@ -46,6 +55,22 @@ class NuvioJsEngine @Inject constructor(
     private val okHttpClient: OkHttpClient,
     private val settingsStore: ProviderSettingsStore
 ) {
+    /**
+     * QuickJS ties stack-overflow checks (`JS_UpdateStackTop`) to the native OS thread
+     * where the runtime was created. Pin each VM to a single-thread dispatcher from a
+     * bounded 3-worker pool so async coroutines resume on the exact same OS thread and
+     * never exceed Android's native heap/thread limits.
+     */
+    private val vmSemaphore = Semaphore(MAX_CONCURRENT_VMS)
+    private val workerDispatchers = ArrayBlockingQueue<ExecutorCoroutineDispatcher>(MAX_CONCURRENT_VMS).apply {
+        repeat(MAX_CONCURRENT_VMS) { idx ->
+            val executor = Executors.newSingleThreadExecutor { runnable ->
+                Thread(runnable, "kestrel-qjs-$idx").apply { isDaemon = true }
+            }
+            add(executor.asCoroutineDispatcher())
+        }
+    }
+
     suspend fun executeGetStreams(
         pluginId: String,
         scraperId: String,
@@ -239,8 +264,15 @@ class NuvioJsEngine @Inject constructor(
             timeoutMs = timeoutMs
         )
 
+        return parseSettingsArray(pluginId, output.optJSONArray("fields"))
+    }
+
+    internal fun parseSettingsArray(
+        pluginId: String,
+        arr: JSONArray?
+    ): List<ProviderSettingField> {
+        if (arr == null) return emptyList()
         val savedValues = settingsStore.getValues(pluginId)
-        val arr = output.optJSONArray("fields") ?: return emptyList()
         val parsed = mutableListOf<ProviderSettingField>()
 
         for (i in 0 until arr.length()) {
@@ -330,108 +362,132 @@ class NuvioJsEngine @Inject constructor(
         val capturedJson = AtomicReference<String?>(null)
         val domRegistry = DomRegistry()
 
-        val settingsJsonObj = JSONObject(settingsStore.getValues(pluginId))
+        val savedSettings = settingsStore.getValues(pluginId)
+        val settingsJsonObj = JSONObject(savedSettings)
         val headersJsonObj = JSONObject(settingsStore.getHeaders(pluginId))
         val settingsInjection = """
             globalThis.SCRAPER_SETTINGS = ${settingsJsonObj};
             globalThis.__kestrelCustomHeaders = ${headersJsonObj};
         """.trimIndent()
 
-        val raw = withTimeoutOrNull(timeoutMs) {
-            quickJs(Dispatchers.Default) {
-                // Match SkyStream's 2MB stack ceiling so large esbuild bundles (e.g. All-in-one) do not overflow.
-                maxStackSize = 2L * 1024L * 1024L
+        val raw = vmSemaphore.withPermit {
+            val qjsDispatcher = workerDispatchers.poll()
+                ?: return@withPermit JSONObject().put("error", "JS worker pool busy").toString()
+            try {
+                withTimeoutOrNull(timeoutMs) {
+                    try {
+                        quickJs(qjsDispatcher) {
+                            // Keep stack comfortably within Android's ~1MB native pthread stack to avoid SIGSEGV.
+                            maxStackSize = 512L * 1024L
 
-                defineBinding(
-                    "__nuvioCall",
-                    object : FunctionBinding<String?> {
-                        override fun invoke(args: Array<Any?>): String? {
-                            val reqJson = args.firstOrNull() as? String ?: "{}"
-                            return handleSyncCall(
-                                scraperId = scraperId,
-                                reqJson = reqJson,
-                                domRegistry = domRegistry,
-                                onResult = { data ->
-                                    capturedJson.set(data)
-                                    if (!resultDeferred.isCompleted) resultDeferred.complete(data)
+                            defineBinding(
+                                "__nuvioCall",
+                                object : FunctionBinding<String?> {
+                                    override fun invoke(args: Array<Any?>): String? {
+                                        val reqJson = args.firstOrNull() as? String ?: "{}"
+                                        return handleSyncCall(
+                                            scraperId = scraperId,
+                                            reqJson = reqJson,
+                                            domRegistry = domRegistry,
+                                            onResult = { data ->
+                                                capturedJson.set(data)
+                                                if (!resultDeferred.isCompleted) resultDeferred.complete(data)
+                                            }
+                                        )
+                                    }
                                 }
                             )
+
+                            defineBinding(
+                                "__nuvioFetchAsync",
+                                object : AsyncFunctionBinding<String> {
+                                    override suspend fun invoke(args: Array<Any?>): String =
+                                        performFetch(args.firstOrNull() as? String ?: "{}", savedSettings)
+                                }
+                            )
+
+                            defineBinding(
+                                "__nuvioWebViewFetchAsync",
+                                object : AsyncFunctionBinding<String> {
+                                    override suspend fun invoke(args: Array<Any?>): String =
+                                        performWebViewFetch(args.firstOrNull() as? String ?: "{}")
+                                }
+                            )
+
+                            defineBinding(
+                                "__nuvioSleepAsync",
+                                object : AsyncFunctionBinding<Any?> {
+                                    override suspend fun invoke(args: Array<Any?>): Any? {
+                                        val ms = (args.firstOrNull() as? Number)?.toLong() ?: 0L
+                                        delay(ms.coerceIn(0L, 15_000L))
+                                        return null
+                                    }
+                                }
+                            )
+
+                            extraSyncBindings.forEach { (bindingName, handler) ->
+                                defineBinding(
+                                    bindingName,
+                                    object : FunctionBinding<Any?> {
+                                        override fun invoke(args: Array<Any?>): Any? = handler(args)
+                                    }
+                                )
+                            }
+
+                            extraAsyncBindings.forEach { (bindingName, handler) ->
+                                defineBinding(
+                                    bindingName,
+                                    object : AsyncFunctionBinding<String> {
+                                        override suspend fun invoke(args: Array<Any?>): String =
+                                            handler(args)
+                                    }
+                                )
+                            }
+
+                            // End every eval with `;undefined;` so QuickJS never attempts to JSON-stringify circular
+                            // completion values such as `Object.assign(globalThis, PluginModule)` -> `globalThis`.
+                            evaluate<Unit>(NuvioPolyfill.build() + "\n;undefined;", "nuvio-polyfill.js")
+                            evaluate<Unit>(settingsInjection + "\n;undefined;", "nuvio-settings.js")
+                            if (setupScript.isNotBlank()) {
+                                val setupError = runCatching {
+                                    evaluate<Unit>(setupScript + "\n;undefined;", "$scraperId-setup.js")
+                                }.exceptionOrNull()
+                                if (setupError != null) {
+                                    return@quickJs JSONObject()
+                                        .put("error", setupError.message ?: "Script setup error")
+                                        .toString()
+                                }
+                            }
+                            if (scriptCode.isNotBlank()) {
+                                val scriptError = runCatching {
+                                    evaluate<Unit>(scriptCode + "\n;undefined;", "$scraperId.js")
+                                }.exceptionOrNull()
+                                if (scriptError != null) {
+                                    return@quickJs JSONObject()
+                                        .put("error", scriptError.message ?: "Script evaluation error")
+                                        .toString()
+                                }
+                            }
+                            val invokeError = runCatching {
+                                evaluate<Unit>(callScript + "\n;undefined;", "nuvio-invoke.js")
+                            }.exceptionOrNull()
+                            if (invokeError != null && capturedJson.get() == null) {
+                                return@quickJs JSONObject()
+                                    .put("error", invokeError.message ?: "Script invocation error")
+                                    .toString()
+                            }
+
+                            capturedJson.get() ?: resultDeferred.await()
                         }
-                    }
-                )
-
-                defineBinding(
-                    "__nuvioFetchAsync",
-                    object : AsyncFunctionBinding<String> {
-                        override suspend fun invoke(args: Array<Any?>): String =
-                            performFetch(args.firstOrNull() as? String ?: "{}")
-                    }
-                )
-
-                defineBinding(
-                    "__nuvioSleepAsync",
-                    object : AsyncFunctionBinding<Any?> {
-                        override suspend fun invoke(args: Array<Any?>): Any? {
-                            val ms = (args.firstOrNull() as? Number)?.toLong() ?: 0L
-                            delay(ms.coerceIn(0L, 15_000L))
-                            return null
-                        }
-                    }
-                )
-
-                extraSyncBindings.forEach { (bindingName, handler) ->
-                    defineBinding(
-                        bindingName,
-                        object : FunctionBinding<Any?> {
-                            override fun invoke(args: Array<Any?>): Any? = handler(args)
-                        }
-                    )
-                }
-
-                extraAsyncBindings.forEach { (bindingName, handler) ->
-                    defineBinding(
-                        bindingName,
-                        object : AsyncFunctionBinding<String> {
-                            override suspend fun invoke(args: Array<Any?>): String =
-                                handler(args)
-                        }
-                    )
-                }
-
-                // End every eval with `;undefined;` so QuickJS never attempts to JSON-stringify circular
-                // completion values such as `Object.assign(globalThis, PluginModule)` -> `globalThis`.
-                evaluate<Unit>(NuvioPolyfill.build() + "\n;undefined;", "nuvio-polyfill.js")
-                evaluate<Unit>(settingsInjection + "\n;undefined;", "nuvio-settings.js")
-                if (setupScript.isNotBlank()) {
-                    val setupError = runCatching {
-                        evaluate<Unit>(setupScript + "\n;undefined;", "$scraperId-setup.js")
-                    }.exceptionOrNull()
-                    if (setupError != null) {
-                        return@quickJs JSONObject()
-                            .put("error", setupError.message ?: "Script setup error")
-                            .toString()
+                    } catch (ce: CancellationException) {
+                        throw ce
+                    } catch (t: Throwable) {
+                        Log.w("NuvioJS", "[$scraperId] QuickJS VM failure: ${t.message}")
+                        JSONObject().put("error", t.message ?: "JS runtime failure").toString()
                     }
                 }
-                if (scriptCode.isNotBlank()) {
-                    val scriptError = runCatching {
-                        evaluate<Unit>(scriptCode + "\n;undefined;", "$scraperId.js")
-                    }.exceptionOrNull()
-                    if (scriptError != null) {
-                        return@quickJs JSONObject()
-                            .put("error", scriptError.message ?: "Script evaluation error")
-                            .toString()
-                    }
-                }
-                val invokeError = runCatching {
-                    evaluate<Unit>(callScript + "\n;undefined;", "nuvio-invoke.js")
-                }.exceptionOrNull()
-                if (invokeError != null && capturedJson.get() == null) {
-                    return@quickJs JSONObject()
-                        .put("error", invokeError.message ?: "Script invocation error")
-                        .toString()
-                }
-
-                capturedJson.get() ?: resultDeferred.await()
+            } finally {
+                workerDispatchers.offer(qjsDispatcher)
             }
         } ?: capturedJson.get()
 
@@ -459,6 +515,22 @@ class NuvioJsEngine @Inject constructor(
                     Log.d("NuvioJS", "[$scraperId] ${req.optString("message")}")
                     "{}"
                 }
+                "btoa" -> {
+                    val rawStr = req.optString("value")
+                    val bytes = if (rawStr.all { it.code <= 0xFF }) {
+                        rawStr.toByteArray(Charsets.ISO_8859_1)
+                    } else {
+                        rawStr.toByteArray(Charsets.UTF_8)
+                    }
+                    JSONObject().put("value", Base64.encodeToString(bytes, Base64.NO_WRAP)).toString()
+                }
+                "atob" -> {
+                    val b64 = req.optString("value").trim()
+                    val decoded = runCatching {
+                        String(Base64.decode(b64, Base64.DEFAULT), Charsets.ISO_8859_1)
+                    }.getOrDefault("")
+                    JSONObject().put("value", decoded).toString()
+                }
                 "cryptoRandom" -> {
                     val size = req.optInt("size", 16).coerceIn(1, 1024)
                     val bytes = ByteArray(size)
@@ -475,10 +547,12 @@ class NuvioJsEngine @Inject constructor(
                     contextNodeIds = req.optJSONArray("contextNodeIds"),
                     legacyHtml = optNullableString(req, "html")
                 )
+                "domRead" -> domRegistry.readNode(req.optInt("nodeId", -1))
                 "domTraverse" -> domRegistry.traverse(
                     kind = req.optString("kind"),
                     nodeIds = req.optJSONArray("nodeIds"),
-                    selector = optNullableString(req, "selector")
+                    selector = optNullableString(req, "selector"),
+                    filterSelector = optNullableString(req, "filter")
                 )
                 "domFilter" -> domRegistry.filter(
                     nodeIds = req.optJSONArray("nodeIds"),
@@ -490,6 +564,12 @@ class NuvioJsEngine @Inject constructor(
                     selector = req.optString("selector")
                 )
                 "domIndex" -> domRegistry.indexOf(req.optInt("nodeId", -1))
+                "domClone" -> domRegistry.cloneNodes(req.optJSONArray("nodeIds"))
+                "domRemove" -> domRegistry.removeNodes(
+                    nodeIds = req.optJSONArray("nodeIds"),
+                    selector = optNullableString(req, "selector")
+                )
+                "domEmpty" -> domRegistry.emptyNodes(req.optJSONArray("nodeIds"))
                 "htmlText" -> {
                     val parsed = runCatching { Jsoup.parse(req.optString("html")).text() }.getOrDefault("")
                     JSONObject().put("text", parsed).toString()
@@ -700,7 +780,8 @@ class NuvioJsEngine @Inject constructor(
         private val idsByNode = IdentityHashMap<Element, Int>()
 
         fun load(html: String): String {
-            val trimmed = html.trimStart()
+            val boundedHtml = if (html.length > MAX_BODY_CHARS) html.substring(0, MAX_BODY_CHARS) else html
+            val trimmed = boundedHtml.trimStart()
             val doc: Document = when {
                 trimmed.startsWith("<tr", ignoreCase = true) ||
                     trimmed.startsWith("<td", ignoreCase = true) ||
@@ -708,13 +789,12 @@ class NuvioJsEngine @Inject constructor(
                     trimmed.startsWith("<tbody", ignoreCase = true) ||
                     trimmed.startsWith("<thead", ignoreCase = true) ||
                     trimmed.startsWith("<tfoot", ignoreCase = true) -> {
-                    val wrapped = Jsoup.parseBodyFragment("<table>$html</table>")
-                    wrapped
+                    Jsoup.parseBodyFragment("<table>$boundedHtml</table>")
                 }
                 trimmed.startsWith("<html", ignoreCase = true) ||
                     trimmed.startsWith("<!doctype", ignoreCase = true) ||
-                    trimmed.contains("<body", ignoreCase = true) -> Jsoup.parse(html)
-                else -> Jsoup.parseBodyFragment(html)
+                    trimmed.contains("<body", ignoreCase = true) -> Jsoup.parse(boundedHtml)
+                else -> Jsoup.parseBodyFragment(boundedHtml)
             }
             val docId = nextDocId.getAndIncrement()
             docs[docId] = doc
@@ -735,8 +815,12 @@ class NuvioJsEngine @Inject constructor(
                     val el = nodesById[contextNodeIds.optInt(i)] ?: continue
                     val matched = runCatching { el.select(selector) }.getOrNull() ?: continue
                     for (m in matched) {
-                        if (seen.put(m, true) == null) combined.add(m)
+                        if (seen.put(m, true) == null) {
+                            combined.add(m)
+                            if (combined.size >= MAX_SERIALIZED_NODES) break
+                        }
                     }
+                    if (combined.size >= MAX_SERIALIZED_NODES) break
                 }
                 return serializeElements(combined)
             }
@@ -749,20 +833,27 @@ class NuvioJsEngine @Inject constructor(
             return serializeElements(matched)
         }
 
+        fun readNode(nodeId: Int): String {
+            val el = nodesById[nodeId] ?: return "null"
+            return nodeToJson(nodeId, el).toString()
+        }
+
         fun traverse(
             kind: String,
             nodeIds: JSONArray?,
-            selector: String?
+            selector: String?,
+            filterSelector: String? = null
         ): String {
             if (nodeIds == null || nodeIds.length() == 0) return "[]"
             val out = Elements()
             val seen = IdentityHashMap<Element, Boolean>()
             val selFilter = selector?.trim()?.takeIf { it.isNotEmpty() }
+            val extraFilter = filterSelector?.trim()?.takeIf { it.isNotEmpty() }
 
-            fun addCandidate(el: Element?) {
-                if (el == null) return
-                if (selFilter != null) {
-                    val matches = runCatching { el.`is`(selFilter) }.getOrDefault(false)
+            fun addCandidate(el: Element?, explicitFilter: String? = selFilter) {
+                if (el == null || out.size >= MAX_SERIALIZED_NODES) return
+                if (explicitFilter != null) {
+                    val matches = runCatching { el.`is`(explicitFilter) }.getOrDefault(false)
                     if (!matches) return
                 }
                 if (seen.put(el, true) == null) {
@@ -771,11 +862,12 @@ class NuvioJsEngine @Inject constructor(
             }
 
             for (i in 0 until nodeIds.length()) {
+                if (out.size >= MAX_SERIALIZED_NODES) break
                 val el = nodesById[nodeIds.optInt(i)] ?: continue
                 when (kind) {
-                    "children" -> el.children().forEach(::addCandidate)
+                    "children" -> el.children().forEach { addCandidate(it) }
                     "parent" -> addCandidate(el.parent())
-                    "parents" -> el.parents().forEach(::addCandidate)
+                    "parents" -> el.parents().forEach { addCandidate(it) }
                     "closest" -> {
                         if (selFilter != null) {
                             addCandidate(runCatching { el.closest(selFilter) }.getOrNull())
@@ -784,10 +876,20 @@ class NuvioJsEngine @Inject constructor(
                         }
                     }
                     "next" -> addCandidate(el.nextElementSibling())
-                    "nextAll" -> el.nextElementSiblings().forEach(::addCandidate)
+                    "nextAll" -> el.nextElementSiblings().forEach { addCandidate(it) }
+                    "nextUntil" -> {
+                        var cur = el.nextElementSibling()
+                        while (cur != null && out.size < MAX_SERIALIZED_NODES) {
+                            if (selFilter != null && runCatching { cur!!.`is`(selFilter) }.getOrDefault(false)) {
+                                break
+                            }
+                            addCandidate(cur, extraFilter)
+                            cur = cur.nextElementSibling()
+                        }
+                    }
                     "prev" -> addCandidate(el.previousElementSibling())
-                    "prevAll" -> el.previousElementSiblings().forEach(::addCandidate)
-                    "siblings" -> el.siblingElements().forEach(::addCandidate)
+                    "prevAll" -> el.previousElementSiblings().forEach { addCandidate(it) }
+                    "siblings" -> el.siblingElements().forEach { addCandidate(it) }
                 }
             }
             return serializeElements(out)
@@ -806,6 +908,7 @@ class NuvioJsEngine @Inject constructor(
                 val matches = if (cleanSel.isEmpty()) true else runCatching { el.`is`(cleanSel) }.getOrDefault(false)
                 if (if (invert) !matches else matches) {
                     out.add(el)
+                    if (out.size >= MAX_SERIALIZED_NODES) break
                 }
             }
             return serializeElements(out)
@@ -833,33 +936,96 @@ class NuvioJsEngine @Inject constructor(
             return JSONObject().put("index", idx).toString()
         }
 
+        fun cloneNodes(nodeIds: JSONArray?): String {
+            if (nodeIds == null || nodeIds.length() == 0) return "[]"
+            val cloned = Elements()
+            for (i in 0 until nodeIds.length()) {
+                val el = nodesById[nodeIds.optInt(i)] ?: continue
+                cloned.add(el.clone())
+                if (cloned.size >= MAX_SERIALIZED_NODES) break
+            }
+            return serializeElements(cloned)
+        }
+
+        fun removeNodes(nodeIds: JSONArray?, selector: String?): String {
+            if (nodeIds == null || nodeIds.length() == 0) return "{}"
+            val cleanSel = selector?.trim()?.takeIf { it.isNotEmpty() }
+            for (i in 0 until nodeIds.length()) {
+                val el = nodesById[nodeIds.optInt(i)] ?: continue
+                runCatching {
+                    if (cleanSel == null) {
+                        el.remove()
+                    } else {
+                        el.select(cleanSel).remove()
+                    }
+                }
+            }
+            return "{}"
+        }
+
+        fun emptyNodes(nodeIds: JSONArray?): String {
+            if (nodeIds == null || nodeIds.length() == 0) return "{}"
+            for (i in 0 until nodeIds.length()) {
+                val el = nodesById[nodeIds.optInt(i)] ?: continue
+                runCatching { el.empty() }
+            }
+            return "{}"
+        }
+
         private fun serializeElements(elements: Elements): String {
             val arr = JSONArray()
+            var count = 0
             for (el in elements) {
-                val id = idsByNode[el] ?: nextNodeId.getAndIncrement().also { created ->
-                    idsByNode[el] = created
-                    nodesById[created] = el
+                if (count >= MAX_SERIALIZED_NODES) break
+                val existingId = idsByNode[el]
+                val id = existingId ?: if (nodesById.size < MAX_NODES) {
+                    nextNodeId.getAndIncrement().also { created ->
+                        idsByNode[el] = created
+                        nodesById[created] = el
+                    }
+                } else {
+                    -1
                 }
-                val attrsObj = JSONObject()
-                el.attributes().forEach { attr -> attrsObj.put(attr.key, attr.value) }
-                arr.put(
-                    JSONObject()
-                        .put("nodeId", id)
-                        .put("tagName", el.tagName())
-                        .put("text", el.text())
-                        .put("html", el.html())
-                        .put("outerHtml", el.outerHtml())
-                        .put("attrs", attrsObj)
-                )
+                arr.put(nodeToJson(id, el))
+                count++
             }
             return arr.toString()
         }
+
+        private fun nodeToJson(id: Int, el: Element): JSONObject {
+            val attrsObj = JSONObject()
+            el.attributes().forEach { attr -> attrsObj.put(attr.key, attr.value) }
+            return JSONObject()
+                .put("nodeId", id)
+                .put("tagName", el.tagName())
+                .put("text", el.text())
+                .put("html", el.html())
+                .put("outerHtml", el.outerHtml())
+                .put("attrs", attrsObj)
+        }
     }
 
-    private suspend fun performFetch(reqJson: String): String = withContext(Dispatchers.IO) {
+    private suspend fun performFetch(
+        reqJson: String,
+        savedSettings: Map<String, String>
+    ): String = withContext(Dispatchers.IO) {
         try {
             val payload = JSONObject(reqJson)
-            val url = payload.optString("url")
+            var url = payload.optString("url").trim()
+            if (!url.startsWith("http://", ignoreCase = true) && !url.startsWith("https://", ignoreCase = true)) {
+                return@withContext JSONObject().put("error", "Unsupported URL scheme: $url").toString()
+            }
+            if (url.contains("api.themoviedb.org/3/", ignoreCase = true) &&
+                !url.contains("api_key=", ignoreCase = true)
+            ) {
+                val tmdbKey = savedSettings["tmdbApiKey"]
+                    ?: savedSettings["tmdb_api_key"]
+                    ?: savedSettings["TMDB_API_KEY"]
+                if (!tmdbKey.isNullOrBlank()) {
+                    val sep = if ('?' in url) "&" else "?"
+                    url = "${url}${sep}api_key=${URLEncoder.encode(tmdbKey.trim(), "UTF-8")}"
+                }
+            }
             val method = payload.optString("method", "GET").uppercase()
             val builder = Request.Builder().url(url)
             var hasUa = false
@@ -942,6 +1108,47 @@ class NuvioJsEngine @Inject constructor(
         }
     }
 
+    private suspend fun performWebViewFetch(reqJson: String): String {
+        return try {
+            val payload = JSONObject(reqJson)
+            val url = payload.optString("url").trim()
+            if (!url.startsWith("http://", ignoreCase = true) && !url.startsWith("https://", ignoreCase = true)) {
+                return JSONObject().put("error", "Unsupported URL scheme: $url").toString()
+            }
+            val headersMap = LinkedHashMap<String, String>()
+            val headersObj = payload.optJSONObject("headers")
+            if (headersObj != null) {
+                val keys = headersObj.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next()
+                    if (!headersObj.isNull(k)) {
+                        val v = headersObj.optString(k)
+                        if (v.isNotBlank()) headersMap[k] = v
+                    }
+                }
+            }
+            val requestedTimeout = payload.optLong("timeoutMs", payload.optLong("timeout", 22_000L))
+            val timeoutMs = if (requestedTimeout > 0L) requestedTimeout.coerceIn(5_000L, 45_000L) else 22_000L
+            val rendered = Http.renderPageForWaf(url = url, headers = headersMap, timeoutMs = timeoutMs)
+            val respHeaders = JSONObject()
+            if (rendered.cookies.isNotBlank()) {
+                respHeaders.put("set-cookie", rendered.cookies)
+            }
+            val ok = rendered.html.isNotBlank()
+            JSONObject()
+                .put("status", if (ok) 200 else 503)
+                .put("ok", ok)
+                .put("statusText", if (ok) "OK" else "WebView returned empty page")
+                .put("url", rendered.finalUrl.ifBlank { url })
+                .put("redirected", rendered.finalUrl.isNotBlank() && rendered.finalUrl != url)
+                .put("headers", respHeaders)
+                .put("body", rendered.html.take(MAX_BODY_CHARS))
+                .toString()
+        } catch (t: Throwable) {
+            JSONObject().put("error", t.message ?: "WebView fetch error").toString()
+        }
+    }
+
     private fun prepareNuvioScript(scriptCode: String): String {
         var code = scriptCode
         // Support ESM export syntax if a scraper uses `export async function getStreams` or `export default`
@@ -969,6 +1176,9 @@ class NuvioJsEngine @Inject constructor(
         private const val DEFAULT_USER_AGENT =
             "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
         private const val MAX_BODY_CHARS = 2_000_000
+        private const val MAX_CONCURRENT_VMS = 3
+        private const val MAX_NODES = 12_000
+        private const val MAX_SERIALIZED_NODES = 600
         private val HEX_CHARS = "0123456789abcdef".toCharArray()
     }
 }

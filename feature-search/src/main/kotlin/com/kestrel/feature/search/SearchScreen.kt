@@ -149,7 +149,7 @@ fun SearchScreen(
                                 contentPadding = PaddingValues(top = 14.dp, bottom = navClearance),
                                 verticalArrangement = Arrangement.spacedBy(20.dp)
                             ) {
-                                items(state.groups, key = { it.providerId }) { group ->
+                                itemsIndexed(state.groups, key = { idx, group -> "${group.providerId}_$idx" }) { _, group ->
                                     if (group.items.isNotEmpty() || group.errorMessage != null) {
                                         Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                                             SectionHeader(

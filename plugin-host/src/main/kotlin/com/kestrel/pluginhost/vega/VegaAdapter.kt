@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package com.kestrel.pluginhost.vega
 
+import com.hikari.app.net.Http
 import com.kestrel.domain.model.ActorCredit
 import com.kestrel.domain.model.CatalogRow
 import com.kestrel.domain.model.Episode
@@ -26,6 +27,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.security.MessageDigest
+import java.util.concurrent.atomic.AtomicReference
 
 class VegaAdapter(
     private val plugin: PluginMetadata,
@@ -58,10 +60,11 @@ class VegaAdapter(
     }
 
     override suspend fun getCatalog(page: Int): Result<List<CatalogRow>> =
-        sandbox.execute(pluginId = pluginId, timeoutMs = 40_000L) {
+        sandbox.execute(pluginId = pluginId, timeoutMs = 45_000L) {
             val bundle = loadBundle()
             val safePage = page.coerceAtLeast(1)
             val catJson = engine.getCatalogDefinitions(pluginId, bundle)
+            val catErr = catJson.optString("error").takeIf { it.isNotBlank() }
             val catArray = catJson.optJSONArray("catalog") ?: JSONArray()
 
             val entries = buildList {
@@ -77,7 +80,8 @@ class VegaAdapter(
                 listOf("Latest" to "")
             }
 
-            val semaphore = Semaphore(4)
+            val semaphore = Semaphore(2)
+            val firstError = AtomicReference<String?>(catErr)
             val rows = coroutineScope {
                 entries.map { (title, filter) ->
                     async {
@@ -91,9 +95,13 @@ class VegaAdapter(
                                 )
                             } catch (ce: CancellationException) {
                                 throw ce
-                            } catch (_: Throwable) {
+                            } catch (t: Throwable) {
+                                firstError.compareAndSet(null, t.message ?: "getPosts failed")
                                 null
                             } ?: return@withPermit null
+
+                            val rowErr = out.optString("error").takeIf { it.isNotBlank() }
+                            if (rowErr != null) firstError.compareAndSet(null, rowErr)
 
                             val posts = parsePosts(out.optJSONArray("posts"))
                             if (posts.isEmpty()) null else {
@@ -110,6 +118,9 @@ class VegaAdapter(
                     }
                 }.awaitAll().filterNotNull()
             }
+            if (rows.isEmpty() && !firstError.get().isNullOrBlank()) {
+                error(firstError.get()!!)
+            }
             rows
         }
 
@@ -124,7 +135,10 @@ class VegaAdapter(
                 searchQuery = trimmed,
                 page = page.coerceAtLeast(1)
             )
-            parsePosts(out.optJSONArray("posts"))
+            val err = out.optString("error")
+            val posts = parsePosts(out.optJSONArray("posts"))
+            if (posts.isEmpty() && err.isNotBlank()) error(err)
+            posts
         }
 
     override suspend fun load(url: String): Result<MediaDetails> =
@@ -225,7 +239,7 @@ class VegaAdapter(
             }
 
             if (epFetchJobs.isNotEmpty()) {
-                val semaphore = Semaphore(3)
+                val semaphore = Semaphore(2)
                 val fetched = coroutineScope {
                     epFetchJobs.map { (seasonNum, label, epLink) ->
                         async {
@@ -300,7 +314,7 @@ class VegaAdapter(
         sandbox.execute(pluginId = pluginId, timeoutMs = timeoutMs.coerceAtLeast(8_000L)) {
             val bundle = loadBundle()
             val targets = parseTargets(data)
-            val semaphore = Semaphore(3)
+            val semaphore = Semaphore(2)
             val collectedStreams = mutableListOf<StreamSource>()
             val collectedSubtitles = mutableListOf<SubtitleTrack>()
 
@@ -316,6 +330,9 @@ class VegaAdapter(
                 }.awaitAll().filterNotNull()
             }
 
+            val firstError = results.firstNotNullOfOrNull { it.optString("error").takeIf { e -> e.isNotBlank() } }
+            var iframeAttempts = 0
+
             results.forEach { obj ->
                 val arr = obj.optJSONArray("streams") ?: return@forEach
                 for (i in 0 until arr.length()) {
@@ -328,6 +345,47 @@ class VegaAdapter(
                     val server = s.optString("server").ifBlank { s.optString("name") }.ifBlank { name }
                     val qualityStr = s.optString("quality")
                     val typeStr = s.optString("type").lowercase()
+
+                    if (typeStr == "iframe" || typeStr == "embed") {
+                        if (iframeAttempts < MAX_IFRAME_RESOLVES) {
+                            iframeAttempts++
+                            val captured = Http.resolveWithWebView(
+                                url = streamUrl,
+                                capture = VIDEO_CAPTURE_REGEX,
+                                additional = emptyList(),
+                                timeoutMs = 12_000L,
+                                script = null
+                            )
+                            captured.forEachIndexed { idx, hit ->
+                                val mergedHeaders = LinkedHashMap<String, String>().apply {
+                                    putAll(headers)
+                                    putAll(hit.headers)
+                                }
+                                val hitFormat = inferFormatFromUrl(hit.url)
+                                val hitScore = parseQualityScore("$qualityStr $server ${hit.url}")
+                                val hitLabel = if (hitScore > 0) "${hitScore}p" else qualityStr.ifBlank { "Auto" }
+                                collectedStreams.add(
+                                    StreamSource(
+                                        id = stableId("$providerId:${hit.url}:$server:$i:$idx"),
+                                        providerId = providerId,
+                                        providerName = name,
+                                        extractorName = server,
+                                        url = hit.url,
+                                        qualityLabel = hitLabel,
+                                        qualityScore = hitScore,
+                                        format = hitFormat,
+                                        headers = mergedHeaders,
+                                        referer = mergedHeaders.entries.firstOrNull {
+                                            it.key.equals("referer", ignoreCase = true)
+                                        }?.value ?: streamUrl,
+                                        subtitles = subs
+                                    )
+                                )
+                            }
+                        }
+                        continue
+                    }
+
                     val format = when {
                         "m3u8" in typeStr || "hls" in typeStr -> StreamFormat.HLS
                         "dash" in typeStr || "mpd" in typeStr -> StreamFormat.DASH
@@ -353,6 +411,10 @@ class VegaAdapter(
                         )
                     )
                 }
+            }
+
+            if (collectedStreams.isEmpty() && !firstError.isNullOrBlank()) {
+                error(firstError)
             }
 
             ResolvedLinks(
@@ -474,5 +536,10 @@ class VegaAdapter(
     companion object {
         private const val SINGLE_PREFIX = "vega://one/"
         private const val MULTI_PREFIX = "vega://multi/"
+        private const val MAX_IFRAME_RESOLVES = 4
+        private val VIDEO_CAPTURE_REGEX = Regex(
+            """\.(m3u8|mpd|mp4|mkv|webm)(\?|$|#)|/hls/|master\.txt""",
+            RegexOption.IGNORE_CASE
+        )
     }
 }

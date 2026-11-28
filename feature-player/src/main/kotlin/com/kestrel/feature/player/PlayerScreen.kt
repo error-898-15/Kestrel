@@ -1536,7 +1536,7 @@ private fun PlayerDrawerContent(
                         )
                     }
                 } else {
-                    items(audioTracks, key = { it.id }) { track ->
+                    itemsIndexed(audioTracks, key = { idx, track -> "audio_${track.id}_$idx" }) { _, track ->
                         val active = hasCustomAudioOverride && track.isSelected
                         DrawerSelectableCard(
                             selected = active,
@@ -1638,7 +1638,7 @@ private fun PlayerDrawerContent(
                         )
                     }
                 } else {
-                    items(textTracks, key = { it.id }) { track ->
+                    itemsIndexed(textTracks, key = { idx, track -> "text_${track.id}_$idx" }) { _, track ->
                         DrawerSelectableCard(
                             selected = track.isSelected,
                             onClick = { onSelectSubtitle(track) }
@@ -1802,7 +1802,7 @@ private fun PlayerDrawerContent(
                         Spacer(modifier = Modifier.height(6.dp))
                         DrawerSectionLabel("EPISODES (${session.details.episodes.size})")
                     }
-                    items(session.details.episodes, key = { it.id }) { ep ->
+                    itemsIndexed(session.details.episodes, key = { idx, ep -> "player_ep_${ep.id}_$idx" }) { _, ep ->
                         val active = ep.id == session.selectedEpisode?.id
                         DrawerSelectableCard(
                             selected = active,

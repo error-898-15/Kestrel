@@ -213,12 +213,32 @@ class CompositePluginRuntimeLoader @Inject constructor(
 
             RepoType.HIKARI -> Result.failure(IllegalStateException("${plugin.displayName} has no settings menu"))
 
-            RepoType.VEGA, RepoType.ZANGETSU, RepoType.SKYSTREAM -> withContext(ioDispatcher) {
+            RepoType.VEGA, RepoType.SKYSTREAM -> withContext(ioDispatcher) {
                 runCatching {
                     ProviderSettingsUiTarget.NuvioConfig(
                         pluginId = plugin.id,
                         displayName = plugin.displayName,
                         fields = emptyList(),
+                        customHeaders = settingsStore.getHeaders(plugin.id)
+                    )
+                }
+            }
+
+            RepoType.ZANGETSU -> withContext(ioDispatcher) {
+                runCatching {
+                    val filePath = plugin.localFilePath
+                        ?: error("Install ${plugin.displayName} before configuring settings")
+                    val file = File(filePath)
+                    require(file.exists()) { "Missing Zangetsu script for ${plugin.displayName}" }
+                    val fields = zangetsuJsEngine.inspectSettingsSchema(
+                        pluginId = plugin.id,
+                        sourceId = plugin.internalName,
+                        scriptCode = file.readText()
+                    )
+                    ProviderSettingsUiTarget.NuvioConfig(
+                        pluginId = plugin.id,
+                        displayName = plugin.displayName,
+                        fields = fields,
                         customHeaders = settingsStore.getHeaders(plugin.id)
                     )
                 }

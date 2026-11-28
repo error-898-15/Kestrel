@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package com.kestrel.pluginhost.zangetsu
 
+import com.hikari.app.net.Http
 import com.kestrel.domain.model.CatalogRow
 import com.kestrel.domain.model.Episode
 import com.kestrel.domain.model.MediaDetails
@@ -214,6 +215,7 @@ class ZangetsuAdapter(
             val arr = out.optJSONArray("sources") ?: JSONArray()
             val streams = mutableListOf<StreamSource>()
             val allSubtitles = mutableListOf<SubtitleTrack>()
+            var iframeAttempts = 0
 
             for (i in 0 until arr.length()) {
                 val src = arr.optJSONObject(i) ?: continue
@@ -226,12 +228,52 @@ class ZangetsuAdapter(
                 val quality = src.optString("quality")
                 val labelBase = src.optString("label").ifBlank { name }
                 val kind = src.optString("kind").uppercase()
+                val container = src.optString("container").lowercase()
                 val extractorLabel = if (kind.isNotBlank() && kind !in labelBase.uppercase()) {
                     "$labelBase [$kind]"
                 } else {
                     labelBase
                 }
-                val container = src.optString("container").lowercase()
+
+                if (kind == "IFRAME" || kind == "EMBED" || container == "iframe" || container == "embed") {
+                    if (iframeAttempts < MAX_IFRAME_RESOLVES) {
+                        iframeAttempts++
+                        val captured = Http.resolveWithWebView(
+                            url = url,
+                            capture = VIDEO_CAPTURE_REGEX,
+                            additional = emptyList(),
+                            timeoutMs = 12_000L,
+                            script = null
+                        )
+                        captured.forEachIndexed { idx, hit ->
+                            val mergedHeaders = LinkedHashMap<String, String>().apply {
+                                putAll(headers)
+                                putAll(hit.headers)
+                            }
+                            val hitScore = parseQualityScore("$quality $extractorLabel ${hit.url}")
+                            val hitLabel = if (hitScore > 0) "${hitScore}p" else quality.ifBlank { "Auto" }
+                            streams.add(
+                                StreamSource(
+                                    id = stableId("$providerId:${hit.url}:$extractorLabel:$i:$idx"),
+                                    providerId = providerId,
+                                    providerName = name,
+                                    extractorName = extractorLabel,
+                                    url = hit.url,
+                                    qualityLabel = hitLabel,
+                                    qualityScore = hitScore,
+                                    format = inferFormatFromUrl(hit.url),
+                                    headers = mergedHeaders,
+                                    referer = mergedHeaders.entries.firstOrNull {
+                                        it.key.equals("referer", ignoreCase = true)
+                                    }?.value ?: url,
+                                    subtitles = subs
+                                )
+                            )
+                        }
+                    }
+                    continue
+                }
+
                 val format = when {
                     "hls" in container || "m3u8" in container -> StreamFormat.HLS
                     "dash" in container || "mpd" in container -> StreamFormat.DASH
@@ -356,5 +398,13 @@ class ZangetsuAdapter(
     private fun stableId(input: String): String {
         val digest = MessageDigest.getInstance("SHA-256").digest(input.toByteArray(Charsets.UTF_8))
         return digest.take(8).joinToString("") { "%02x".format(it) }
+    }
+
+    companion object {
+        private const val MAX_IFRAME_RESOLVES = 4
+        private val VIDEO_CAPTURE_REGEX = Regex(
+            """\.(m3u8|mpd|mp4|mkv|webm)(\?|$|#)|/hls/|master\.txt""",
+            RegexOption.IGNORE_CASE
+        )
     }
 }
