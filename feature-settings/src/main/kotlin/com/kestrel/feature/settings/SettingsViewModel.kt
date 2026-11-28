@@ -176,20 +176,15 @@ class SettingsViewModel @Inject constructor(
                     val repoName = repoNameById[plugin.repoId].orEmpty()
                     searchBlobByPluginId[plugin.id] = buildString {
                         append(plugin.displayName)
-                        append('
-')
+                        append('\n')
                         append(plugin.internalName)
-                        append('
-')
+                        append('\n')
                         append(plugin.description)
-                        append('
-')
+                        append('\n')
                         append(repoName)
                         if (plugin.tvTypes.isNotEmpty()) {
-                            append('
-')
-                            append(plugin.tvTypes.joinToString("
-"))
+                            append('\n')
+                            append(plugin.tvTypes.joinToString("\n"))
                         }
                     }.lowercase(Locale.US)
                 }
