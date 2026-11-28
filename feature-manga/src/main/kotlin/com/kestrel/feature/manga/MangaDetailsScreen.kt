@@ -826,9 +826,10 @@ fun MangaDetailsScreen(
         }
     }
 
-    if (showWrongTitleSheet && details != null) {
+    val wrongTitleDetails = state.details
+    if (showWrongTitleSheet && wrongTitleDetails != null) {
         WrongTitleSearchSheet(
-            initialQuery = details.summary.title,
+            initialQuery = wrongTitleDetails.summary.title,
             results = state.wrongTitleResults,
             isSearching = state.isSearchingWrongTitle,
             onSearch = viewModel::searchAlternateTitle,

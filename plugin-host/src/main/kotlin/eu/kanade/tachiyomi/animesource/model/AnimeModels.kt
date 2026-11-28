@@ -125,21 +125,6 @@ open class Video @JvmOverloads constructor(
         headers = headers
     )
 
-    constructor(
-        url: String,
-        quality: String,
-        videoUrl: String?,
-        headers: Headers?,
-        subtitleTracks: List<Track>
-    ) : this(
-        url = url,
-        quality = quality,
-        videoUrl = videoUrl,
-        headers = headers,
-        subtitleTracks = subtitleTracks,
-        audioTracks = emptyList()
-    )
-
     var status: State = State.QUEUE
     var initialized: Boolean = false
 
